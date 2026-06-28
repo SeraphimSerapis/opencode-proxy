@@ -1,0 +1,76 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "opencode-proxy"
+version = "0.1.0"
+description = "FastAPI compatibility proxy for OpenCode and OpenAI-compatible LiteLLM routers."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [
+  { name = "Tim Messerschmidt" },
+]
+dependencies = [
+  "fastapi>=0.128.0",
+  "httpx>=0.28.1",
+  "pydantic-settings>=2.12.0",
+  "uvicorn[standard]>=0.38.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.19.0",
+  "pytest>=9.0.0",
+  "pytest-asyncio>=1.3.0",
+  "respx>=0.22.0",
+  "ruff>=0.14.0",
+]
+
+[project.scripts]
+opencode-proxy = "opencode_proxy.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/opencode_proxy"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+  "A",
+  "ASYNC",
+  "B",
+  "C4",
+  "E",
+  "F",
+  "I",
+  "N",
+  "PGH",
+  "RUF",
+  "S",
+  "SIM",
+  "UP",
+  "W",
+]
+ignore = [
+  "S101",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+pretty = true
+packages = ["opencode_proxy"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+asyncio_mode = "auto"
+testpaths = ["tests"]
