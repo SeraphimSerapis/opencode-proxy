@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from opencode_proxy.settings import Settings, parse_custom_headers
 
@@ -33,3 +34,15 @@ def test_settings_reads_custom_headers_alias(monkeypatch: pytest.MonkeyPatch) ->
     settings = Settings()
 
     assert settings.parsed_custom_headers == {"X-Test": "yes"}
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_settings_rejects_stream_guard_chars_below_one(value: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(stream_guard_chars=value)
+
+
+@pytest.mark.parametrize("value", [0, -10])
+def test_settings_rejects_tool_argument_chunk_size_below_one(value: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(tool_argument_chunk_size=value)

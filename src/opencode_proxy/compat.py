@@ -218,8 +218,11 @@ def parse_qwen_xml_tool_calls(text: str) -> list[ToolCall]:
 
 
 def convert_chat_completion_response(body: JsonObject) -> tuple[JsonObject, bool]:
-    """Convert non-streaming OpenAI-compatible chat completion JSON in place."""
+    """Convert non-streaming OpenAI-compatible chat completion JSON in place.
 
+    Only ``choices[0]`` is inspected; ``n>1`` responses are not repaired
+    (OpenCode uses ``n=1``).
+    """
     choices = body.get("choices")
     if not isinstance(choices, list) or not choices:
         return body, False
@@ -248,15 +251,6 @@ def convert_chat_completion_response(body: JsonObject) -> tuple[JsonObject, bool
     message["content"] = None
     first_choice["finish_reason"] = "tool_calls"
     return body, True
-
-
-def collect_delta_text(delta: JsonObject) -> str:
-    parts: list[str] = []
-    for field in ("content", "reasoning_content", "reasoning"):
-        value = delta.get(field)
-        if isinstance(value, str) and value:
-            parts.append(value)
-    return "".join(parts)
 
 
 def strip_empty_tool_calls(delta: JsonObject) -> JsonObject:

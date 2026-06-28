@@ -1,9 +1,9 @@
 # OpenCode Proxy
 
-FastAPI compatibility proxy for running OpenCode against an OpenAI-compatible LiteLLM router when a model emits tool calls as raw text instead of standard `tool_calls` JSON.
+FastAPI compatibility proxy for running OpenCode against an OpenAI-compatible upstream such as LiteLLM, llama.cpp, or vLLM when a model emits tool calls as raw text instead of standard `tool_calls` JSON.
 
 ```text
-OpenCode CLI -> opencode-proxy -> LiteLLM router -> model backend
+OpenCode CLI -> opencode-proxy -> OpenAI-compatible upstream -> model backend
 ```
 
 The proxy passes normal OpenAI-compatible traffic through unchanged and repairs known malformed assistant tool-call formats in `/v1/chat/completions` responses.
@@ -25,7 +25,7 @@ uv sync --dev
 uv run uvicorn opencode_proxy.app:create_app --factory --host 0.0.0.0 --port 9526
 ```
 
-By default the proxy forwards to `http://127.0.0.1:4000`, which is LiteLLM's common local port. Override it with:
+By default the proxy forwards to `http://127.0.0.1:4000`, which is LiteLLM's common local port. Point it at any OpenAI-compatible upstream with:
 
 ```bash
 UPSTREAM_URL=http://127.0.0.1:4000 uv run opencode-proxy
@@ -33,14 +33,14 @@ UPSTREAM_URL=http://127.0.0.1:4000 uv run opencode-proxy
 
 ## OpenCode Provider Example
 
-Point OpenCode at the proxy, not directly at LiteLLM:
+Point OpenCode at the proxy, not directly at the upstream:
 
 ```jsonc
 {
   "provider": {
-    "litellm-proxy": {
+    "opencode-proxy": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "LiteLLM via OpenCode Proxy",
+      "name": "OpenCode Proxy",
       "options": {
         "baseURL": "http://127.0.0.1:9526/v1",
         "apiKey": "dummy"
@@ -91,7 +91,7 @@ CI also runs a Docker build smoke test.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `UPSTREAM_URL` | `http://127.0.0.1:4000` | Upstream LiteLLM/OpenAI-compatible base URL. |
+| `UPSTREAM_URL` | `http://127.0.0.1:4000` | Upstream OpenAI-compatible base URL. |
 | `PROXY_HOST` | `0.0.0.0` | Bind host for `opencode-proxy`. |
 | `PROXY_PORT` | `9526` | Bind port for `opencode-proxy`. |
 | `LOG_LEVEL` | `INFO` | Python logging level. |
@@ -118,11 +118,13 @@ Hop-by-hop headers such as `Connection` and `Content-Length` are ignored. For st
 ## API Surface
 
 - `GET /healthz`: local proxy health check.
-- `/v1/chat/completions`: proxied to LiteLLM with request tool sanitization and response tool-call repair.
+- `/v1/chat/completions`: proxied to the upstream with request tool sanitization and response tool-call repair.
 - `/{path:path}`: transparent passthrough for other OpenAI-compatible endpoints such as `/v1/models`.
 
 ## Notes
 
-- Set `UPSTREAM_URL` to the LiteLLM router base URL, not the `/v1` path.
+- Set `UPSTREAM_URL` to the upstream base URL, not the `/v1` path.
 - The proxy strips compressed SSE request headers so streamed responses can be parsed line by line.
 - If an upstream response already contains standard OpenAI `tool_calls`, it is passed through unchanged.
+- `reasoning_content` and `reasoning` fields (DeepSeek R1 / o1-style streaming) pass through unchanged; only `content` is buffered and inspected for raw tool-call text.
+- Because `content` is buffered, reasoning deltas from the same upstream event may be emitted before that event's content delta.

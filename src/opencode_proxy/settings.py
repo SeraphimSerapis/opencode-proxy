@@ -19,8 +19,8 @@ class Settings(BaseSettings):
     proxy_host: str = "0.0.0.0"  # noqa: S104 - container default should be externally reachable.
     proxy_port: int = 9526
     log_level: str = "INFO"
-    stream_guard_chars: int = 192
-    tool_argument_chunk_size: int = 64
+    stream_guard_chars: int = Field(default=192, ge=1)
+    tool_argument_chunk_size: int = Field(default=64, ge=1)
     custom_headers: str = Field(
         default="",
         validation_alias=AliasChoices("CUSTOM_HEADERS", "UPSTREAM_HEADERS"),

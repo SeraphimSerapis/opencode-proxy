@@ -237,3 +237,174 @@ async def test_custom_hop_by_hop_headers_are_not_forwarded() -> None:
         response = await client.get("/v1/models")
 
     assert response.status_code == 200
+
+
+@respx.mock
+async def test_streaming_preserves_reasoning_content_separate_from_content() -> None:
+    reasoning_chunk = {
+        "id": "chatcmpl-r1",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-r1",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": "Hello", "reasoning_content": "Thinking about it"},
+                "finish_reason": None,
+            }
+        ],
+    }
+    sse = f"data: {json.dumps(reasoning_chunk)}\n\ndata: [DONE]\n\n"
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=sse.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "deepseek-r1",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert response.status_code == 200
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+
+    reasoning_text = "".join(
+        p["choices"][0]["delta"].get("reasoning_content", "") or "" for p in payloads
+    )
+    content_text = "".join(p["choices"][0]["delta"].get("content", "") or "" for p in payloads)
+
+    assert "Thinking about it" in reasoning_text
+    assert "Thinking about it" not in content_text
+    assert content_text == "Hello"
+
+
+@respx.mock
+async def test_streaming_mixed_reasoning_and_content_documents_field_ordering() -> None:
+    mixed_chunk = {
+        "id": "chatcmpl-r1",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-r1",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "content": "Short answer",
+                    "reasoning_content": "Thinking first",
+                },
+                "finish_reason": None,
+            }
+        ],
+    }
+    sse = f"data: {json.dumps(mixed_chunk)}\n\ndata: [DONE]\n\n"
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=sse.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "deepseek-r1",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert response.status_code == 200
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+
+    assert payloads[0]["choices"][0]["delta"] == {"reasoning_content": "Thinking first"}
+    assert payloads[1]["choices"][0]["delta"] == {"content": "Short answer"}
+
+
+@respx.mock
+async def test_streaming_false_tool_prefix_does_not_starve() -> None:
+    filler = "x" * 200
+    pieces = ["I need a tool to do ", filler, ". The end."]
+
+    sse_lines = []
+    for piece in pieces:
+        chunk = {
+            "id": "chatcmpl-fp",
+            "object": "chat.completion.chunk",
+            "model": "qwen",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": piece},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        sse_lines.append(f"data: {json.dumps(chunk)}\n\n")
+    sse = "".join(sse_lines) + "data: [DONE]\n\n"
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=sse.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen",
+                "stream": True,
+                "messages": [{"role": "user", "content": "tell me"}],
+            },
+        )
+
+    assert response.status_code == 200
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    content_text = "".join(p["choices"][0]["delta"].get("content", "") or "" for p in payloads)
+    expected = "I need a tool to do " + filler + ". The end."
+    assert content_text == expected
+    # Monitoring triggered by "tool" must not hold the entire stream back until
+    # [DONE]; with 220+ buffer chars between the prefix match and stream end,
+    # the proxy must flush at least one intermediate content chunk.
+    assert len(payloads) >= 2
+
+
+@respx.mock
+async def test_upstream_connection_error_returns_generic_502() -> None:
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        side_effect=httpx.ConnectError("connection refused to secret-host:4000")
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen", "messages": [{"role": "user", "content": "x"}]},
+        )
+
+    assert response.status_code == 502
+    body = response.json()
+    assert body["error"]["message"] == "upstream request failed"
+    assert "secret-host" not in json.dumps(body)
+    assert "connection refused" not in json.dumps(body)

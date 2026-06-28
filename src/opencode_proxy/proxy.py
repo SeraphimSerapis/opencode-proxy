@@ -17,7 +17,6 @@ from starlette.background import BackgroundTask
 from opencode_proxy.compat import (
     JsonObject,
     build_tool_call_chunks,
-    collect_delta_text,
     convert_chat_completion_response,
     find_raw_tool_start,
     has_complete_raw_tool_block,
@@ -203,6 +202,10 @@ async def _rewrite_sse_stream(
     upstream_response: httpx.Response,
     settings: Settings,
 ) -> AsyncIterator[bytes]:
+    """Rewrite an SSE chat-completion stream, converting raw tool-call text to
+    OpenAI ``tool_calls`` deltas. Only ``choices[0]`` is repaired; ``n>1``
+    responses are not supported (OpenCode uses ``n=1``).
+    """
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     model = "unknown"
     pending_text = ""
@@ -255,17 +258,30 @@ async def _rewrite_sse_stream(
             yield _encode_sse_json(event)
             continue
 
-        text = collect_delta_text(delta)
-        if not text:
-            cleaned_delta = strip_empty_tool_calls(delta)
-            if cleaned_delta is not delta:
+        content_value = delta.get("content")
+        content_text = content_value if isinstance(content_value, str) else ""
+        # non-content delta fields (reasoning_content, reasoning, role, ...) —
+        # passed through unchanged so DeepSeek R1 / o1-style reasoning stays in
+        # its own field instead of being re-emitted as content.
+        other_fields = {k: v for k, v in delta.items() if k != "content"}
+
+        if not content_text:
+            cleaned_delta = strip_empty_tool_calls(other_fields)
+            if cleaned_delta is not other_fields:
                 first_choice["delta"] = cleaned_delta
-                yield _encode_sse_json(event)
-            else:
-                yield _encode_sse_json(event)
+            yield _encode_sse_json(event)
             continue
 
-        pending_text += text
+        if other_fields:
+            cleaned_other = strip_empty_tool_calls(other_fields)
+            if cleaned_other:
+                passthrough_event = {
+                    **event,
+                    "choices": [{**first_choice, "delta": cleaned_other}],
+                }
+                yield _encode_sse_json(passthrough_event)
+
+        pending_text += content_text
         monitoring_tool_block = monitoring_tool_block or has_raw_tool_prefix(pending_text)
 
         if monitoring_tool_block and has_complete_raw_tool_block(pending_text):
@@ -291,11 +307,13 @@ async def _rewrite_sse_stream(
 
             monitoring_tool_block = False
 
-        if not monitoring_tool_block:
-            flush_size = len(pending_text) - settings.stream_guard_chars
-            if flush_size > 0:
-                yield _encode_sse_json(_content_chunk(chunk_id, model, pending_text[:flush_size]))
-                pending_text = pending_text[flush_size:]
+        # Always hold back `stream_guard_chars` of pending content so a split
+        # raw tool-call marker (or a false-positive prefix match like the word
+        # "tool") can complete without starving the stream until [DONE].
+        flush_size = len(pending_text) - settings.stream_guard_chars
+        if flush_size > 0:
+            yield _encode_sse_json(_content_chunk(chunk_id, model, pending_text[:flush_size]))
+            pending_text = pending_text[flush_size:]
 
     if pending_text:
         yield _encode_sse_json(_content_chunk(chunk_id, model, pending_text))
@@ -436,7 +454,7 @@ def _proxy_error(exc: httpx.HTTPError) -> JSONResponse:
         status_code=502,
         content={
             "error": {
-                "message": f"upstream request failed: {exc}",
+                "message": "upstream request failed",
                 "type": "proxy_error",
             },
         },
