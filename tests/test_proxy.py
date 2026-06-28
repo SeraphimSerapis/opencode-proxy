@@ -198,6 +198,23 @@ async def test_non_chat_route_passes_through() -> None:
 
 
 @respx.mock
+async def test_root_models_route_forwards_to_v1_models() -> None:
+    route = respx.get("http://upstream.test/v1/models").mock(
+        return_value=httpx.Response(
+            200,
+            json={"object": "list", "data": [{"id": "model-a"}]},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.get("/models")
+
+    assert route.called
+    assert response.status_code == 200
+    assert response.json()["data"][0]["id"] == "model-a"
+
+
+@respx.mock
 async def test_custom_headers_are_forwarded_to_upstream() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["authorization"] == "Bearer upstream-token"
@@ -564,6 +581,22 @@ async def test_query_string_forwarded_to_upstream() -> None:
 
     async with await _client() as client:
         response = await client.get("/v1/models?api-version=2024-06-01")
+
+    assert response.status_code == 200
+
+
+@respx.mock
+async def test_root_models_route_preserves_query_string() -> None:
+    """Root-level model discovery should preserve query parameters."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert "api-version=2024-06-01" in str(request.url)
+        return httpx.Response(200, json={"object": "list", "data": []})
+
+    respx.get("http://upstream.test/v1/models").mock(side_effect=handler)
+
+    async with await _client() as client:
+        response = await client.get("/models?api-version=2024-06-01")
 
     assert response.status_code == 200
 

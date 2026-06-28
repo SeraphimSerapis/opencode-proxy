@@ -46,6 +46,7 @@ HOP_BY_HOP_HEADERS = {
 }
 
 CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
+MODELS_PATH = "/v1/models"
 
 
 def build_router(settings: Settings) -> APIRouter:
@@ -57,6 +58,13 @@ def build_router(settings: Settings) -> APIRouter:
     )
     async def chat_completions(request: Request) -> Response:
         return await proxy_chat_completions(request, settings)
+
+    @router.api_route(
+        "/models",
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
+    )
+    async def models(request: Request) -> Response:
+        return await proxy_passthrough(request, settings, MODELS_PATH)
 
     @router.api_route(
         "/{path:path}",

@@ -119,6 +119,7 @@ Hop-by-hop headers such as `Connection` and `Content-Length` are ignored. For st
 
 - `GET /healthz`: local proxy health check.
 - `/v1/chat/completions`: proxied to the upstream with request tool sanitization and response tool-call repair.
+- `/models`: compatibility alias for upstream `/v1/models` discovery.
 - `/{path:path}`: transparent passthrough for other OpenAI-compatible endpoints such as `/v1/models`.
 
 ## Notes
