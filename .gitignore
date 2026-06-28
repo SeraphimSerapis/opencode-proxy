@@ -14,3 +14,4 @@ __pycache__/
 .env.*
 !.env.example
 .firecrawl/
+.agy-judge-result.md

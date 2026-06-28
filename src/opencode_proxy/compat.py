@@ -6,8 +6,10 @@ import html
 import json
 import re
 import uuid
-from collections.abc import Iterable
-from typing import Any, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 JsonObject = dict[str, Any]
 

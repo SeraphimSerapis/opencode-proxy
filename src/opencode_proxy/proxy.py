@@ -5,8 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from collections.abc import AsyncIterator, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 import httpx
@@ -24,7 +23,11 @@ from opencode_proxy.compat import (
     parse_raw_tool_calls,
     strip_empty_tool_calls,
 )
-from opencode_proxy.settings import Settings
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Mapping
+
+    from opencode_proxy.settings import Settings
 
 LOG = logging.getLogger(__name__)
 UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=30.0)
