@@ -10,13 +10,15 @@ from opencode_proxy.compat import (
     parse_raw_tool_calls,
 )
 
+BAR = "\uff5c"
+
 
 def test_parse_deepseek_dsml_name_parameters() -> None:
-    content = """
-    <｜DSML｜tool_calls>
+    content = f"""
+    <{BAR}DSML{BAR}tool_calls>
     <name>bash</name>
-    <parameters>{&quot;cmd&quot;:&quot;ls -la&quot;}</parameters>
-    </｜DSML｜tool_calls>
+    <parameters>{{&quot;cmd&quot;:&quot;ls -la&quot;}}</parameters>
+    </{BAR}DSML{BAR}tool_calls>
     """
 
     tool_calls = parse_raw_tool_calls(content)

@@ -7,7 +7,7 @@ import json
 import re
 import uuid
 from collections.abc import Iterable
-from typing import Any, NotRequired, TypedDict, cast
+from typing import Any, NotRequired, TypedDict
 
 JsonObject = dict[str, Any]
 
@@ -395,7 +395,7 @@ def _make_chunk(
         "choices": [
             {
                 "index": 0,
-                "delta": cast(ChatCompletionDelta, delta),
+                "delta": delta,
                 "finish_reason": finish_reason,
             },
         ],
