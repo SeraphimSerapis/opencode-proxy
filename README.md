@@ -64,14 +64,26 @@ docker run --rm -p 9526:9526 \
   opencode-proxy:local
 ```
 
+When this repository is pushed to GitHub, the publish workflow builds:
+
+```bash
+docker pull ghcr.io/seraphimserapis/opencode-proxy:latest
+docker run --rm -p 9526:9526 \
+  -e UPSTREAM_URL=http://host.docker.internal:4000 \
+  ghcr.io/seraphimserapis/opencode-proxy:latest
+```
+
 ## Validation
 
 ```bash
+uv sync --dev
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src tests
 uv run pytest
 ```
+
+CI also runs a Docker build smoke test.
 
 ## Environment
 
@@ -83,3 +95,15 @@ uv run pytest
 | `LOG_LEVEL` | `INFO` | Python logging level. |
 | `STREAM_GUARD_CHARS` | `192` | Text held back while detecting split raw tool-call tags. |
 | `TOOL_ARGUMENT_CHUNK_SIZE` | `64` | Size for streamed function argument deltas. |
+
+## API Surface
+
+- `GET /healthz`: local proxy health check.
+- `/v1/chat/completions`: proxied to LiteLLM with request tool sanitization and response tool-call repair.
+- `/{path:path}`: transparent passthrough for other OpenAI-compatible endpoints such as `/v1/models`.
+
+## Notes
+
+- Set `UPSTREAM_URL` to the LiteLLM router base URL, not the `/v1` path.
+- The proxy strips compressed SSE request headers so streamed responses can be parsed line by line.
+- If an upstream response already contains standard OpenAI `tool_calls`, it is passed through unchanged.
