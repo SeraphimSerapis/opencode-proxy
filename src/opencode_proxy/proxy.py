@@ -80,7 +80,7 @@ async def proxy_chat_completions(request: Request, settings: Settings) -> Respon
 
 async def proxy_passthrough(request: Request, settings: Settings, path: str) -> Response:
     body = await request.body()
-    headers = _forward_request_headers(request, stream=False)
+    headers = _forward_request_headers(request, settings=settings, stream=False)
     try:
         async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
             upstream_response = await client.request(
@@ -106,7 +106,7 @@ async def _proxy_buffered_chat_completion(
     parsed_body: JsonObject | None,
     raw_body: bytes,
 ) -> Response:
-    headers = _forward_request_headers(request, stream=False)
+    headers = _forward_request_headers(request, settings=settings, stream=False)
     try:
         async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
             upstream_response = await client.request(
@@ -161,7 +161,7 @@ async def _proxy_streaming_chat_completion(
     parsed_body: JsonObject | None,
     raw_body: bytes,
 ) -> Response:
-    headers = _forward_request_headers(request, stream=True)
+    headers = _forward_request_headers(request, settings=settings, stream=True)
 
     client = httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT)
     try:
@@ -355,7 +355,9 @@ def _sanitize_tools(body: JsonObject) -> None:
         body.pop("tools", None)
 
 
-def _forward_request_headers(request: Request, *, stream: bool) -> dict[str, str]:
+def _forward_request_headers(
+    request: Request, *, settings: Settings, stream: bool
+) -> dict[str, str]:
     headers: dict[str, str] = {}
     for key, value in request.headers.items():
         lower_key = key.lower()
@@ -373,7 +375,22 @@ def _forward_request_headers(request: Request, *, stream: bool) -> dict[str, str
     if client_host and "x-forwarded-for" not in {key.lower() for key in headers}:
         headers["x-forwarded-for"] = client_host
 
+    for key, value in settings.parsed_custom_headers.items():
+        lower_key = key.lower()
+        if lower_key in HOP_BY_HOP_HEADERS:
+            continue
+        if stream and lower_key == "accept-encoding":
+            continue
+        _set_header(headers, key, value)
+
     return headers
+
+
+def _set_header(headers: dict[str, str], key: str, value: str) -> None:
+    for existing_key in list(headers):
+        if existing_key.lower() == key.lower():
+            headers.pop(existing_key)
+    headers[key] = value
 
 
 def _forward_response_headers(headers: httpx.Headers) -> dict[str, str]:

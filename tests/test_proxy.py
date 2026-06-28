@@ -11,8 +11,8 @@ from opencode_proxy.settings import Settings
 BAR = "\uff5c"
 
 
-async def _client() -> httpx.AsyncClient:
-    app = create_app(Settings(upstream_url="http://upstream.test"))
+async def _client(settings: Settings | None = None) -> httpx.AsyncClient:
+    app = create_app(settings or Settings(upstream_url="http://upstream.test"))
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://proxy.test")
 
@@ -195,3 +195,45 @@ async def test_non_chat_route_passes_through() -> None:
     assert route.called
     assert response.status_code == 200
     assert response.json()["data"][0]["id"] == "model-a"
+
+
+@respx.mock
+async def test_custom_headers_are_forwarded_to_upstream() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer upstream-token"
+        assert request.headers["x-skip-auth"] == "true"
+        return httpx.Response(200, json={"object": "list", "data": []})
+
+    respx.get("http://upstream.test/v1/models").mock(side_effect=handler)
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        custom_headers='{"Authorization":"Bearer upstream-token","X-Skip-Auth":"true"}',
+    )
+
+    async with await _client(settings) as client:
+        response = await client.get(
+            "/v1/models",
+            headers={"Authorization": "Bearer client-token"},
+        )
+
+    assert response.status_code == 200
+
+
+@respx.mock
+async def test_custom_hop_by_hop_headers_are_not_forwarded() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["x-test"] == "yes"
+        assert request.headers.get("connection") != "close"
+        assert request.headers.get("content-length") != "999"
+        return httpx.Response(200, json={"object": "list", "data": []})
+
+    respx.get("http://upstream.test/v1/models").mock(side_effect=handler)
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        custom_headers='{"Connection":"close","Content-Length":"999","X-Test":"yes"}',
+    )
+
+    async with await _client(settings) as client:
+        response = await client.get("/v1/models")
+
+    assert response.status_code == 200

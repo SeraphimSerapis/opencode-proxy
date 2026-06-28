@@ -61,6 +61,7 @@ Point OpenCode at the proxy, not directly at LiteLLM:
 docker build -t opencode-proxy:local .
 docker run --rm -p 9526:9526 \
   -e UPSTREAM_URL=http://host.docker.internal:4000 \
+  -e 'CUSTOM_HEADERS={"X-Skip-Auth":"true"}' \
   opencode-proxy:local
 ```
 
@@ -70,6 +71,7 @@ When this repository is pushed to GitHub, the publish workflow builds:
 docker pull ghcr.io/seraphimserapis/opencode-proxy:latest
 docker run --rm -p 9526:9526 \
   -e UPSTREAM_URL=http://host.docker.internal:4000 \
+  -e 'CUSTOM_HEADERS={"X-Skip-Auth":"true"}' \
   ghcr.io/seraphimserapis/opencode-proxy:latest
 ```
 
@@ -95,6 +97,23 @@ CI also runs a Docker build smoke test.
 | `LOG_LEVEL` | `INFO` | Python logging level. |
 | `STREAM_GUARD_CHARS` | `192` | Text held back while detecting split raw tool-call tags. |
 | `TOOL_ARGUMENT_CHUNK_SIZE` | `64` | Size for streamed function argument deltas. |
+| `CUSTOM_HEADERS` | unset | Extra headers added to upstream requests. Overrides forwarded client headers. |
+| `UPSTREAM_HEADERS` | unset | Alias for `CUSTOM_HEADERS`. |
+
+`CUSTOM_HEADERS` accepts a JSON object:
+
+```bash
+CUSTOM_HEADERS='{"Authorization":"Bearer local-dev-token","X-Skip-Auth":"true"}'
+```
+
+It also accepts newline-separated `Header: value` pairs, which is useful in `.env` files:
+
+```dotenv
+CUSTOM_HEADERS="Authorization: Bearer local-dev-token
+X-Skip-Auth: true"
+```
+
+Hop-by-hop headers such as `Connection` and `Content-Length` are ignored. For streaming requests, `Accept-Encoding` is also ignored so SSE can be parsed safely.
 
 ## API Surface
 

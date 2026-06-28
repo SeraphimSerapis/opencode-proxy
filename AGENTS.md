@@ -49,6 +49,7 @@ docker run --rm -p 9526:9526 -e UPSTREAM_URL=http://host.docker.internal:4000 op
 - `LOG_LEVEL`: Python logging level. Default: `INFO`.
 - `STREAM_GUARD_CHARS`: amount of non-tool text to hold while checking for split tool tags. Default: `192`.
 - `TOOL_ARGUMENT_CHUNK_SIZE`: streamed function argument chunk size. Default: `64`.
+- `CUSTOM_HEADERS`: extra headers applied to upstream requests. Prefer JSON object syntax. `UPSTREAM_HEADERS` is accepted as an alias.
 
 ## Release Expectations
 
