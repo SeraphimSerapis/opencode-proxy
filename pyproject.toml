@@ -19,7 +19,7 @@ dependencies = [
   "uvicorn[standard]>=0.38.0",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
   "mypy>=1.19.0",
   "pytest>=9.0.0",

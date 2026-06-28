@@ -21,7 +21,7 @@ Native OpenAI `tool_calls` are passed through unchanged.
 ## Local Development
 
 ```bash
-uv sync --all-extras --dev
+uv sync --dev
 uv run uvicorn opencode_proxy.app:create_app --factory --host 0.0.0.0 --port 9526
 ```
 

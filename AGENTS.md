@@ -19,7 +19,7 @@ Build a small, production-ready FastAPI proxy between OpenCode and an OpenAI-com
 Use `uv` for development:
 
 ```bash
-uv sync --all-extras --dev
+uv sync --dev
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src tests
