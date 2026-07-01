@@ -70,6 +70,26 @@ def test_parse_model_aliases_from_lines() -> None:
     }
 
 
+def test_parse_model_aliases_from_comma_separated_pairs() -> None:
+    aliases = parse_model_aliases(
+        "dsv4-flash=DeepSeek-V4-Flash,deepseek-ai/DeepSeek-V4-Flash-DSpark=DeepSeek-V4-Flash",
+    )
+
+    assert aliases == {
+        "dsv4-flash": "DeepSeek-V4-Flash",
+        "deepseek-ai/DeepSeek-V4-Flash-DSpark": "DeepSeek-V4-Flash",
+    }
+
+
+def test_parse_model_aliases_from_comma_separated_colon_pairs() -> None:
+    aliases = parse_model_aliases("short:canonical, other: target")
+
+    assert aliases == {
+        "short": "canonical",
+        "other": "target",
+    }
+
+
 def test_settings_reads_model_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MODEL_ALIASES", '{"alias":"target"}')
 

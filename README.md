@@ -136,20 +136,27 @@ X-Skip-Auth: true"
 
 Hop-by-hop headers such as `Connection` and `Content-Length` are ignored. For streaming requests, `Accept-Encoding` is also ignored so SSE can be parsed safely.
 
-`MODEL_ALIASES` accepts a JSON object mapping alias to canonical upstream model:
+`MODEL_ALIASES` accepts comma-separated `alias=target` pairs, which is usually
+the simplest form for Docker Compose and `.env` files:
 
 ```bash
-MODEL_ALIASES='{"dsv4-flash":"DeepSeek-V4-Flash","deepseek-ai/DeepSeek-V4-Flash-DSpark":"DeepSeek-V4-Flash"}'
+MODEL_ALIASES=dsv4-flash=DeepSeek-V4-Flash,deepseek-ai/DeepSeek-V4-Flash-DSpark=DeepSeek-V4-Flash
 ```
 
-It also accepts newline-separated `alias=target` pairs:
+It also accepts newline-separated pairs and JSON object syntax:
 
 ```dotenv
 MODEL_ALIASES="dsv4-flash=DeepSeek-V4-Flash
 deepseek-ai/DeepSeek-V4-Flash-DSpark=DeepSeek-V4-Flash"
 ```
 
+```bash
+MODEL_ALIASES='{"dsv4-flash":"DeepSeek-V4-Flash","deepseek-ai/DeepSeek-V4-Flash-DSpark":"DeepSeek-V4-Flash"}'
+```
+
 With these aliases, `/v1/chat/completions` requests for `dsv4-flash` are sent upstream as `DeepSeek-V4-Flash`. `/v1/models` and `/models` also include alias entries so clients can discover them.
+On startup, the proxy logs configured alias names. You can also check
+`/healthz/config` and confirm `model_aliases.aliases` contains `dsv4-flash`.
 
 If an alias conflicts with a model already returned by upstream discovery,
 `ALIAS_CONFLICT_POLICY=skip` keeps the upstream entry, `shadow` replaces the

@@ -237,21 +237,28 @@ def parse_model_aliases(raw_aliases: str) -> dict[str, str]:
         }
 
     aliases: dict[str, str] = {}
-    for line in raw_aliases.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if "=" in stripped:
-            alias, target = stripped.split("=", 1)
-        elif ":" in stripped:
-            alias, target = stripped.split(":", 1)
+    for item in _split_alias_items(raw_aliases):
+        if "=" in item:
+            alias, target = item.split("=", 1)
+        elif ":" in item:
+            alias, target = item.split(":", 1)
         else:
-            msg = f"Invalid MODEL_ALIASES line: {stripped!r}"
+            msg = f"Invalid MODEL_ALIASES item: {item!r}"
             raise ValueError(msg)
         alias = alias.strip()
         target = target.strip()
         if not alias or not target:
-            msg = f"Invalid MODEL_ALIASES line: {stripped!r}"
+            msg = f"Invalid MODEL_ALIASES item: {item!r}"
             raise ValueError(msg)
         aliases[alias] = target
     return aliases
+
+
+def _split_alias_items(raw_aliases: str) -> list[str]:
+    items: list[str] = []
+    for line in raw_aliases.splitlines():
+        for item in line.split(","):
+            stripped = item.strip()
+            if stripped:
+                items.append(stripped)
+    return items
