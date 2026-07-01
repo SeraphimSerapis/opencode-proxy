@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from opencode_proxy.compat import (
     build_tool_call_chunks,
     convert_chat_completion_response,
+    extract_raw_tool_call_segments,
     find_raw_tool_start,
     has_complete_raw_tool_block,
     has_raw_tool_prefix,
@@ -12,9 +14,11 @@ from opencode_proxy.compat import (
     normalize_raw_tool_markup,
     parse_raw_tool_calls,
     strip_empty_tool_calls,
+    tool_calls_within_limits,
 )
 
 BAR = "\uff5c"
+FIXTURE_DIR = Path(__file__).parent / "fixtures" / "tool_calls"
 
 
 def test_parse_deepseek_dsml_name_parameters() -> None:
@@ -97,6 +101,60 @@ def test_parse_qwen_function_parameter_format() -> None:
     assert json.loads(tool_calls[0]["function"]["arguments"]) == {"pattern": "*.py"}
 
 
+def test_parse_qwen_json_tool_call_format() -> None:
+    content = """
+    <tool_call>
+    {"name":"search","arguments":{"query":"OpenCode proxy"}}
+    </tool_call>
+    """
+
+    tool_calls = parse_raw_tool_calls(content)
+
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "search"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {
+        "query": "OpenCode proxy",
+    }
+
+
+def test_fixture_corpus_parses_supported_tool_call_formats() -> None:
+    expected_names = {
+        "deepseek_dsml.txt": "bash",
+        "qwen_xml.txt": "read_file",
+        "qwen_json.txt": "search",
+    }
+
+    for fixture_name, expected_name in expected_names.items():
+        tool_calls = parse_raw_tool_calls((FIXTURE_DIR / fixture_name).read_text())
+        assert len(tool_calls) == 1
+        assert tool_calls[0]["function"]["name"] == expected_name
+
+
+def test_extract_raw_tool_call_segments_preserves_surrounding_text() -> None:
+    content = (
+        'Before <tool_call><name>ls</name><parameters>{"path":"."}</parameters></tool_call> after.'
+    )
+
+    tool_calls, remaining, changed = extract_raw_tool_call_segments(content)
+
+    assert changed is True
+    assert len(tool_calls) == 1
+    assert remaining == "Before  after."
+
+
+def test_extract_raw_tool_call_segments_preserves_oversized_block() -> None:
+    content = '<tool_call><name>ls</name><parameters>{"path":"."}</parameters></tool_call>'
+
+    tool_calls, remaining, changed = extract_raw_tool_call_segments(
+        content,
+        max_raw_tool_block_chars=10,
+    )
+
+    assert tool_calls == []
+    assert remaining == content
+    assert changed is False
+
+
 def test_convert_non_streaming_response_replaces_content_with_tool_calls() -> None:
     body = {
         "id": "chatcmpl-test",
@@ -121,6 +179,100 @@ def test_convert_non_streaming_response_replaces_content_with_tool_calls() -> No
     assert choice["finish_reason"] == "tool_calls"
     assert choice["message"]["content"] is None
     assert choice["message"]["tool_calls"][0]["function"] == {"name": "ls", "arguments": "{}"}
+
+
+def test_convert_non_streaming_response_repairs_all_choices() -> None:
+    body = {
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "content": (
+                        "<tool_call><name>read</name>"
+                        '<parameters>{"path":"a"}</parameters></tool_call>'
+                    ),
+                },
+                "finish_reason": "stop",
+            },
+            {
+                "index": 1,
+                "message": {
+                    "content": (
+                        "<tool_call><name>write</name>"
+                        '<parameters>{"path":"b"}</parameters></tool_call>'
+                    ),
+                },
+                "finish_reason": "stop",
+            },
+        ],
+    }
+
+    converted, changed = convert_chat_completion_response(body)
+
+    assert changed is True
+    assert converted["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "read"
+    assert converted["choices"][1]["message"]["tool_calls"][0]["function"]["name"] == "write"
+    assert converted["choices"][0]["finish_reason"] == "tool_calls"
+    assert converted["choices"][1]["finish_reason"] == "tool_calls"
+
+
+def test_convert_non_streaming_response_scans_reasoning_content() -> None:
+    body = {
+        "choices": [
+            {
+                "message": {
+                    "content": None,
+                    "reasoning_content": (
+                        "<tool_call><name>read</name>"
+                        '<parameters>{"path":"README.md"}</parameters></tool_call>'
+                    ),
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+
+    converted, changed = convert_chat_completion_response(body)
+
+    assert changed is True
+    message = converted["choices"][0]["message"]
+    assert message["reasoning_content"] is None
+    assert message["content"] is None
+    assert message["tool_calls"][0]["function"]["name"] == "read"
+
+
+def test_convert_non_streaming_response_preserves_over_limit_tool_call() -> None:
+    content = (
+        '<tool_call><name>write</name><parameters>{"content":"abcdef"}</parameters></tool_call>'
+    )
+    body = {
+        "choices": [
+            {
+                "message": {"content": content},
+                "finish_reason": "stop",
+            }
+        ]
+    }
+
+    converted, changed = convert_chat_completion_response(
+        body,
+        max_tool_argument_chars=5,
+    )
+
+    assert changed is False
+    assert converted["choices"][0]["message"]["content"] == content
+
+
+def test_tool_calls_within_limits_rejects_too_many_calls() -> None:
+    tool_calls = [make_tool_call("a", {}), make_tool_call("b", {})]
+
+    assert tool_calls_within_limits(tool_calls, max_tool_calls=1) is False
+
+
+def test_tool_calls_within_limits_rejects_large_arguments() -> None:
+    tool_calls = [make_tool_call("write", {"content": "abcdef"})]
+
+    assert tool_calls_within_limits(tool_calls, max_tool_argument_chars=5) is False
 
 
 def test_existing_tool_calls_pass_through() -> None:

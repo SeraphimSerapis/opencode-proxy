@@ -1,0 +1,4 @@
+<tool_call>
+  <name>read_file</name>
+  <parameters>{"path":"README.md"}</parameters>
+</tool_call>

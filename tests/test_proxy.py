@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from typing import Any
 
 import httpx
 import respx
@@ -9,12 +11,21 @@ from opencode_proxy.app import create_app
 from opencode_proxy.settings import Settings
 
 BAR = "\uff5c"
+FIXTURE_DIR = Path(__file__).parent / "fixtures" / "tool_calls"
 
 
 async def _client(settings: Settings | None = None) -> httpx.AsyncClient:
     app = create_app(settings or Settings(upstream_url="http://upstream.test"))
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://proxy.test")
+
+
+def _stream_payloads(response: httpx.Response) -> list[dict[str, Any]]:
+    return [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
 
 
 @respx.mock
@@ -132,6 +143,78 @@ async def test_streaming_chat_completion_is_converted() -> None:
 
 
 @respx.mock
+async def test_streaming_sse_comments_multiline_data_and_duplicate_done() -> None:
+    chunk = {
+        "id": "chatcmpl-sse",
+        "object": "chat.completion.chunk",
+        "model": "qwen",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": "hello"},
+                "finish_reason": None,
+            }
+        ],
+    }
+    payload = json.dumps(chunk)
+    first_part, second_part = payload.split('"object"', 1)
+    sse = (
+        ": keepalive\n\n"
+        f"data: {first_part}\n"
+        f'data: "object"{second_part}\n\n'
+        "data: [DONE]\n\n"
+        "data: [DONE]\n\n"
+    )
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=sse.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert ": keepalive" in response.text
+    assert response.text.count("data: [DONE]") == 1
+    assert _stream_payloads(response)[0]["choices"][0]["delta"]["content"] == "hello"
+
+
+@respx.mock
+async def test_streaming_non_sse_response_passes_through() -> None:
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=b'{"message":"not an sse stream"}',
+            headers={"content-type": "application/json"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json() == {"message": "not an sse stream"}
+
+
+@respx.mock
 async def test_chat_completion_request_drops_non_function_tools() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
@@ -174,6 +257,76 @@ async def test_chat_completion_request_drops_non_function_tools() -> None:
                         },
                     },
                 ],
+            },
+        )
+
+    assert response.status_code == 200
+
+
+@respx.mock
+async def test_chat_completion_request_keeps_non_function_tools_when_disabled() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["tools"] == [{"type": "custom", "name": "kept"}]
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(side_effect=handler)
+    settings = Settings(upstream_url="http://upstream.test", sanitize_tools=False)
+
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test",
+                "messages": [{"role": "user", "content": "x"}],
+                "tools": [{"type": "custom", "name": "kept"}],
+            },
+        )
+
+    assert response.status_code == 200
+
+
+@respx.mock
+async def test_chat_completion_request_drops_configured_fields() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert "parallel_tool_calls" not in payload
+        assert payload["model"] == "test"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(side_effect=handler)
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        request_drop_fields="parallel_tool_calls",
+    )
+
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test",
+                "parallel_tool_calls": False,
+                "messages": [{"role": "user", "content": "x"}],
             },
         )
 
@@ -234,6 +387,130 @@ async def test_custom_headers_are_forwarded_to_upstream() -> None:
         )
 
     assert response.status_code == 200
+
+
+@respx.mock
+async def test_model_alias_rewrites_chat_completion_request() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["model"] == "DeepSeek-V4-Flash"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(side_effect=handler)
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        model_aliases='{"dsv4-flash":"DeepSeek-V4-Flash"}',
+    )
+
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "dsv4-flash", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert response.status_code == 200
+
+
+@respx.mock
+async def test_model_aliases_are_added_to_v1_models() -> None:
+    respx.get("http://upstream.test/v1/models").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {
+                        "id": "DeepSeek-V4-Flash",
+                        "object": "model",
+                        "owned_by": "local",
+                    }
+                ],
+            },
+        ),
+    )
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        model_aliases=(
+            '{"dsv4-flash":"DeepSeek-V4-Flash",'
+            '"deepseek-ai/DeepSeek-V4-Flash-DSpark":"DeepSeek-V4-Flash"}'
+        ),
+    )
+
+    async with await _client(settings) as client:
+        response = await client.get("/v1/models")
+
+    assert response.status_code == 200
+    model_ids = {model["id"] for model in response.json()["data"]}
+    assert model_ids == {
+        "DeepSeek-V4-Flash",
+        "dsv4-flash",
+        "deepseek-ai/DeepSeek-V4-Flash-DSpark",
+    }
+
+
+@respx.mock
+async def test_model_alias_conflict_error_policy_returns_409() -> None:
+    respx.get("http://upstream.test/v1/models").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {"id": "alias", "object": "model", "owned_by": "upstream"},
+                    {"id": "target", "object": "model", "owned_by": "upstream"},
+                ],
+            },
+        ),
+    )
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        model_aliases='{"alias":"target"}',
+        alias_conflict_policy="error",
+    )
+
+    async with await _client(settings) as client:
+        response = await client.get("/v1/models")
+
+    assert response.status_code == 409
+    assert response.json()["error"]["type"] == "alias_conflict"
+
+
+@respx.mock
+async def test_model_alias_conflict_shadow_policy_replaces_discovery_entry() -> None:
+    respx.get("http://upstream.test/v1/models").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {"id": "alias", "object": "model", "owned_by": "upstream-original"},
+                    {"id": "target", "object": "model", "owned_by": "target-owner"},
+                ],
+            },
+        ),
+    )
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        model_aliases='{"alias":"target"}',
+        alias_conflict_policy="shadow",
+    )
+
+    async with await _client(settings) as client:
+        response = await client.get("/v1/models")
+
+    assert response.status_code == 200
+    aliases = [entry for entry in response.json()["data"] if entry["id"] == "alias"]
+    assert aliases == [{"id": "alias", "object": "model", "owned_by": "target-owner"}]
 
 
 @respx.mock
@@ -654,6 +931,430 @@ async def test_streaming_multiple_tool_calls_converted() -> None:
     assert "read" in tool_names
     assert "write" in tool_names
     assert lines[-1] == "data: [DONE]"
+
+
+@respx.mock
+async def test_streaming_trailing_text_after_tool_call_is_preserved() -> None:
+    content = (
+        "Before "
+        '<tool_call><name>read</name><parameters>{"path":"README.md"}</parameters></tool_call>'
+        " after."
+    )
+    chunk = {
+        "id": "chatcmpl-trailing",
+        "object": "chat.completion.chunk",
+        "model": "qwen",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": None,
+            }
+        ],
+    }
+    finish_chunk = {
+        "id": "chatcmpl-trailing",
+        "object": "chat.completion.chunk",
+        "model": "qwen",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }
+    sse = f"data: {json.dumps(chunk)}\n\ndata: {json.dumps(finish_chunk)}\n\ndata: [DONE]\n\n"
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=sse.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen",
+                "stream": True,
+                "messages": [{"role": "user", "content": "read"}],
+            },
+        )
+
+    assert response.status_code == 200
+    payloads = _stream_payloads(response)
+    content_text = "".join(
+        payload["choices"][0]["delta"].get("content", "") or "" for payload in payloads
+    )
+    assert content_text == "Before  after."
+    assert payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    assert [line for line in response.text.splitlines() if line][-1] == "data: [DONE]"
+
+
+@respx.mock
+async def test_streaming_long_raw_tool_block_does_not_leak_markup() -> None:
+    long_value = "x" * 500
+    first = {
+        "id": "chatcmpl-long",
+        "object": "chat.completion.chunk",
+        "model": "qwen",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "content": (
+                        '<tool_call><name>write</name><parameters>{"content":"' + long_value[:250]
+                    )
+                },
+                "finish_reason": None,
+            }
+        ],
+    }
+    second = {
+        "id": "chatcmpl-long",
+        "object": "chat.completion.chunk",
+        "model": "qwen",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": long_value[250:] + '"}</parameters></tool_call>'},
+                "finish_reason": None,
+            }
+        ],
+    }
+    sse = f"data: {json.dumps(first)}\n\ndata: {json.dumps(second)}\n\ndata: [DONE]\n\n"
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=sse.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen",
+                "stream": True,
+                "messages": [{"role": "user", "content": "write"}],
+            },
+        )
+
+    assert response.status_code == 200
+    payloads = _stream_payloads(response)
+    assert "<tool_call>" not in response.text
+    streamed_arguments = "".join(
+        payload["choices"][0]["delta"]["tool_calls"][0]["function"].get("arguments", "")
+        for payload in payloads
+        if payload["choices"][0]["delta"].get("tool_calls")
+    )
+    assert json.loads(streamed_arguments) == {"content": long_value}
+
+
+@respx.mock
+async def test_streaming_oversized_raw_tool_block_passes_through_as_text() -> None:
+    content = (
+        '<tool_call><name>write</name><parameters>{"content":"abcdef"}</parameters></tool_call>'
+    )
+    chunk = {
+        "id": "chatcmpl-limit",
+        "object": "chat.completion.chunk",
+        "model": "qwen",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": None,
+            }
+        ],
+    }
+    sse = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=sse.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        max_raw_tool_block_chars=10,
+    )
+
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen",
+                "stream": True,
+                "messages": [{"role": "user", "content": "write"}],
+            },
+        )
+
+    assert response.status_code == 200
+    content_text = "".join(
+        payload["choices"][0]["delta"].get("content", "") or ""
+        for payload in _stream_payloads(response)
+    )
+    assert content_text == content
+    assert '"tool_calls"' not in response.text
+
+
+@respx.mock
+async def test_streaming_over_tool_call_count_limit_passes_through_as_text() -> None:
+    content = (
+        "<tool_calls>"
+        "<name>read</name><parameters>{}</parameters>"
+        "<name>write</name><parameters>{}</parameters>"
+        "</tool_calls>"
+    )
+    chunk = {
+        "id": "chatcmpl-count-limit",
+        "object": "chat.completion.chunk",
+        "model": "qwen",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": None,
+            }
+        ],
+    }
+    sse = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=sse.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+    settings = Settings(upstream_url="http://upstream.test", max_tool_calls=1)
+
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen",
+                "stream": True,
+                "messages": [{"role": "user", "content": "write"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert content in response.text
+    assert '"tool_calls"' not in response.text
+
+
+@respx.mock
+async def test_streaming_upstream_disconnect_mid_tool_block_flushes_text_and_done() -> None:
+    content = '<tool_call><name>write</name><parameters>{"content":"unfinished"'
+    chunk = {
+        "id": "chatcmpl-disconnect",
+        "object": "chat.completion.chunk",
+        "model": "qwen",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": None,
+            }
+        ],
+    }
+    sse = f"data: {json.dumps(chunk)}\n\n"
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=sse.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen",
+                "stream": True,
+                "messages": [{"role": "user", "content": "write"}],
+            },
+        )
+
+    assert response.status_code == 200
+    content_text = "".join(
+        payload["choices"][0]["delta"].get("content", "") or ""
+        for payload in _stream_payloads(response)
+    )
+    assert content_text == content
+    assert response.text.count("data: [DONE]") == 1
+
+
+@respx.mock
+async def test_streaming_repairs_multiple_choice_indexes() -> None:
+    chunk = {
+        "id": "chatcmpl-choices",
+        "object": "chat.completion.chunk",
+        "model": "qwen",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "content": (
+                        "<tool_call><name>read</name>"
+                        '<parameters>{"path":"a"}</parameters></tool_call>'
+                    )
+                },
+                "finish_reason": None,
+            },
+            {
+                "index": 1,
+                "delta": {
+                    "content": (
+                        "<tool_call><name>write</name>"
+                        '<parameters>{"path":"b"}</parameters></tool_call>'
+                    )
+                },
+                "finish_reason": None,
+            },
+        ],
+    }
+    sse = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=sse.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen",
+                "stream": True,
+                "messages": [{"role": "user", "content": "do both"}],
+            },
+        )
+
+    assert response.status_code == 200
+    names_by_choice = {
+        payload["choices"][0]["index"]: payload["choices"][0]["delta"]["tool_calls"][0]["function"][
+            "name"
+        ]
+        for payload in _stream_payloads(response)
+        if payload["choices"][0]["delta"].get("tool_calls")
+        and "name" in payload["choices"][0]["delta"]["tool_calls"][0].get("function", {})
+    }
+    assert names_by_choice == {0: "read", 1: "write"}
+
+
+@respx.mock
+async def test_streaming_reasoning_content_tool_call_is_converted() -> None:
+    chunk = {
+        "id": "chatcmpl-reasoning-tool",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-r1",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "reasoning_content": (
+                        "<tool_call><name>read</name>"
+                        '<parameters>{"path":"README.md"}</parameters></tool_call>'
+                    )
+                },
+                "finish_reason": None,
+            }
+        ],
+    }
+    sse = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=sse.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "deepseek-r1",
+                "stream": True,
+                "messages": [{"role": "user", "content": "read"}],
+            },
+        )
+
+    assert response.status_code == 200
+    payloads = _stream_payloads(response)
+    assert "reasoning_content" not in response.text
+    tool_names = [
+        payload["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]
+        for payload in payloads
+        if payload["choices"][0]["delta"].get("tool_calls")
+        and "name" in payload["choices"][0]["delta"]["tool_calls"][0].get("function", {})
+    ]
+    assert tool_names == ["read"]
+
+
+@respx.mock
+async def test_e2e_opencode_like_stream_with_alias_and_fixture() -> None:
+    fixture_content = (FIXTURE_DIR / "qwen_json.txt").read_text()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["model"] == "DeepSeek-V4-Flash"
+        chunk = {
+            "id": "chatcmpl-e2e",
+            "object": "chat.completion.chunk",
+            "model": payload["model"],
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": fixture_content},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        return httpx.Response(
+            200,
+            content=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(side_effect=handler)
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        model_aliases='{"dsv4-flash":"DeepSeek-V4-Flash"}',
+    )
+
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dsv4-flash",
+                "stream": True,
+                "messages": [{"role": "user", "content": "search"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "search",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    payloads = _stream_payloads(response)
+    tool_names = [
+        payload["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]
+        for payload in payloads
+        if payload["choices"][0]["delta"].get("tool_calls")
+        and "name" in payload["choices"][0]["delta"]["tool_calls"][0].get("function", {})
+    ]
+    assert tool_names == ["search"]
+    assert response.text.count("data: [DONE]") == 1
 
 
 @respx.mock

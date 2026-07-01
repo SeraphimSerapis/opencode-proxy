@@ -25,8 +25,36 @@ RAW_TOOL_START_MARKERS = (
     DSML_OPEN,
     "<|DSML|tool_calls>",
     "<DSML>tool_calls>",
+    "<DSML: tool_calls>",
     "<tool_calls>",
     "<tool_call>",
+)
+
+RAW_TOOL_BLOCK_PATTERNS = (
+    (
+        re.compile(re.escape(DSML_OPEN), re.DOTALL),
+        re.compile(re.escape(DSML_CLOSE), re.DOTALL),
+    ),
+    (
+        re.compile(r"<\|DSML\|tool_calls\s*>", re.DOTALL),
+        re.compile(r"</\|DSML\|tool_calls\s*>", re.DOTALL),
+    ),
+    (
+        re.compile(r"<DSML>\s*tool_calls\s*>", re.DOTALL),
+        re.compile(r"</DSML[:\s]+tool_calls\s*>", re.DOTALL),
+    ),
+    (
+        re.compile(r"<DSML[:\s]+tool_calls\s*>", re.DOTALL),
+        re.compile(r"</DSML[:\s]+tool_calls\s*>", re.DOTALL),
+    ),
+    (
+        re.compile(r"<tool_calls\s*>", re.DOTALL),
+        re.compile(r"</tool_calls\s*>", re.DOTALL),
+    ),
+    (
+        re.compile(r"<tool_call\b[^>]*>", re.DOTALL),
+        re.compile(r"</tool_call\s*>", re.DOTALL),
+    ),
 )
 
 
@@ -106,10 +134,7 @@ def normalize_raw_tool_markup(text: str) -> str:
 
 
 def has_complete_raw_tool_block(text: str) -> bool:
-    normalized = normalize_raw_tool_markup(text)
-    return (DSML_OPEN in normalized and DSML_CLOSE in normalized) or (
-        "<tool_call>" in normalized and "</tool_call>" in normalized
-    )
+    return find_complete_raw_tool_block_span(text) is not None
 
 
 def has_raw_tool_prefix(text: str) -> bool:
@@ -133,11 +158,66 @@ def has_raw_tool_prefix(text: str) -> bool:
 
 
 def find_raw_tool_start(text: str) -> int | None:
-    normalized = normalize_raw_tool_markup(text)
-    indexes = [idx for marker in RAW_TOOL_START_MARKERS if (idx := normalized.find(marker)) != -1]
+    indexes = [
+        match.start()
+        for start_pattern, _ in RAW_TOOL_BLOCK_PATTERNS
+        for match in start_pattern.finditer(text)
+    ]
     if not indexes:
         return None
     return min(indexes)
+
+
+def find_complete_raw_tool_block_span(text: str) -> tuple[int, int] | None:
+    spans: list[tuple[int, int]] = []
+    for start_pattern, close_pattern in RAW_TOOL_BLOCK_PATTERNS:
+        for start_match in start_pattern.finditer(text):
+            close_match = close_pattern.search(text, start_match.end())
+            if close_match is not None:
+                spans.append((start_match.start(), close_match.end()))
+                break
+
+    if not spans:
+        return None
+    return min(spans, key=lambda span: (span[0], span[1]))
+
+
+def extract_raw_tool_call_segments(
+    text: str,
+    *,
+    max_raw_tool_block_chars: int | None = None,
+) -> tuple[list[ToolCall], str, bool]:
+    """Return parsed tool calls and text with parsed raw tool blocks removed."""
+
+    tool_calls: list[ToolCall] = []
+    text_parts: list[str] = []
+    cursor = 0
+    changed = False
+
+    while cursor < len(text):
+        span = find_complete_raw_tool_block_span(text[cursor:])
+        if span is None:
+            text_parts.append(text[cursor:])
+            break
+
+        start = cursor + span[0]
+        end = cursor + span[1]
+        block = text[start:end]
+        if max_raw_tool_block_chars is not None and len(block) > max_raw_tool_block_chars:
+            text_parts.append(text[cursor:end])
+            cursor = end
+            continue
+
+        parsed = parse_raw_tool_calls(block)
+        if parsed:
+            text_parts.append(text[cursor:start])
+            tool_calls.extend(parsed)
+            changed = True
+        else:
+            text_parts.append(text[cursor:end])
+        cursor = end
+
+    return _dedupe_tool_calls(tool_calls), "".join(text_parts), changed
 
 
 def normalize_argument_value(value: object) -> str:
@@ -198,6 +278,11 @@ def parse_qwen_xml_tool_calls(text: str) -> list[ToolCall]:
             results.extend(name_matches)
             continue
 
+        json_matches = _parse_json_tool_call_block(block)
+        if json_matches:
+            results.extend(json_matches)
+            continue
+
         function_match = re.search(
             r"<function=(?P<name>[^>]+)>(?P<body>.*?)</function>",
             block,
@@ -219,40 +304,92 @@ def parse_qwen_xml_tool_calls(text: str) -> list[ToolCall]:
     return results
 
 
-def convert_chat_completion_response(body: JsonObject) -> tuple[JsonObject, bool]:
-    """Convert non-streaming OpenAI-compatible chat completion JSON in place.
-
-    Only ``choices[0]`` is inspected; ``n>1`` responses are not repaired
-    (OpenCode uses ``n=1``).
-    """
+def convert_chat_completion_response(
+    body: JsonObject,
+    *,
+    tool_call_scan_fields: Iterable[str] = ("content", "reasoning", "reasoning_content"),
+    max_raw_tool_block_chars: int | None = None,
+    max_tool_calls: int | None = None,
+    max_tool_argument_chars: int | None = None,
+) -> tuple[JsonObject, bool]:
+    """Convert non-streaming OpenAI-compatible chat completion JSON in place."""
     choices = body.get("choices")
     if not isinstance(choices, list) or not choices:
         return body, False
 
-    first_choice = choices[0]
-    if not isinstance(first_choice, dict):
-        return body, False
+    changed = False
+    scan_fields = tuple(tool_call_scan_fields)
+    for choice in choices:
+        if isinstance(choice, dict) and _convert_chat_completion_choice(
+            choice,
+            tool_call_scan_fields=scan_fields,
+            max_raw_tool_block_chars=max_raw_tool_block_chars,
+            max_tool_calls=max_tool_calls,
+            max_tool_argument_chars=max_tool_argument_chars,
+        ):
+            changed = True
 
-    message = first_choice.get("message")
+    return body, changed
+
+
+def _convert_chat_completion_choice(
+    choice: JsonObject,
+    *,
+    tool_call_scan_fields: Iterable[str],
+    max_raw_tool_block_chars: int | None,
+    max_tool_calls: int | None,
+    max_tool_argument_chars: int | None,
+) -> bool:
+    message = choice.get("message")
     if not isinstance(message, dict):
-        return body, False
+        return False
 
     existing_tool_calls = message.get("tool_calls")
     if existing_tool_calls:
-        return body, False
+        return False
 
-    content = message.get("content")
-    if not isinstance(content, str) or not has_complete_raw_tool_block(content):
-        return body, False
+    for field in tool_call_scan_fields:
+        value = message.get(field)
+        if not isinstance(value, str) or not has_complete_raw_tool_block(value):
+            continue
 
-    tool_calls = parse_raw_tool_calls(content)
-    if not tool_calls:
-        return body, False
+        tool_calls, remaining_text, changed = extract_raw_tool_call_segments(
+            value,
+            max_raw_tool_block_chars=max_raw_tool_block_chars,
+        )
+        if not changed or not tool_calls:
+            continue
+        if not tool_calls_within_limits(
+            tool_calls,
+            max_tool_calls=max_tool_calls,
+            max_tool_argument_chars=max_tool_argument_chars,
+        ):
+            continue
 
-    message["tool_calls"] = tool_calls
-    message["content"] = None
-    first_choice["finish_reason"] = "tool_calls"
-    return body, True
+        message["tool_calls"] = tool_calls
+        message[field] = remaining_text if remaining_text.strip() else None
+        if "content" not in message:
+            message["content"] = None
+        choice["finish_reason"] = "tool_calls"
+        return True
+
+    return False
+
+
+def tool_calls_within_limits(
+    tool_calls: Iterable[ToolCall],
+    *,
+    max_tool_calls: int | None = None,
+    max_tool_argument_chars: int | None = None,
+) -> bool:
+    tool_call_list = list(tool_calls)
+    if max_tool_calls is not None and len(tool_call_list) > max_tool_calls:
+        return False
+    if max_tool_argument_chars is not None:
+        for tool_call in tool_call_list:
+            if len(tool_call["function"]["arguments"]) > max_tool_argument_chars:
+                return False
+    return True
 
 
 def strip_empty_tool_calls(delta: JsonObject) -> JsonObject:
@@ -270,6 +407,8 @@ def build_tool_call_chunks(
     chunk_id: str,
     model: str,
     argument_chunk_size: int,
+    choice_index: int = 0,
+    include_finish: bool = True,
 ) -> list[ChatCompletionChunk]:
     chunks: list[ChatCompletionChunk] = []
     for index, tool_call in enumerate(tool_calls):
@@ -292,6 +431,7 @@ def build_tool_call_chunks(
                     ],
                 },
                 finish_reason=None,
+                choice_index=choice_index,
             ),
         )
 
@@ -312,18 +452,37 @@ def build_tool_call_chunks(
                         ],
                     },
                     finish_reason=None,
+                    choice_index=choice_index,
                 ),
             )
 
-    chunks.append(
-        _make_chunk(
-            chunk_id=chunk_id,
-            model=model,
-            delta={},
-            finish_reason="tool_calls",
-        ),
-    )
+    if include_finish:
+        chunks.append(
+            _make_chunk(
+                chunk_id=chunk_id,
+                model=model,
+                delta={},
+                finish_reason="tool_calls",
+                choice_index=choice_index,
+            ),
+        )
     return chunks
+
+
+def make_finish_chunk(
+    *,
+    chunk_id: str,
+    model: str,
+    finish_reason: str,
+    choice_index: int = 0,
+) -> ChatCompletionChunk:
+    return _make_chunk(
+        chunk_id=chunk_id,
+        model=model,
+        delta={},
+        finish_reason=finish_reason,
+        choice_index=choice_index,
+    )
 
 
 def _parse_name_parameter_blocks(block: str) -> list[ToolCall]:
@@ -365,6 +524,36 @@ def _parse_dsml_invoke_blocks(block: str) -> list[ToolCall]:
     return results
 
 
+def _parse_json_tool_call_block(block: str) -> list[ToolCall]:
+    raw = html.unescape(block).strip()
+    if raw.startswith("```") and raw.endswith("```"):
+        lines = raw.splitlines()
+        if len(lines) >= 3:
+            raw = "\n".join(lines[1:-1]).strip()
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+    objects: list[JsonObject]
+    if isinstance(parsed, dict):
+        objects = [parsed]
+    elif isinstance(parsed, list):
+        objects = [item for item in parsed if isinstance(item, dict)]
+    else:
+        return []
+
+    results: list[ToolCall] = []
+    for item in objects:
+        name = item.get("name") or item.get("function")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        arguments = item.get("arguments", item.get("parameters", {}))
+        results.append(make_tool_call(name, arguments))
+    return results
+
+
 def _dedupe_tool_calls(tool_calls: list[ToolCall]) -> list[ToolCall]:
     deduped: list[ToolCall] = []
     seen: set[tuple[str, str]] = set()
@@ -383,6 +572,7 @@ def _make_chunk(
     model: str,
     delta: ChatCompletionDelta,
     finish_reason: str | None,
+    choice_index: int = 0,
 ) -> ChatCompletionChunk:
     return {
         "id": chunk_id,
@@ -390,7 +580,7 @@ def _make_chunk(
         "model": model,
         "choices": [
             {
-                "index": 0,
+                "index": choice_index,
                 "delta": delta,
                 "finish_reason": finish_reason,
             },

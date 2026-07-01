@@ -1,0 +1,3 @@
+<tool_call>
+{"name":"search","arguments":{"query":"OpenCode proxy"}}
+</tool_call>

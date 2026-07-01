@@ -24,5 +24,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/healthz/config")
+    async def healthz_config() -> dict[str, object]:
+        return settings.safe_config
+
     app.include_router(build_router(settings))
     return app

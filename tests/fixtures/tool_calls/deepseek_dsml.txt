@@ -1,0 +1,7 @@
+Before
+<|DSML|tool_calls>
+<|DSML|invoke name="bash">
+  <|DSML|parameter name="cmd">pwd</|DSML|parameter>
+</|DSML|invoke>
+</|DSML|tool_calls>
+After
