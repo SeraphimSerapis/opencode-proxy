@@ -221,7 +221,7 @@ def parse_request_drop_fields(value: object) -> tuple[str, ...]:
 
 
 def parse_model_aliases(raw_aliases: str) -> dict[str, str]:
-    raw_aliases = raw_aliases.strip()
+    raw_aliases = _strip_wrapping_quotes(raw_aliases.strip())
     if not raw_aliases:
         return {}
 
@@ -231,9 +231,10 @@ def parse_model_aliases(raw_aliases: str) -> dict[str, str]:
             msg = "MODEL_ALIASES JSON must be an object"
             raise ValueError(msg)
         return {
-            str(alias).strip(): str(target).strip()
+            _strip_wrapping_quotes(str(alias).strip()): _strip_wrapping_quotes(str(target).strip())
             for alias, target in parsed.items()
-            if str(alias).strip() and str(target).strip()
+            if _strip_wrapping_quotes(str(alias).strip())
+            and _strip_wrapping_quotes(str(target).strip())
         }
 
     aliases: dict[str, str] = {}
@@ -245,8 +246,8 @@ def parse_model_aliases(raw_aliases: str) -> dict[str, str]:
         else:
             msg = f"Invalid MODEL_ALIASES item: {item!r}"
             raise ValueError(msg)
-        alias = alias.strip()
-        target = target.strip()
+        alias = _strip_wrapping_quotes(alias.strip())
+        target = _strip_wrapping_quotes(target.strip())
         if not alias or not target:
             msg = f"Invalid MODEL_ALIASES item: {item!r}"
             raise ValueError(msg)
@@ -262,3 +263,9 @@ def _split_alias_items(raw_aliases: str) -> list[str]:
             if stripped:
                 items.append(stripped)
     return items
+
+
+def _strip_wrapping_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1].strip()
+    return value.strip("'\"").strip()

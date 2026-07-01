@@ -81,6 +81,23 @@ def test_parse_model_aliases_from_comma_separated_pairs() -> None:
     }
 
 
+def test_parse_model_aliases_strips_accidental_wrapping_quotes() -> None:
+    aliases = parse_model_aliases(
+        '"dsv4-flash=DeepSeek-V4-Flash,deepseek-ai/DeepSeek-V4-Flash-DSpark=DeepSeek-V4-Flash"',
+    )
+
+    assert aliases == {
+        "dsv4-flash": "DeepSeek-V4-Flash",
+        "deepseek-ai/DeepSeek-V4-Flash-DSpark": "DeepSeek-V4-Flash",
+    }
+
+
+def test_parse_model_aliases_strips_quoted_pair_parts() -> None:
+    aliases = parse_model_aliases('"dsv4-flash"="DeepSeek-V4-Flash"')
+
+    assert aliases == {"dsv4-flash": "DeepSeek-V4-Flash"}
+
+
 def test_parse_model_aliases_from_comma_separated_colon_pairs() -> None:
     aliases = parse_model_aliases("short:canonical, other: target")
 
