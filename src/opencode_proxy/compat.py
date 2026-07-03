@@ -283,24 +283,21 @@ def parse_qwen_xml_tool_calls(text: str) -> list[ToolCall]:
             results.extend(json_matches)
             continue
 
-        function_match = re.search(
+        for function_match in re.finditer(
             r"<function=(?P<name>[^>]+)>(?P<body>.*?)</function>",
             block,
             re.DOTALL,
-        )
-        if function_match is None:
-            continue
-
-        params: JsonObject = {}
-        for param in re.finditer(
-            r"<parameter=(?P<name>[^>]+)>(?P<value>.*?)</parameter>",
-            function_match.group("body"),
-            re.DOTALL,
         ):
-            params[html.unescape(param.group("name")).strip()] = html.unescape(
-                param.group("value"),
-            ).strip()
-        results.append(make_tool_call(function_match.group("name"), params))
+            params: JsonObject = {}
+            for param in re.finditer(
+                r"<parameter=(?P<name>[^>]+)>(?P<value>.*?)</parameter>",
+                function_match.group("body"),
+                re.DOTALL,
+            ):
+                params[html.unescape(param.group("name")).strip()] = html.unescape(
+                    param.group("value"),
+                ).strip()
+            results.append(make_tool_call(function_match.group("name"), params))
     return results
 
 
@@ -511,15 +508,22 @@ def _parse_dsml_invoke_blocks(block: str) -> list[ToolCall]:
         params: JsonObject = {}
         for param in re.finditer(
             re.escape(DSML_PARAMETER_OPEN)
-            + r"""\s+name=(?P<quote>["'])(?P<name>.*?)(?P=quote)[^>]*>"""
+            + r"""\s+name=(?P<quote>["'])(?P<name>.*?)(?P=quote)"""
+            + r"""(?:\s+string=(?P<str_quote>["'])(?P<string>true|false)(?P=str_quote))?[^>]*>"""
             + r"(?P<value>.*?)"
             + re.escape(DSML_PARAMETER_CLOSE),
             remaining[:end],
             re.DOTALL,
         ):
-            params[html.unescape(param.group("name")).strip()] = html.unescape(
-                param.group("value"),
-            ).strip()
+            value = html.unescape(param.group("value")).strip()
+            if param.group("string") == "false":
+                try:
+                    parsed_value = json.loads(value)
+                except json.JSONDecodeError:
+                    parsed_value = value
+            else:
+                parsed_value = value
+            params[html.unescape(param.group("name")).strip()] = parsed_value
         results.append(make_tool_call(invoke.group("name"), params))
     return results
 

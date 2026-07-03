@@ -101,6 +101,55 @@ def test_parse_qwen_function_parameter_format() -> None:
     assert json.loads(tool_calls[0]["function"]["arguments"]) == {"pattern": "*.py"}
 
 
+def test_parse_qwen3_multi_line_function_parameter_format() -> None:
+    content = """
+    <tool_call>
+    <function=get_weather>
+    <parameter=location>San Francisco, CA</parameter>
+    <parameter=unit>celsius</parameter>
+    </function>
+    </tool_call>
+    """
+
+    tool_calls = parse_raw_tool_calls(content)
+
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {
+        "location": "San Francisco, CA",
+        "unit": "celsius",
+    }
+
+
+def test_parse_qwen3_multiple_functions_in_one_tool_call() -> None:
+    content = """
+    <tool_call>
+    <function=get_weather>
+    <parameter=location>San Francisco</parameter>
+    <parameter=unit>celsius</parameter>
+    </function>
+    <function=get_weather>
+    <parameter=location>Seattle</parameter>
+    <parameter=unit>fahrenheit</parameter>
+    </function>
+    </tool_call>
+    """
+
+    tool_calls = parse_raw_tool_calls(content)
+
+    assert len(tool_calls) == 2
+    assert tool_calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {
+        "location": "San Francisco",
+        "unit": "celsius",
+    }
+    assert tool_calls[1]["function"]["name"] == "get_weather"
+    assert json.loads(tool_calls[1]["function"]["arguments"]) == {
+        "location": "Seattle",
+        "unit": "fahrenheit",
+    }
+
+
 def test_parse_qwen_json_tool_call_format() -> None:
     content = """
     <tool_call>
@@ -115,6 +164,46 @@ def test_parse_qwen_json_tool_call_format() -> None:
     assert json.loads(tool_calls[0]["function"]["arguments"]) == {
         "query": "OpenCode proxy",
     }
+
+
+def test_parse_qwen_xml_json_tool_call_format_with_newlines() -> None:
+    content = """<tool_call>
+{"name": "get_weather", "arguments": {"location":"Tokyo"}}
+</tool_call>"""
+
+    tool_calls = parse_raw_tool_calls(content)
+
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"location": "Tokyo"}
+
+
+def test_parse_qwen_xml_json_multiple_tool_calls() -> None:
+    content = """<tool_call>
+{"name": "get_weather", "arguments": {"location":"Shanghai"}}
+</tool_call><tool_call>
+{"name": "add", "arguments": {"x":1,"y":2}}
+</tool_call>"""
+
+    tool_calls = parse_raw_tool_calls(content)
+
+    assert len(tool_calls) == 2
+    assert tool_calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"location": "Shanghai"}
+    assert tool_calls[1]["function"]["name"] == "add"
+    assert json.loads(tool_calls[1]["function"]["arguments"]) == {"x": 1, "y": 2}
+
+
+def test_parse_qwen_xml_json_escaped_function_name() -> None:
+    content = """<tool_call>
+{"name":"say_\\"hi","arguments":{}}
+</tool_call>"""
+
+    tool_calls = parse_raw_tool_calls(content)
+
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == 'say_"hi'
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {}
 
 
 def test_fixture_corpus_parses_supported_tool_call_formats() -> None:
@@ -427,6 +516,49 @@ def test_parse_multiple_dsml_invoke_blocks() -> None:
         "path": "b.py",
         "content": "hi",
     }
+
+
+def test_parse_dsml_invoke_preserves_string_false_json_types() -> None:
+    content = f"""
+    <{BAR}DSML{BAR}tool_calls>
+    <{BAR}DSML{BAR}invoke name="edit">
+      <{BAR}DSML{BAR}parameter name="path" string="true">README.md</{BAR}DSML{BAR}parameter>
+      <{BAR}DSML{BAR}parameter name="count" string="false">5</{BAR}DSML{BAR}parameter>
+      <{BAR}DSML{BAR}parameter name="active" string="false">true</{BAR}DSML{BAR}parameter>
+      <{BAR}DSML{BAR}parameter name="tags" string="false">["a","b"]</{BAR}DSML{BAR}parameter>
+      <{BAR}DSML{BAR}parameter name="meta" string="false">{{"k":"v"}}</{BAR}DSML{BAR}parameter>
+    </{BAR}DSML{BAR}invoke>
+    </{BAR}DSML{BAR}tool_calls>
+    """
+
+    tool_calls = parse_raw_tool_calls(content)
+
+    assert len(tool_calls) == 1
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert arguments == {
+        "path": "README.md",
+        "count": 5,
+        "active": True,
+        "tags": ["a", "b"],
+        "meta": {"k": "v"},
+    }
+
+
+def test_parse_ascii_dsml_invoke_preserves_string_false_json_types() -> None:
+    content = """
+    <|DSML|tool_calls>
+    <|DSML|invoke name="edit">
+      <|DSML|parameter name="count" string="false">42</|DSML|parameter>
+      <|DSML|parameter name="label" string="true">hello</|DSML|parameter>
+    </|DSML|invoke>
+    </|DSML|tool_calls>
+    """
+
+    tool_calls = parse_raw_tool_calls(content)
+
+    assert len(tool_calls) == 1
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert arguments == {"count": 42, "label": "hello"}
 
 
 # --- Deduplication tests ---
