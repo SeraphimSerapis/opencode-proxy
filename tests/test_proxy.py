@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 from pathlib import Path
 from typing import Any
@@ -788,6 +789,28 @@ async def test_passthrough_connection_error_returns_502() -> None:
 
 
 @respx.mock
+async def test_catch_all_streams_request_and_preserves_encoded_response() -> None:
+    request_body = b"input" * 1024
+    response_body = b"output" * 1024
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert await request.aread() == request_body
+        return httpx.Response(
+            200,
+            stream=httpx.ByteStream(gzip.compress(response_body)),
+            headers={"content-type": "application/octet-stream", "content-encoding": "gzip"},
+        )
+
+    respx.post("http://upstream.test/v1/embeddings").mock(side_effect=handler)
+
+    async with await _client() as client:
+        response = await client.post("/v1/embeddings", content=request_body)
+
+    assert response.content == response_body
+    assert response.headers["content-encoding"] == "gzip"
+
+
+@respx.mock
 async def test_streaming_connection_error_returns_502() -> None:
     """Connection errors during streaming setup should return a generic 502."""
     respx.post("http://upstream.test/v1/chat/completions").mock(
@@ -1374,3 +1397,217 @@ async def test_non_streaming_request_without_body() -> None:
         )
 
     assert response.status_code == 400
+
+
+@respx.mock
+async def test_non_streaming_laguna_tool_call_is_converted() -> None:
+    upstream = respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-laguna-1",
+                "object": "chat.completion",
+                "model": "laguna",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": (
+                                "<tool_call>terminal"
+                                "<arg_key>cmd</arg_key><arg_value>uname -a</arg_value>"
+                                "</tool_call>"
+                            ),
+                        },
+                        "finish_reason": "stop",
+                    },
+                ],
+            },
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "laguna", "messages": [{"role": "user", "content": "check OS"}]},
+        )
+
+    assert upstream.called
+    assert response.status_code == 200
+    body = response.json()
+    choice = body["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] is None
+    assert choice["message"]["tool_calls"][0]["function"] == {
+        "name": "terminal",
+        "arguments": '{"cmd":"uname -a"}',
+    }
+
+
+@respx.mock
+async def test_streaming_laguna_tool_call_is_converted() -> None:
+    first_chunk = {
+        "id": "chatcmpl-laguna-stream",
+        "object": "chat.completion.chunk",
+        "model": "laguna",
+        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+    }
+    raw_tool_chunk = {
+        "id": "chatcmpl-laguna-stream",
+        "object": "chat.completion.chunk",
+        "model": "laguna",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "content": (
+                        "<tool_call>terminal"
+                        "<arg_key>cmd</arg_key><arg_value>pwd</arg_value>"
+                        "</tool_call>"
+                    ),
+                },
+                "finish_reason": None,
+            },
+        ],
+    }
+    sse = (
+        f"data: {json.dumps(first_chunk)}\n\ndata: {json.dumps(raw_tool_chunk)}\n\ndata: [DONE]\n\n"
+    )
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=sse.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "laguna",
+                "stream": True,
+                "messages": [{"role": "user", "content": "where"}],
+            },
+        )
+
+    assert response.status_code == 200
+    lines = [line for line in response.text.splitlines() if line.startswith("data: ")]
+    payloads = [line.removeprefix("data: ") for line in lines if line != "data: [DONE]"]
+    chunks = [json.loads(payload) for payload in payloads]
+    tool_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk["choices"][0]["delta"].get("tool_calls")
+        or chunk["choices"][0]["finish_reason"] == "tool_calls"
+    ]
+    assert tool_chunks
+    assert tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "terminal"
+    streamed_arguments = "".join(
+        chunk["choices"][0]["delta"]["tool_calls"][0]["function"].get("arguments", "")
+        for chunk in tool_chunks
+        if chunk["choices"][0]["delta"].get("tool_calls")
+    )
+    assert json.loads(streamed_arguments) == {"cmd": "pwd"}
+    assert lines[-1] == "data: [DONE]"
+
+
+@respx.mock
+async def test_streaming_adjacent_raw_blocks_use_distinct_tool_indexes() -> None:
+    content = (
+        '<tool_call><name>read</name><parameters>{"path":"a"}</parameters></tool_call>'
+        '<tool_call><name>write</name><parameters>{"path":"b"}</parameters></tool_call>'
+    )
+    chunk = {
+        "id": "chatcmpl-adjacent",
+        "object": "chat.completion.chunk",
+        "model": "qwen",
+        "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+    }
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen", "stream": True, "messages": []},
+        )
+
+    named_calls = [
+        tool_call
+        for payload in _stream_payloads(response)
+        for tool_call in payload["choices"][0]["delta"].get("tool_calls", [])
+        if "name" in tool_call.get("function", {})
+    ]
+    assert [(call["function"]["name"], call["index"]) for call in named_calls] == [
+        ("read", 0),
+        ("write", 1),
+    ]
+
+
+@respx.mock
+async def test_compressed_chat_response_drops_stale_content_headers() -> None:
+    payload = json.dumps({"id": "chatcmpl-gzip", "choices": []}).encode()
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=gzip.compress(payload),
+            headers={
+                "content-type": "application/json",
+                "content-encoding": "gzip",
+                "etag": '"compressed-body"',
+            },
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "test", "messages": []},
+        )
+
+    assert response.json()["id"] == "chatcmpl-gzip"
+    assert "content-encoding" not in response.headers
+    assert "etag" not in response.headers
+
+
+@respx.mock
+async def test_streaming_scanned_content_preserves_choice_and_event_metadata() -> None:
+    chunk = {
+        "id": "chatcmpl-metadata",
+        "object": "chat.completion.chunk",
+        "created": 123,
+        "model": "qwen",
+        "system_fingerprint": "fp_test",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": "hello"},
+                "logprobs": {"content": [{"token": "hello", "logprob": -0.1}]},
+                "finish_reason": None,
+            }
+        ],
+    }
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen", "stream": True, "messages": []},
+        )
+
+    payloads = _stream_payloads(response)
+    assert any(payload.get("created") == 123 for payload in payloads)
+    assert any(payload.get("system_fingerprint") == "fp_test" for payload in payloads)
+    assert any(payload["choices"][0].get("logprobs") for payload in payloads)

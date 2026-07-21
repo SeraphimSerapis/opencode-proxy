@@ -47,6 +47,13 @@ HOP_BY_HOP_HEADERS = {
     "content-length",
 }
 
+DECODED_BODY_HEADERS = {
+    "content-encoding",
+    "content-md5",
+    "digest",
+    "etag",
+}
+
 CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
 MODELS_PATH = "/v1/models"
 
@@ -54,8 +61,11 @@ MODELS_PATH = "/v1/models"
 @dataclass
 class StreamChoiceState:
     field_buffers: dict[str, str] = field(default_factory=dict)
+    field_event_metadata: dict[str, JsonObject] = field(default_factory=dict)
+    pending_raw_fields: set[str] = field(default_factory=set)
     raw_tool_calls_emitted: bool = False
     finish_sent: bool = False
+    next_tool_call_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -114,38 +124,39 @@ async def proxy_chat_completions(request: Request, settings: Settings) -> Respon
 
 
 async def proxy_passthrough(request: Request, settings: Settings, path: str) -> Response:
-    body = await request.body()
     headers = _forward_request_headers(request, settings=settings, stream=False)
+    client = _upstream_client(request)
     try:
-        async with httpx.AsyncClient(timeout=_upstream_timeout(settings)) as client:
-            upstream_response = await client.request(
-                request.method,
-                _upstream_url(settings, path, request.url.query),
-                headers=headers,
-                content=body,
-            )
+        upstream_request = client.build_request(
+            request.method,
+            _upstream_url(settings, path, request.url.query),
+            headers=headers,
+            content=request.stream(),
+        )
+        upstream_response = await client.send(upstream_request, stream=True)
     except httpx.HTTPError as exc:
         return _proxy_error(exc)
 
-    return Response(
-        content=upstream_response.content,
+    return StreamingResponse(
+        upstream_response.aiter_raw(),
         status_code=upstream_response.status_code,
-        headers=_forward_response_headers(upstream_response.headers),
+        headers=_forward_response_headers(upstream_response.headers, body_decoded=False),
         media_type=upstream_response.headers.get("content-type"),
+        background=BackgroundTask(upstream_response.aclose),
     )
 
 
 async def proxy_models(request: Request, settings: Settings) -> Response:
     body = await request.body()
     headers = _forward_request_headers(request, settings=settings, stream=False)
+    client = _upstream_client(request)
     try:
-        async with httpx.AsyncClient(timeout=_upstream_timeout(settings)) as client:
-            upstream_response = await client.request(
-                request.method,
-                _upstream_url(settings, MODELS_PATH, request.url.query),
-                headers=headers,
-                content=body,
-            )
+        upstream_response = await client.request(
+            request.method,
+            _upstream_url(settings, MODELS_PATH, request.url.query),
+            headers=headers,
+            content=body,
+        )
     except httpx.HTTPError as exc:
         return _proxy_error(exc)
 
@@ -201,14 +212,14 @@ async def _proxy_buffered_chat_completion(
     raw_body: bytes,
 ) -> Response:
     headers = _forward_request_headers(request, settings=settings, stream=False)
+    client = _upstream_client(request)
     try:
-        async with httpx.AsyncClient(timeout=_upstream_timeout(settings)) as client:
-            upstream_response = await client.request(
-                request.method,
-                _upstream_url(settings, CHAT_COMPLETIONS_PATH, request.url.query),
-                headers=headers,
-                **_body_kwargs(parsed_body, raw_body),
-            )
+        upstream_response = await client.request(
+            request.method,
+            _upstream_url(settings, CHAT_COMPLETIONS_PATH, request.url.query),
+            headers=headers,
+            **_body_kwargs(parsed_body, raw_body),
+        )
     except httpx.HTTPError as exc:
         return _proxy_error(exc)
 
@@ -263,7 +274,7 @@ async def _proxy_streaming_chat_completion(
 ) -> Response:
     headers = _forward_request_headers(request, settings=settings, stream=True)
 
-    client = httpx.AsyncClient(timeout=_upstream_timeout(settings))
+    client = _upstream_client(request)
     try:
         upstream_request = client.build_request(
             request.method,
@@ -273,14 +284,12 @@ async def _proxy_streaming_chat_completion(
         )
         upstream_response = await client.send(upstream_request, stream=True)
     except httpx.HTTPError as exc:
-        await client.aclose()
         return _proxy_error(exc)
 
     response_headers = _forward_response_headers(upstream_response.headers)
     if upstream_response.status_code >= 400:
         content = await upstream_response.aread()
         await upstream_response.aclose()
-        await client.aclose()
         return Response(
             content=content,
             status_code=upstream_response.status_code,
@@ -292,7 +301,6 @@ async def _proxy_streaming_chat_completion(
     if "text/event-stream" not in content_type.lower():
         content = await upstream_response.aread()
         await upstream_response.aclose()
-        await client.aclose()
         return Response(
             content=content,
             status_code=upstream_response.status_code,
@@ -301,7 +309,7 @@ async def _proxy_streaming_chat_completion(
         )
 
     generator = _rewrite_sse_stream(request, upstream_response, settings)
-    background = BackgroundTask(_close_streaming_resources, upstream_response, client)
+    background = BackgroundTask(upstream_response.aclose)
     return StreamingResponse(
         generator,
         status_code=upstream_response.status_code,
@@ -435,14 +443,6 @@ async def _finish_sse_stream(
     yield b"data: [DONE]\n\n"
 
 
-async def _close_streaming_resources(
-    upstream_response: httpx.Response,
-    client: httpx.AsyncClient,
-) -> None:
-    await upstream_response.aclose()
-    await client.aclose()
-
-
 def _rewrite_stream_choice(
     event: JsonObject,
     choice: JsonObject,
@@ -502,7 +502,7 @@ def _rewrite_stream_choice(
     )
 
     emitted_any_delta = False
-    if other_delta:
+    if other_delta or _has_stream_metadata(choice):
         outputs.append(_choice_delta_event(event, choice, other_delta, finish_reason=None))
         emitted_any_delta = True
 
@@ -510,6 +510,7 @@ def _rewrite_stream_choice(
         outputs.extend(
             _process_stream_field_text(
                 state,
+                event=event,
                 field_name=field_name,
                 text=scanned_text[field_name],
                 chunk_id=chunk_id,
@@ -552,6 +553,7 @@ def _rewrite_stream_choice(
 def _process_stream_field_text(
     state: StreamChoiceState,
     *,
+    event: JsonObject,
     field_name: str,
     text: str,
     chunk_id: str,
@@ -560,12 +562,38 @@ def _process_stream_field_text(
     settings: Settings,
 ) -> list[JsonObject]:
     outputs: list[JsonObject] = []
-    state.field_buffers[field_name] = state.field_buffers.get(field_name, "") + text
+    state.field_event_metadata[field_name] = {
+        key: value
+        for key, value in event.items()
+        if key not in {"choices", "id", "object", "model"}
+    }
+    previous_buffer = state.field_buffers.get(field_name, "")
+    state.field_buffers[field_name] = previous_buffer + text
+
+    if field_name in state.pending_raw_fields and "</" not in previous_buffer[-2:] + text:
+        if len(state.field_buffers[field_name]) > settings.max_raw_tool_block_chars:
+            LOG.warning(
+                "incomplete raw tool-call block exceeded max size; passing through as text",
+            )
+            outputs.append(
+                _field_chunk(
+                    chunk_id,
+                    model,
+                    field_name,
+                    state.field_buffers[field_name],
+                    choice_index,
+                    event_metadata=state.field_event_metadata.get(field_name),
+                )
+            )
+            state.field_buffers[field_name] = ""
+            state.pending_raw_fields.discard(field_name)
+        return outputs
 
     while state.field_buffers[field_name]:
         buffer = state.field_buffers[field_name]
         span = find_complete_raw_tool_block_span(buffer)
         if span is not None:
+            state.pending_raw_fields.discard(field_name)
             start, end = span
             prefix = buffer[:start]
             block = buffer[start:end]
@@ -576,7 +604,14 @@ def _process_stream_field_text(
                     "raw tool-call block exceeded max size; passing through as text",
                 )
                 outputs.append(
-                    _field_chunk(chunk_id, model, field_name, prefix + block, choice_index)
+                    _field_chunk(
+                        chunk_id,
+                        model,
+                        field_name,
+                        prefix + block,
+                        choice_index,
+                        event_metadata=state.field_event_metadata.get(field_name),
+                    )
                 )
                 state.field_buffers[field_name] = suffix
                 continue
@@ -585,7 +620,14 @@ def _process_stream_field_text(
             if not tool_calls:
                 LOG.info("raw tool-call block could not be parsed; passing through as text")
                 outputs.append(
-                    _field_chunk(chunk_id, model, field_name, prefix + block, choice_index)
+                    _field_chunk(
+                        chunk_id,
+                        model,
+                        field_name,
+                        prefix + block,
+                        choice_index,
+                        event_metadata=state.field_event_metadata.get(field_name),
+                    )
                 )
                 state.field_buffers[field_name] = suffix
                 continue
@@ -599,14 +641,28 @@ def _process_stream_field_text(
                     "raw tool-call block exceeded tool-call limits; passing through as text"
                 )
                 outputs.append(
-                    _field_chunk(chunk_id, model, field_name, prefix + block, choice_index)
+                    _field_chunk(
+                        chunk_id,
+                        model,
+                        field_name,
+                        prefix + block,
+                        choice_index,
+                        event_metadata=state.field_event_metadata.get(field_name),
+                    )
                 )
                 state.field_buffers[field_name] = suffix
                 continue
 
             if prefix:
                 outputs.append(
-                    _field_chunk(chunk_id, model, field_name, prefix, choice_index),
+                    _field_chunk(
+                        chunk_id,
+                        model,
+                        field_name,
+                        prefix,
+                        choice_index,
+                        event_metadata=state.field_event_metadata.get(field_name),
+                    ),
                 )
             LOG.info(
                 "converted %d raw tool call(s) in streaming chat completion",
@@ -618,9 +674,16 @@ def _process_stream_field_text(
                 model=model,
                 argument_chunk_size=settings.tool_argument_chunk_size,
                 choice_index=choice_index,
+                tool_index_offset=state.next_tool_call_index,
                 include_finish=False,
             ):
-                outputs.append(cast("JsonObject", tool_chunk))
+                outputs.append(
+                    {
+                        **state.field_event_metadata.get(field_name, {}),
+                        **cast("JsonObject", tool_chunk),
+                    }
+                )
+            state.next_tool_call_index += len(tool_calls)
             state.raw_tool_calls_emitted = True
             state.field_buffers[field_name] = suffix
             continue
@@ -631,8 +694,18 @@ def _process_stream_field_text(
                 LOG.warning(
                     "incomplete raw tool-call block exceeded max size; passing through as text",
                 )
-                outputs.append(_field_chunk(chunk_id, model, field_name, buffer, choice_index))
+                outputs.append(
+                    _field_chunk(
+                        chunk_id,
+                        model,
+                        field_name,
+                        buffer,
+                        choice_index,
+                        event_metadata=state.field_event_metadata.get(field_name),
+                    )
+                )
                 state.field_buffers[field_name] = ""
+                state.pending_raw_fields.discard(field_name)
                 break
             if raw_start > 0:
                 outputs.append(
@@ -642,9 +715,11 @@ def _process_stream_field_text(
                         field_name,
                         buffer[:raw_start],
                         choice_index,
+                        event_metadata=state.field_event_metadata.get(field_name),
                     ),
                 )
                 state.field_buffers[field_name] = buffer[raw_start:]
+            state.pending_raw_fields.add(field_name)
             break
 
         flush_size = len(buffer) - settings.stream_guard_chars
@@ -656,6 +731,7 @@ def _process_stream_field_text(
                     field_name,
                     buffer[:flush_size],
                     choice_index,
+                    event_metadata=state.field_event_metadata.get(field_name),
                 ),
             )
             state.field_buffers[field_name] = buffer[flush_size:]
@@ -674,7 +750,16 @@ def _flush_choice_buffers(
     outputs: list[JsonObject] = []
     for field_name, buffered_text in list(state.field_buffers.items()):
         if buffered_text:
-            outputs.append(_field_chunk(chunk_id, model, field_name, buffered_text, choice_index))
+            outputs.append(
+                _field_chunk(
+                    chunk_id,
+                    model,
+                    field_name,
+                    buffered_text,
+                    choice_index,
+                    event_metadata=state.field_event_metadata.get(field_name),
+                )
+            )
             state.field_buffers[field_name] = ""
     return outputs
 
@@ -685,8 +770,11 @@ def _field_chunk(
     field_name: str,
     text: str,
     choice_index: int,
+    *,
+    event_metadata: Mapping[str, Any] | None = None,
 ) -> JsonObject:
     return {
+        **(event_metadata or {}),
         "id": chunk_id,
         "object": "chat.completion.chunk",
         "model": model,
@@ -845,6 +933,11 @@ def _choice_delta_event(
     }
 
 
+def _has_stream_metadata(choice: JsonObject) -> bool:
+    choice_envelope = {"index", "delta", "finish_reason"}
+    return bool(choice.keys() - choice_envelope)
+
+
 def _forward_request_headers(
     request: Request, *, settings: Settings, stream: bool
 ) -> dict[str, str]:
@@ -883,10 +976,15 @@ def _set_header(headers: dict[str, str], key: str, value: str) -> None:
     headers[key] = value
 
 
-def _forward_response_headers(headers: httpx.Headers) -> dict[str, str]:
+def _forward_response_headers(
+    headers: httpx.Headers,
+    *,
+    body_decoded: bool = True,
+) -> dict[str, str]:
     forwarded: dict[str, str] = {}
+    excluded_headers = HOP_BY_HOP_HEADERS | (DECODED_BODY_HEADERS if body_decoded else set())
     for key, value in headers.items():
-        if key.lower() in HOP_BY_HOP_HEADERS:
+        if key.lower() in excluded_headers:
             continue
         forwarded[key] = value
     return forwarded
@@ -909,6 +1007,18 @@ def _upstream_timeout(settings: Settings) -> httpx.Timeout:
         write=None if settings.upstream_write_timeout == 0 else settings.upstream_write_timeout,
         pool=None if settings.upstream_pool_timeout == 0 else settings.upstream_pool_timeout,
     )
+
+
+def create_upstream_client(settings: Settings) -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=_upstream_timeout(settings))
+
+
+def _upstream_client(request: Request) -> httpx.AsyncClient:
+    client = request.app.state.upstream_client
+    if not isinstance(client, httpx.AsyncClient):
+        msg = "upstream HTTP client is not initialized"
+        raise RuntimeError(msg)
+    return client
 
 
 def _parse_sse_data(payload: str) -> JsonObject | str:
