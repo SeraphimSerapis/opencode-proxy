@@ -33,3 +33,15 @@ def test_healthz_config_exposes_safe_config() -> None:
     assert body["custom_headers"] == {"names": ["Authorization"]}
     assert body["model_aliases"]["aliases"] == ["alias"]
     assert "secret" not in response.text
+
+
+def test_app_lifespan_closes_shared_upstream_client() -> None:
+    app = create_app(Settings(upstream_url="http://upstream.test"))
+    upstream_client = app.state.upstream_client
+
+    with TestClient(app) as client:
+        assert client.get("/healthz").status_code == 200
+        assert app.state.upstream_client is upstream_client
+        assert upstream_client.is_closed is False
+
+    assert upstream_client.is_closed is True

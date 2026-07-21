@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING
 
 from fastapi import FastAPI
 
 from opencode_proxy import __version__
-from opencode_proxy.proxy import build_router
+from opencode_proxy.proxy import build_router, create_upstream_client
 from opencode_proxy.settings import Settings
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 LOG = logging.getLogger(__name__)
 
@@ -25,7 +30,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     else:
         LOG.info("no model aliases configured")
 
-    app = FastAPI(title="OpenCode Proxy", version=__version__)
+    upstream_client = create_upstream_client(settings)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            await upstream_client.aclose()
+
+    app = FastAPI(title="OpenCode Proxy", version=__version__, lifespan=lifespan)
+    app.state.upstream_client = upstream_client
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

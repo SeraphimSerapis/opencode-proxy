@@ -217,7 +217,7 @@ def extract_raw_tool_call_segments(
             text_parts.append(text[cursor:end])
         cursor = end
 
-    return _dedupe_tool_calls(tool_calls), "".join(text_parts), changed
+    return tool_calls, "".join(text_parts), changed
 
 
 def normalize_argument_value(value: object) -> str:
@@ -252,8 +252,7 @@ def make_tool_call(name: str, arguments: object, call_id: str | None = None) -> 
 
 def parse_raw_tool_calls(text: str) -> list[ToolCall]:
     normalized = normalize_raw_tool_markup(text)
-    parsed = [*parse_dsml_tool_calls(normalized), *parse_qwen_xml_tool_calls(normalized)]
-    return _dedupe_tool_calls(parsed)
+    return [*parse_dsml_tool_calls(normalized), *parse_qwen_xml_tool_calls(normalized)]
 
 
 def parse_dsml_tool_calls(text: str) -> list[ToolCall]:
@@ -276,6 +275,11 @@ def parse_qwen_xml_tool_calls(text: str) -> list[ToolCall]:
         name_matches = _parse_name_parameter_blocks(block)
         if name_matches:
             results.extend(name_matches)
+            continue
+
+        laguna_matches = _parse_laguna_tool_call_blocks(block)
+        if laguna_matches:
+            results.extend(laguna_matches)
             continue
 
         json_matches = _parse_json_tool_call_block(block)
@@ -405,10 +409,12 @@ def build_tool_call_chunks(
     model: str,
     argument_chunk_size: int,
     choice_index: int = 0,
+    tool_index_offset: int = 0,
     include_finish: bool = True,
 ) -> list[ChatCompletionChunk]:
     chunks: list[ChatCompletionChunk] = []
-    for index, tool_call in enumerate(tool_calls):
+    for local_index, tool_call in enumerate(tool_calls):
+        index = tool_index_offset + local_index
         function = tool_call["function"]
         chunks.append(
             _make_chunk(
@@ -493,6 +499,57 @@ def _parse_name_parameter_blocks(block: str) -> list[ToolCall]:
     return results
 
 
+def _parse_laguna_tool_call_blocks(block: str) -> list[ToolCall]:
+    """Parse Poolside / Laguna S 2.1 tool calls.
+
+    Format: ``func_name<arg_key>k</arg_key><arg_value>v</arg_value>``
+    where each ``<arg_value>`` is either a raw string or a JSON-encoded
+    non-string value (boolean, number, array, object) produced by
+    Jinja's ``tojson`` filter.
+    """
+    if "<arg_key>" not in block:
+        return []
+
+    name_part, _, args_part = block.partition("<arg_key>")
+    func_name = html.unescape(name_part).strip()
+    if not func_name:
+        return []
+
+    args_str = "<arg_key>" + args_part
+    params: JsonObject = {}
+    cursor = 0
+    for param_match in re.finditer(
+        r"<arg_key>(?P<key>.*?)</arg_key>\s*<arg_value>(?P<value>.*?)</arg_value>",
+        args_str,
+        re.DOTALL,
+    ):
+        if args_str[cursor : param_match.start()].strip():
+            return []
+        key = html.unescape(param_match.group("key")).strip()
+        if not key or key in params:
+            return []
+        raw_val = html.unescape(param_match.group("value")).strip()
+
+        if (
+            raw_val.startswith(("{", "[", "-"))
+            or raw_val in ("true", "false", "null")
+            or (raw_val and raw_val[0].isdigit())
+        ):
+            try:
+                parsed_val: object = json.loads(raw_val)
+            except (json.JSONDecodeError, TypeError):
+                parsed_val = raw_val
+        else:
+            parsed_val = raw_val
+
+        params[key] = parsed_val
+        cursor = param_match.end()
+
+    if not params or args_str[cursor:].strip():
+        return []
+    return [make_tool_call(func_name, params)]
+
+
 def _parse_dsml_invoke_blocks(block: str) -> list[ToolCall]:
     results: list[ToolCall] = []
     invoke_pattern = re.compile(
@@ -556,18 +613,6 @@ def _parse_json_tool_call_block(block: str) -> list[ToolCall]:
         arguments = item.get("arguments", item.get("parameters", {}))
         results.append(make_tool_call(name, arguments))
     return results
-
-
-def _dedupe_tool_calls(tool_calls: list[ToolCall]) -> list[ToolCall]:
-    deduped: list[ToolCall] = []
-    seen: set[tuple[str, str]] = set()
-    for tool_call in tool_calls:
-        key = (tool_call["function"]["name"], tool_call["function"]["arguments"])
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(tool_call)
-    return deduped
 
 
 def _make_chunk(

@@ -15,6 +15,7 @@ The proxy passes normal OpenAI-compatible traffic through unchanged and repairs 
 - ASCII DSML variants such as `<|DSML|tool_calls>`.
 - Qwen-style `<tool_call>` XML blocks.
 - Qwen-style JSON objects inside `<tool_call>` blocks.
+- Poolside / Laguna S 2.1 `<tool_call>func<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>` blocks.
 - Spurious empty streamed `tool_calls: []` chunks from some OpenAI-compatible servers.
 
 Native OpenAI `tool_calls` are passed through unchanged.

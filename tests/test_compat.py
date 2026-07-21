@@ -150,6 +150,140 @@ def test_parse_qwen3_multiple_functions_in_one_tool_call() -> None:
     }
 
 
+def test_parse_laguna_arg_key_value_single_arg() -> None:
+    content = "<tool_call>terminal<arg_key>cmd</arg_key><arg_value>uname -a</arg_value></tool_call>"
+
+    tool_calls = parse_raw_tool_calls(content)
+
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "terminal"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"cmd": "uname -a"}
+
+
+def test_parse_laguna_arg_key_value_multiple_args() -> None:
+    content = (
+        "<tool_call>edit_file"
+        "<arg_key>path</arg_key><arg_value>src/main.py</arg_value>"
+        "<arg_key>content</arg_key><arg_value>print('hello')</arg_value>"
+        "</tool_call>"
+    )
+
+    tool_calls = parse_raw_tool_calls(content)
+
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "edit_file"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {
+        "path": "src/main.py",
+        "content": "print('hello')",
+    }
+
+
+def test_parse_laguna_json_arg_values() -> None:
+    content = (
+        "<tool_call>configure"
+        "<arg_key>debug</arg_key><arg_value>true</arg_value>"
+        "<arg_key>retries</arg_key><arg_value>5</arg_value>"
+        '<arg_key>tags</arg_key><arg_value>["prod", "v2"]</arg_value>'
+        "</tool_call>"
+    )
+
+    tool_calls = parse_raw_tool_calls(content)
+
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "configure"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {
+        "debug": True,
+        "retries": 5,
+        "tags": ["prod", "v2"],
+    }
+
+
+def test_parse_laguna_multiple_tool_calls() -> None:
+    content = (
+        "<tool_call>terminal<arg_key>cmd</arg_key><arg_value>ls -la</arg_value></tool_call>\n"
+        "<tool_call>terminal<arg_key>cmd</arg_key><arg_value>pwd</arg_value></tool_call>"
+    )
+
+    tool_calls = parse_raw_tool_calls(content)
+
+    assert len(tool_calls) == 2
+    assert tool_calls[0]["function"]["name"] == "terminal"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"cmd": "ls -la"}
+    assert tool_calls[1]["function"]["name"] == "terminal"
+    assert json.loads(tool_calls[1]["function"]["arguments"]) == {"cmd": "pwd"}
+
+
+def test_extract_raw_tool_call_segments_laguna() -> None:
+    content = (
+        "Let me run a command.\n"
+        "<tool_call>terminal<arg_key>cmd</arg_key><arg_value>git status</arg_value></tool_call>\n"
+        "Finished checking status."
+    )
+
+    tool_calls, remaining_text, changed = extract_raw_tool_call_segments(content)
+
+    assert changed is True
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "terminal"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"cmd": "git status"}
+    assert remaining_text == "Let me run a command.\n\nFinished checking status."
+
+
+def test_parse_laguna_negative_number_arg_value() -> None:
+    content = (
+        "<tool_call>adjust"
+        "<arg_key>offset</arg_key><arg_value>-42</arg_value>"
+        "<arg_key>ratio</arg_key><arg_value>-3.14</arg_value>"
+        "</tool_call>"
+    )
+
+    tool_calls = parse_raw_tool_calls(content)
+
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "adjust"
+    args = json.loads(tool_calls[0]["function"]["arguments"])
+    assert args == {"offset": -42, "ratio": -3.14}
+
+
+def test_parse_laguna_multiline_arg_value() -> None:
+    code = "def hello():\n    print('world')\n"
+    content = (
+        "<tool_call>write_file"
+        "<arg_key>path</arg_key><arg_value>main.py</arg_value>"
+        f"<arg_key>content</arg_key><arg_value>{code}</arg_value>"
+        "</tool_call>"
+    )
+
+    tool_calls = parse_raw_tool_calls(content)
+
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "write_file"
+    args = json.loads(tool_calls[0]["function"]["arguments"])
+    assert args["path"] == "main.py"
+    assert args["content"] == code.strip()
+
+
+def test_parse_laguna_rejects_incomplete_argument_pair() -> None:
+    content = "<tool_call>terminal<arg_key>cmd</arg_key>missing-value</tool_call>"
+
+    assert parse_raw_tool_calls(content) == []
+
+
+def test_parse_laguna_rejects_empty_argument_key() -> None:
+    content = "<tool_call>terminal<arg_key> </arg_key><arg_value>pwd</arg_value></tool_call>"
+
+    assert parse_raw_tool_calls(content) == []
+
+
+def test_parse_identical_tool_calls_preserves_both_invocations() -> None:
+    call = "<tool_call><name>ping</name><parameters>{}</parameters></tool_call>"
+
+    tool_calls = parse_raw_tool_calls(call + call)
+
+    assert len(tool_calls) == 2
+    assert tool_calls[0]["id"] != tool_calls[1]["id"]
+
+
 def test_parse_qwen_json_tool_call_format() -> None:
     content = """
     <tool_call>
@@ -564,8 +698,8 @@ def test_parse_ascii_dsml_invoke_preserves_string_false_json_types() -> None:
 # --- Deduplication tests ---
 
 
-def test_deduplicate_identical_tool_calls() -> None:
-    """When both DSML and Qwen parsers extract the same call, it should be deduped."""
+def test_preserve_identical_tool_calls_across_formats() -> None:
+    """Distinct raw blocks remain distinct even when their calls have equal arguments."""
     content = f"""
     <{BAR}DSML{BAR}tool_calls>
     <name>bash</name>
@@ -579,7 +713,8 @@ def test_deduplicate_identical_tool_calls() -> None:
 
     tool_calls = parse_raw_tool_calls(content)
 
-    assert len(tool_calls) == 1
+    assert len(tool_calls) == 2
+    assert tool_calls[0]["id"] != tool_calls[1]["id"]
     assert tool_calls[0]["function"]["name"] == "bash"
 
 
