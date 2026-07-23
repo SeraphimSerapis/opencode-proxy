@@ -44,6 +44,18 @@ def test_settings_reads_custom_headers_alias(monkeypatch: pytest.MonkeyPatch) ->
     assert settings.parsed_custom_headers == {"X-Test": "yes"}
 
 
+def test_settings_reads_legacy_ollama_environment_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OLLAMA_PROXY_UPSTREAM_URL", "http://legacy.test:4000")
+    monkeypatch.setenv("OLLAMA_PROXY_UPSTREAM_API_KEY", "legacy-key")
+
+    settings = Settings()
+
+    assert settings.upstream_url == "http://legacy.test:4000"
+    assert settings.upstream_api_key == "legacy-key"
+
+
 def test_parse_model_aliases_from_json_object() -> None:
     aliases = parse_model_aliases(
         '{"dsv4-flash":"DeepSeek-V4-Flash",'
