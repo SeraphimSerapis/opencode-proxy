@@ -1107,14 +1107,59 @@ def _encode_sse_json(payload: Mapping[str, Any]) -> bytes:
     return f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n".encode()
 
 
+def classify_upstream_error(exc: BaseException) -> tuple[str, str]:
+    """Map an upstream transport failure to a safe ``(message, type)`` pair.
+
+    The returned strings never include hostnames or raw exception text so they
+    are safe to return to clients while still distinguishing common failure modes.
+    """
+    if isinstance(exc, httpx.ConnectTimeout):
+        return "upstream connect timeout", "connect_timeout"
+    if isinstance(exc, httpx.ReadTimeout):
+        return "upstream read timeout", "read_timeout"
+    if isinstance(exc, httpx.WriteTimeout):
+        return "upstream write timeout", "write_timeout"
+    if isinstance(exc, httpx.PoolTimeout):
+        return "upstream pool timeout", "pool_timeout"
+    if isinstance(exc, httpx.TimeoutException):
+        return "upstream request timeout", "timeout"
+    if isinstance(exc, httpx.ConnectError):
+        detail = str(exc).lower()
+        if "refused" in detail:
+            return "upstream connection refused", "connection_refused"
+        if _looks_like_dns_failure(detail):
+            return "upstream DNS resolution failed", "dns_error"
+        return "upstream connection failed", "connect_error"
+    if isinstance(exc, httpx.ProxyError):
+        return "upstream proxy error", "proxy_error"
+    if isinstance(exc, httpx.RemoteProtocolError):
+        return "upstream protocol error", "protocol_error"
+    if isinstance(exc, httpx.NetworkError):
+        return "upstream network error", "network_error"
+    return "upstream request failed", "proxy_error"
+
+
+def _looks_like_dns_failure(detail: str) -> bool:
+    markers = (
+        "name or service not known",
+        "nodename nor servname",
+        "getaddrinfo failed",
+        "name resolution",
+        "temporary failure in name resolution",
+        "nodename not known",
+    )
+    return any(marker in detail for marker in markers)
+
+
 def _proxy_error(exc: httpx.HTTPError) -> JSONResponse:
-    LOG.warning("upstream request failed: %s", exc)
+    message, error_type = classify_upstream_error(exc)
+    LOG.warning("upstream request failed type=%s: %s", error_type, exc)
     return JSONResponse(
         status_code=502,
         content={
             "error": {
-                "message": "upstream request failed",
-                "type": "proxy_error",
+                "message": message,
+                "type": error_type,
             },
         },
     )

@@ -9,10 +9,49 @@ import httpx
 import respx
 
 from opencode_proxy.app import create_app
+from opencode_proxy.proxy import classify_upstream_error
 from opencode_proxy.settings import Settings
 
 BAR = "\uff5c"
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "tool_calls"
+
+
+def test_classify_upstream_error_types() -> None:
+    assert classify_upstream_error(httpx.ConnectTimeout("connect timed out")) == (
+        "upstream connect timeout",
+        "connect_timeout",
+    )
+    assert classify_upstream_error(httpx.ReadTimeout("read timed out")) == (
+        "upstream read timeout",
+        "read_timeout",
+    )
+    assert classify_upstream_error(httpx.WriteTimeout("write timed out")) == (
+        "upstream write timeout",
+        "write_timeout",
+    )
+    assert classify_upstream_error(httpx.PoolTimeout("pool timed out")) == (
+        "upstream pool timeout",
+        "pool_timeout",
+    )
+    assert classify_upstream_error(
+        httpx.ConnectError("connection refused to secret-host:4000")
+    ) == ("upstream connection refused", "connection_refused")
+    assert classify_upstream_error(
+        httpx.ConnectError("[Errno -2] Name or service not known")
+    ) == ("upstream DNS resolution failed", "dns_error")
+    assert classify_upstream_error(httpx.ConnectError("network unreachable")) == (
+        "upstream connection failed",
+        "connect_error",
+    )
+    assert classify_upstream_error(httpx.RemoteProtocolError("peer closed")) == (
+        "upstream protocol error",
+        "protocol_error",
+    )
+    message, error_type = classify_upstream_error(
+        httpx.ConnectError("connection refused to secret-host:4000")
+    )
+    assert "secret-host" not in message
+    assert error_type == "connection_refused"
 
 
 async def _client(settings: Settings | None = None) -> httpx.AsyncClient:
@@ -687,7 +726,7 @@ async def test_streaming_false_tool_prefix_does_not_starve() -> None:
 
 
 @respx.mock
-async def test_upstream_connection_error_returns_generic_502() -> None:
+async def test_upstream_connection_error_returns_typed_502() -> None:
     respx.post("http://upstream.test/v1/chat/completions").mock(
         side_effect=httpx.ConnectError("connection refused to secret-host:4000")
     )
@@ -700,9 +739,11 @@ async def test_upstream_connection_error_returns_generic_502() -> None:
 
     assert response.status_code == 502
     body = response.json()
-    assert body["error"]["message"] == "upstream request failed"
+    assert body["error"] == {
+        "message": "upstream connection refused",
+        "type": "connection_refused",
+    }
     assert "secret-host" not in json.dumps(body)
-    assert "connection refused" not in json.dumps(body)
 
 
 @respx.mock
@@ -775,7 +816,7 @@ async def test_streaming_upstream_4xx_returns_error_body() -> None:
 
 @respx.mock
 async def test_passthrough_connection_error_returns_502() -> None:
-    """Connection errors on passthrough routes should return a generic 502."""
+    """Connection errors on passthrough routes should return a typed 502."""
     respx.get("http://upstream.test/v1/models").mock(
         side_effect=httpx.ConnectError("connection refused")
     )
@@ -785,7 +826,7 @@ async def test_passthrough_connection_error_returns_502() -> None:
 
     assert response.status_code == 502
     body = response.json()
-    assert body["error"]["type"] == "proxy_error"
+    assert body["error"]["type"] == "connection_refused"
 
 
 @respx.mock
@@ -812,7 +853,7 @@ async def test_catch_all_streams_request_and_preserves_encoded_response() -> Non
 
 @respx.mock
 async def test_streaming_connection_error_returns_502() -> None:
-    """Connection errors during streaming setup should return a generic 502."""
+    """Connection errors during streaming setup should return a typed 502."""
     respx.post("http://upstream.test/v1/chat/completions").mock(
         side_effect=httpx.ConnectError("connection refused")
     )
@@ -829,7 +870,7 @@ async def test_streaming_connection_error_returns_502() -> None:
 
     assert response.status_code == 502
     body = response.json()
-    assert body["error"]["type"] == "proxy_error"
+    assert body["error"]["type"] == "connection_refused"
 
 
 @respx.mock

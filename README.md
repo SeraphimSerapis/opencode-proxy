@@ -234,6 +234,7 @@ discovery entry with the alias target metadata, and `error` returns `409`.
 
 - Set `UPSTREAM_URL` to the upstream base URL, not the `/v1` path. If `/v1` is included anyway, the proxy strips it and logs a warning.
 - Chat and generate requests are limited by `MAX_CONCURRENT_UPSTREAM` (default `8`) so a shared GPU backend is not stampeded by OpenCode, Home Assistant, and other clients.
+- Upstream transport failures return typed `502` bodies (`connection_refused`, `connect_timeout`, `read_timeout`, and related) without leaking hostnames from exception text.
 - The proxy strips compressed SSE request headers so streamed responses can be parsed line by line.
 - If an upstream response already contains standard OpenAI `tool_calls`, it is passed through unchanged.
 - `reasoning_content` and `reasoning` fields (DeepSeek R1 / o1-style streaming) are scanned for raw tool-call blocks by default, but ordinary reasoning text remains in reasoning fields.
