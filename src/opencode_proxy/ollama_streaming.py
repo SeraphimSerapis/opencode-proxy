@@ -27,8 +27,10 @@ if TYPE_CHECKING:
 
 @dataclass
 class _ToolAccumulator:
+    max_argument_chars: int
     names: dict[tuple[int, int], str] = field(default_factory=dict)
     arguments: dict[tuple[int, int], str] = field(default_factory=dict)
+    oversized: set[tuple[int, int]] = field(default_factory=set)
 
     def add(self, choice_index: int, call_index: int, function: dict[str, Any]) -> None:
         key = (choice_index, call_index)
@@ -37,7 +39,14 @@ class _ToolAccumulator:
             self.names[key] = name
         fragment = function.get("arguments")
         if isinstance(fragment, str):
-            self.arguments[key] = self.arguments.get(key, "") + fragment
+            current = self.arguments.get(key, "")
+            remaining = self.max_argument_chars - len(current)
+            if remaining <= 0:
+                self.oversized.add(key)
+            else:
+                self.arguments[key] = current + fragment[:remaining]
+                if len(fragment) > remaining:
+                    self.oversized.add(key)
 
     def pop(self, choice_index: int) -> list[OllamaToolCall]:
         keys = sorted(
@@ -47,7 +56,9 @@ class _ToolAccumulator:
             OllamaToolCall(
                 function=OllamaFunction(
                     name=self.names.get(key, ""),
-                    arguments=_json_object(self.arguments.get(key, "")),
+                    arguments=(
+                        {} if key in self.oversized else _json_object(self.arguments.get(key, ""))
+                    ),
                 )
             )
             for key in keys
@@ -56,6 +67,7 @@ class _ToolAccumulator:
         for key in keys:
             self.names.pop(key, None)
             self.arguments.pop(key, None)
+            self.oversized.discard(key)
         return calls
 
 
@@ -65,7 +77,7 @@ async def stream_chat_to_ollama(
     settings: Settings,
     model: str,
 ) -> AsyncIterator[bytes]:
-    tools = _ToolAccumulator()
+    tools = _ToolAccumulator(max_argument_chars=settings.max_tool_argument_chars)
     usage: dict[str, Any] = {}
     terminal: dict[int, tuple[OllamaMessage, str]] = {}
     async for raw_frame in _rewrite_sse_stream(request, response, settings):
