@@ -530,17 +530,23 @@ def _rewrite_stream_choice(
                 choice_index=choice_index,
             ),
         )
-        outputs.append(
-            cast(
-                "JsonObject",
-                make_finish_chunk(
-                    chunk_id=chunk_id,
-                    model=model,
-                    finish_reason=_finish_reason_for_state(finish_reason, state),
-                    choice_index=choice_index,
-                ),
+        finish_payload = cast(
+            "JsonObject",
+            make_finish_chunk(
+                chunk_id=chunk_id,
+                model=model,
+                finish_reason=_finish_reason_for_state(finish_reason, state),
+                choice_index=choice_index,
             ),
         )
+        finish_payload.update(
+            {
+                key: value
+                for key, value in event.items()
+                if key not in {"choices", "id", "object", "model"}
+            }
+        )
+        outputs.append(finish_payload)
         state.finish_sent = True
         emitted_any_delta = True
 
@@ -957,6 +963,9 @@ def _forward_request_headers(
     client_host = request.client.host if request.client else None
     if client_host and "x-forwarded-for" not in {key.lower() for key in headers}:
         headers["x-forwarded-for"] = client_host
+
+    if settings.upstream_api_key and not any(key.lower() == "authorization" for key in headers):
+        headers["Authorization"] = f"Bearer {settings.upstream_api_key}"
 
     for key, value in settings.parsed_custom_headers.items():
         lower_key = key.lower()

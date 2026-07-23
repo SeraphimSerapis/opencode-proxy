@@ -1,0 +1,4 @@
+---
+# Ollama compatibility is now served by compose/ai/opencode-proxy.yml.
+# Keep this include empty so the old service cannot accidentally run in parallel.
+services: {}

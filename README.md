@@ -4,9 +4,10 @@ FastAPI compatibility proxy for running OpenCode against an OpenAI-compatible up
 
 ```text
 OpenCode CLI -> opencode-proxy -> OpenAI-compatible upstream -> model backend
+Ollama clients -> opencode-proxy -> OpenAI-compatible upstream -> model backend
 ```
 
-The proxy passes normal OpenAI-compatible traffic through unchanged and repairs known malformed assistant tool-call formats in `/v1/chat/completions` responses.
+The proxy passes normal OpenAI-compatible traffic through unchanged and repairs known malformed assistant tool-call formats in `/v1/chat/completions` responses. The same process also exposes an Ollama-compatible REST adapter, so OpenCode, Home Assistant, and Ollama clients can share one gateway.
 
 ## Supported Repairs
 
@@ -53,7 +54,7 @@ Point OpenCode at the proxy, not directly at the upstream:
       "name": "OpenCode Proxy",
       "options": {
         "baseURL": "http://127.0.0.1:9526/v1",
-        "apiKey": "dummy"
+        "apiKey": "sk-your-litellm-virtual-key"
       },
       "models": {
         "your-model": {
@@ -64,6 +65,37 @@ Point OpenCode at the proxy, not directly at the upstream:
   }
 }
 ```
+
+## Ollama-compatible API
+
+The unified service implements the commonly used Ollama endpoints:
+
+- `GET /` and `GET /api/version` for client discovery.
+- `POST /api/chat` and `POST /api/generate`, including NDJSON streaming, vision images, thinking fields, and tool calls.
+- `GET /api/tags`, `GET /api/ps`, and `POST /api/show` for model discovery and synthetic metadata.
+- `POST /api/embed` and the deprecated `POST /api/embeddings`.
+- Model-management and blob endpoints are safe no-ops because model lifecycle remains upstream.
+
+Ollama clients normally target `http://127.0.0.1:9526` when running the container
+directly. In Docker Compose, map both host ports (`11434:9526` and
+`9526:9526`) to keep the standard Ollama port and the OpenCode port on one
+process.
+
+The adapter forwards incoming `Authorization` headers to LiteLLM. Set
+`UPSTREAM_API_KEY` only for clients that cannot provide a key; it is used as a
+fallback and never replaces a caller-provided key. This makes LiteLLM virtual
+keys and per-user budgets available without running a second proxy.
+
+When no fallback is configured, requests without `Authorization` receive the
+upstream LiteLLM authentication error. This is the default in the Prometheus
+compose deployment.
+
+LiteLLM can also host the repair logic directly through a custom callback using
+its `async_post_call_success_hook` and
+`async_post_call_streaming_iterator_hook` hooks. The unified adapter remains the
+recommended path for Ollama clients because it owns the Ollama request/response
+shape while LiteLLM continues to own authentication, routing, budgets, and
+spend tracking.
 
 ## Docker
 
@@ -97,11 +129,32 @@ uv run pytest
 
 CI also runs a Docker build smoke test.
 
+For a token-free integration smoke test, run the dependency-free mock upstream
+from this repository in a second terminal and point the proxy at it:
+
+```bash
+python tools/mock_openai.py
+UPSTREAM_URL=http://127.0.0.1:4000 uv run opencode-proxy
+curl http://127.0.0.1:9526/api/tags
+curl -N http://127.0.0.1:9526/api/chat \
+  -H 'content-type: application/json' \
+  -d '{"model":"mock-model","messages":[{"role":"user","content":"hello"}]}'
+```
+
+On Prometheus, the compose stack should include only the unified service. Build
+it from `${PROJECTSDIR}/opencode-proxy`, set `UPSTREAM_URL=http://litellm:4000`,
+and map both `11434:9526` and `9526:9526` to that one container. The checked-in
+compose definition leaves `UPSTREAM_API_KEY` empty, so LiteLLM virtual keys
+gate callers through forwarded `Authorization` headers. Set
+`PROXY_UPSTREAM_FALLBACK_KEY` only for trusted clients that cannot send a key;
+never use the LiteLLM master key as a general client fallback.
+
 ## Environment
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `UPSTREAM_URL` | `http://127.0.0.1:4000` | Upstream OpenAI-compatible base URL. |
+| `UPSTREAM_API_KEY` | unset | Fallback upstream bearer token. Incoming `Authorization` headers take precedence. `OLLAMA_PROXY_UPSTREAM_URL` and `OLLAMA_PROXY_UPSTREAM_API_KEY` remain accepted aliases for existing Ollama deployments. |
 | `PROXY_HOST` | `0.0.0.0` | Bind host for `opencode-proxy`. |
 | `PROXY_PORT` | `9526` | Bind port for `opencode-proxy`. |
 | `LOG_LEVEL` | `INFO` | Python logging level. |
@@ -121,6 +174,7 @@ CI also runs a Docker build smoke test.
 | `UPSTREAM_HEADERS` | unset | Alias for `CUSTOM_HEADERS`. |
 | `MODEL_ALIASES` | unset | Model alias map. Request aliases are rewritten to canonical upstream model names. |
 | `ALIAS_CONFLICT_POLICY` | `skip` | Model discovery behavior when an alias conflicts with an upstream model id: `skip`, `shadow`, or `error`. |
+| `OLLAMA_VERSION` | `0.5.1` | Version reported by `GET /api/version`. |
 
 `CUSTOM_HEADERS` accepts a JSON object:
 
@@ -169,6 +223,8 @@ discovery entry with the alias target metadata, and `error` returns `409`.
 - `GET /healthz/config`: safe local config summary, with header values and URL credentials omitted.
 - `/v1/chat/completions`: proxied to the upstream with request tool sanitization and response tool-call repair.
 - `/v1/models` and `/models`: upstream model discovery with configured alias entries added.
+- `/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`: Ollama-compatible translations backed by the same upstream client and tool-call repair pipeline.
+- `/api/tags`, `/api/ps`, `/api/show`, `/api/version`: Ollama discovery and metadata endpoints.
 - `/{path:path}`: transparent passthrough for other OpenAI-compatible endpoints.
 
 ## Notes

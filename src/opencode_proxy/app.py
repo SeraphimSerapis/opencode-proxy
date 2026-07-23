@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from fastapi import FastAPI
 
 from opencode_proxy import __version__
+from opencode_proxy.ollama import build_ollama_router
 from opencode_proxy.proxy import build_router, create_upstream_client
 from opencode_proxy.settings import Settings
 
@@ -50,5 +51,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def healthz_config() -> dict[str, object]:
         return settings.safe_config
 
+    # Register Ollama routes before the OpenAI catch-all route so /api/* paths
+    # are handled by the native compatibility adapter rather than passthrough.
+    app.include_router(build_ollama_router(settings))
     app.include_router(build_router(settings))
     return app

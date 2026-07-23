@@ -16,10 +16,24 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
-    upstream_url: str = Field(default="http://127.0.0.1:4000", min_length=1)
+    upstream_url: str = Field(
+        default="http://127.0.0.1:4000",
+        min_length=1,
+        validation_alias=AliasChoices("UPSTREAM_URL", "OLLAMA_PROXY_UPSTREAM_URL"),
+    )
+    upstream_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("UPSTREAM_API_KEY", "OLLAMA_PROXY_UPSTREAM_API_KEY"),
+    )
     proxy_host: str = "0.0.0.0"  # noqa: S104 - container default should be externally reachable.
     proxy_port: int = 9526
-    log_level: str = "INFO"
+    log_level: str = Field(
+        default="INFO", validation_alias=AliasChoices("LOG_LEVEL", "OLLAMA_PROXY_LOG_LEVEL")
+    )
+    ollama_version: str = Field(
+        default="0.5.1",
+        validation_alias=AliasChoices("OLLAMA_VERSION", "OLLAMA_PROXY_OLLAMA_VERSION"),
+    )
     upstream_connect_timeout: float = Field(default=10.0, ge=0)
     upstream_read_timeout: float = Field(default=0.0, ge=0)
     upstream_write_timeout: float = Field(default=30.0, ge=0)
@@ -134,6 +148,9 @@ class Settings(BaseSettings):
             },
             "custom_headers": {
                 "names": sorted(self.parsed_custom_headers),
+            },
+            "ollama": {
+                "version": self.ollama_version,
             },
         }
 
