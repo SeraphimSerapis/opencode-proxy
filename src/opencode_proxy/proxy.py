@@ -26,6 +26,7 @@ from opencode_proxy.compat import (
     strip_empty_tool_calls,
     tool_calls_within_limits,
 )
+from opencode_proxy.concurrency import UpstreamConcurrencyLimiter
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
@@ -118,6 +119,9 @@ async def proxy_chat_completions(request: Request, settings: Settings) -> Respon
         _apply_model_alias(parsed_body, settings.parsed_model_aliases)
 
     stream = bool(parsed_body.get("stream")) if parsed_body is not None else False
+    overload = await _acquire_upstream_slot(request)
+    if overload is not None:
+        return overload
     if stream:
         return await _proxy_streaming_chat_completion(request, settings, parsed_body, body)
     return await _proxy_buffered_chat_completion(request, settings, parsed_body, body)
@@ -214,56 +218,59 @@ async def _proxy_buffered_chat_completion(
     headers = _forward_request_headers(request, settings=settings, stream=False)
     client = _upstream_client(request)
     try:
-        upstream_response = await client.request(
-            request.method,
-            _upstream_url(settings, CHAT_COMPLETIONS_PATH, request.url.query),
-            headers=headers,
-            **_body_kwargs(parsed_body, raw_body),
-        )
-    except httpx.HTTPError as exc:
-        return _proxy_error(exc)
+        try:
+            upstream_response = await client.request(
+                request.method,
+                _upstream_url(settings, CHAT_COMPLETIONS_PATH, request.url.query),
+                headers=headers,
+                **_body_kwargs(parsed_body, raw_body),
+            )
+        except httpx.HTTPError as exc:
+            return _proxy_error(exc)
 
-    response_headers = _forward_response_headers(upstream_response.headers)
-    content_type = upstream_response.headers.get("content-type", "")
-    if "application/json" not in content_type.lower():
-        return Response(
-            content=upstream_response.content,
-            status_code=upstream_response.status_code,
-            headers=response_headers,
-            media_type=content_type or None,
-        )
+        response_headers = _forward_response_headers(upstream_response.headers)
+        content_type = upstream_response.headers.get("content-type", "")
+        if "application/json" not in content_type.lower():
+            return Response(
+                content=upstream_response.content,
+                status_code=upstream_response.status_code,
+                headers=response_headers,
+                media_type=content_type or None,
+            )
 
-    try:
-        response_body = upstream_response.json()
-    except json.JSONDecodeError:
-        return Response(
-            content=upstream_response.content,
-            status_code=upstream_response.status_code,
-            headers=response_headers,
-            media_type=content_type,
-        )
+        try:
+            response_body = upstream_response.json()
+        except json.JSONDecodeError:
+            return Response(
+                content=upstream_response.content,
+                status_code=upstream_response.status_code,
+                headers=response_headers,
+                media_type=content_type,
+            )
 
-    if isinstance(response_body, dict):
-        converted, changed = convert_chat_completion_response(
-            response_body,
-            tool_call_scan_fields=settings.parsed_tool_call_scan_fields,
-            max_raw_tool_block_chars=settings.max_raw_tool_block_chars,
-            max_tool_calls=settings.max_tool_calls,
-            max_tool_argument_chars=settings.max_tool_argument_chars,
-        )
-        if changed:
-            LOG.info("converted raw tool call in non-streaming chat completion")
+        if isinstance(response_body, dict):
+            converted, changed = convert_chat_completion_response(
+                response_body,
+                tool_call_scan_fields=settings.parsed_tool_call_scan_fields,
+                max_raw_tool_block_chars=settings.max_raw_tool_block_chars,
+                max_tool_calls=settings.max_tool_calls,
+                max_tool_argument_chars=settings.max_tool_argument_chars,
+            )
+            if changed:
+                LOG.info("converted raw tool call in non-streaming chat completion")
+            return JSONResponse(
+                content=converted,
+                status_code=upstream_response.status_code,
+                headers=response_headers,
+            )
+
         return JSONResponse(
-            content=converted,
+            content=response_body,
             status_code=upstream_response.status_code,
             headers=response_headers,
         )
-
-    return JSONResponse(
-        content=response_body,
-        status_code=upstream_response.status_code,
-        headers=response_headers,
-    )
+    finally:
+        await _release_upstream_slot(request)
 
 
 async def _proxy_streaming_chat_completion(
@@ -284,12 +291,17 @@ async def _proxy_streaming_chat_completion(
         )
         upstream_response = await client.send(upstream_request, stream=True)
     except httpx.HTTPError as exc:
+        await _release_upstream_slot(request)
         return _proxy_error(exc)
+    except Exception:
+        await _release_upstream_slot(request)
+        raise
 
     response_headers = _forward_response_headers(upstream_response.headers)
     if upstream_response.status_code >= 400:
         content = await upstream_response.aread()
         await upstream_response.aclose()
+        await _release_upstream_slot(request)
         return Response(
             content=content,
             status_code=upstream_response.status_code,
@@ -301,6 +313,7 @@ async def _proxy_streaming_chat_completion(
     if "text/event-stream" not in content_type.lower():
         content = await upstream_response.aread()
         await upstream_response.aclose()
+        await _release_upstream_slot(request)
         return Response(
             content=content,
             status_code=upstream_response.status_code,
@@ -309,7 +322,7 @@ async def _proxy_streaming_chat_completion(
         )
 
     generator = _rewrite_sse_stream(request, upstream_response, settings)
-    background = BackgroundTask(upstream_response.aclose)
+    background = BackgroundTask(_aclose_upstream_and_release_slot, upstream_response, request)
     return StreamingResponse(
         generator,
         status_code=upstream_response.status_code,
@@ -1028,6 +1041,49 @@ def _upstream_client(request: Request) -> httpx.AsyncClient:
         msg = "upstream HTTP client is not initialized"
         raise RuntimeError(msg)
     return client
+
+
+def _upstream_limiter(request: Request) -> UpstreamConcurrencyLimiter | None:
+    limiter = getattr(request.app.state, "upstream_limiter", None)
+    return limiter if isinstance(limiter, UpstreamConcurrencyLimiter) else None
+
+
+async def _acquire_upstream_slot(request: Request) -> JSONResponse | None:
+    limiter = _upstream_limiter(request)
+    if limiter is None:
+        return None
+    if await limiter.try_acquire():
+        return None
+    LOG.warning(
+        "rejecting request; upstream concurrency limit reached (%d)",
+        limiter.limit,
+    )
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": {
+                "message": "upstream concurrency limit reached",
+                "type": "proxy_overload",
+            },
+        },
+        headers={"Retry-After": "1"},
+    )
+
+
+async def _release_upstream_slot(request: Request) -> None:
+    limiter = _upstream_limiter(request)
+    if limiter is not None:
+        await limiter.release()
+
+
+async def _aclose_upstream_and_release_slot(
+    upstream_response: httpx.Response,
+    request: Request,
+) -> None:
+    try:
+        await upstream_response.aclose()
+    finally:
+        await _release_upstream_slot(request)
 
 
 def _parse_sse_data(payload: str) -> JsonObject | str:
