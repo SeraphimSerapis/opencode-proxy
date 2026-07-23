@@ -1,0 +1,49 @@
+---
+services:
+  opencode-proxy:
+    # Unified OpenCode + Ollama compatibility service.
+    build:
+      context: ${PROJECTSDIR}/opencode-proxy
+      dockerfile: Dockerfile
+    image: opencode-proxy:latest
+    pull_policy: build
+    container_name: opencode-proxy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      litellm:
+        condition: service_healthy
+    ports:
+      - "${PORT_OPENCODE_PROXY:-9526}:9526"
+      - "${PORT_OLLAMA_PROXY:-11434}:9526"
+    environment:
+      - TZ=${TZ}
+      - UPSTREAM_URL=http://litellm:4000
+      - UPSTREAM_API_KEY=${LITELLM_MASTER_KEY}
+      - LOG_LEVEL=INFO
+      - OLLAMA_VERSION=0.5.1
+      - MODEL_ALIASES=dsv4-flash=DeepSeek-V4-Flash,deepseek-ai/DeepSeek-V4-Flash-DSpark=DeepSeek-V4-Flash
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:9526/healthz', timeout=2).read()\""
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      default:
+      traefik_proxy:
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik_proxy"
+      - "traefik.http.routers.opencode-proxy-rtr.entrypoints=https"
+      - "traefik.http.routers.opencode-proxy-rtr.middlewares=chain-no-auth@file"
+      - "traefik.http.routers.opencode-proxy-rtr.rule=Host(`opencode-proxy.${DOMAIN_COFFEE}`)"
+      - "traefik.http.routers.opencode-proxy-rtr.tls=true"
+      - "traefik.http.services.opencode-proxy-svc.loadbalancer.server.port=9526"
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
