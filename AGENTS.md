@@ -67,3 +67,10 @@ port `9526`; do not bring up the retired standalone `ollama-proxy` service.
 - Do not push unless linting, formatting check, typing, and tests pass locally.
 - If Docker is unavailable locally, state that clearly and include the exact build command to run.
 - Keep README usage examples current with the supported environment variables and OpenCode provider configuration.
+
+## Cursor Cloud specific instructions
+
+- This is a headless API service (no GUI/frontend). Validate it with `curl`/HTTP, not a browser.
+- `uv` is installed to `~/.local/bin` (on `PATH` for login shells via `~/.bashrc`). The startup update script runs `uv sync --dev`, so `.venv` is ready; use the `uv run ...` commands from `## Local Commands` for lint/format/type/test.
+- To run and test the proxy end-to-end without a real model, start the dependency-free mock upstream and point the proxy at it. Invoke it with `python3` (the VM has no `python` alias, unlike the README example): `python3 tools/mock_openai.py` (listens on `:4000`), then run the app per `## Local Commands` with `UPSTREAM_URL=http://127.0.0.1:4000`.
+- The app binds `:9526`. Quick hello-world checks once both are running: `curl http://127.0.0.1:9526/healthz`, OpenAI path `POST /v1/chat/completions`, and Ollama path `POST /api/chat` (both return `mock response` against the mock upstream).
