@@ -306,12 +306,15 @@ async def _request_upstream_raw(
     headers = _forward_request_headers(request, settings=settings, stream=False)
     if payload is not None:
         headers["content-type"] = "application/json"
+    request_kwargs: dict[str, Any] = {}
+    if payload is not None:
+        request_kwargs["json"] = payload
     try:
         response = await client.request(
             method,
             _upstream_url(settings, path, request.url.query),
             headers=headers,
-            json=payload if payload is not None else None,
+            **request_kwargs,
         )
     except httpx.HTTPError as exc:
         return _proxy_error(exc)
