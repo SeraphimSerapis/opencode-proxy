@@ -27,8 +27,13 @@ class Settings(BaseSettings):
     )
     proxy_host: str = "0.0.0.0"  # noqa: S104 - container default should be externally reachable.
     proxy_port: int = 9526
-    log_level: str = "INFO"
-    ollama_version: str = Field(default="0.5.1", validation_alias="OLLAMA_VERSION")
+    log_level: str = Field(
+        default="INFO", validation_alias=AliasChoices("LOG_LEVEL", "OLLAMA_PROXY_LOG_LEVEL")
+    )
+    ollama_version: str = Field(
+        default="0.5.1",
+        validation_alias=AliasChoices("OLLAMA_VERSION", "OLLAMA_PROXY_OLLAMA_VERSION"),
+    )
     upstream_connect_timeout: float = Field(default=10.0, ge=0)
     upstream_read_timeout: float = Field(default=0.0, ge=0)
     upstream_write_timeout: float = Field(default=30.0, ge=0)

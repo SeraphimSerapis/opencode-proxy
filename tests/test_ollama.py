@@ -96,6 +96,11 @@ async def test_ollama_chat_stream_converts_sse_to_ndjson_and_keeps_usage_until_d
             "id": "chat-1",
             "model": "qwen",
             "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+        },
+        {
+            "id": "chat-1",
+            "model": "qwen",
+            "choices": [],
             "usage": {"prompt_tokens": 2, "completion_tokens": 3},
         },
     ]
@@ -116,6 +121,7 @@ async def test_ollama_chat_stream_converts_sse_to_ndjson_and_keeps_usage_until_d
     lines = [json.loads(line) for line in response.text.splitlines() if line]
     assert lines[0]["message"]["content"] == "hello"
     assert lines[-1]["done"] is True
+    assert lines[-1]["message"]["content"] == ""
     assert lines[-1]["prompt_eval_count"] == 2
     tool_lines = [line for line in lines if line.get("message", {}).get("tool_calls")]
     assert tool_lines[0]["message"]["tool_calls"][0]["function"] == {
@@ -125,10 +131,51 @@ async def test_ollama_chat_stream_converts_sse_to_ndjson_and_keeps_usage_until_d
 
 
 @respx.mock
+async def test_ollama_generate_stream_defers_done_until_usage_chunk() -> None:
+    chunks = [
+        {
+            "id": "generate-1",
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {"content": "answer"}, "finish_reason": None}],
+        },
+        {
+            "id": "generate-1",
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        },
+        {
+            "id": "generate-1",
+            "model": "qwen",
+            "choices": [],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 6},
+        },
+    ]
+    sse = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200, content=sse.encode(), headers={"content-type": "text/event-stream"}
+        )
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/api/generate",
+            json={"model": "qwen", "prompt": "question"},
+        )
+
+    lines = [json.loads(line) for line in response.text.splitlines() if line]
+    assert lines[0]["response"] == "answer"
+    assert lines[-1]["done"] is True
+    assert lines[-1]["prompt_eval_count"] == 4
+    assert lines[-1]["eval_count"] == 6
+
+
+@respx.mock
 async def test_ollama_generate_and_embed_translate_upstream_requests() -> None:
     def chat_handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert body["messages"][-1] == {"role": "user", "content": "hello"}
+        assert len(request.headers.get_list("content-type")) == 1
         return httpx.Response(
             200,
             json={"choices": [{"message": {"content": "world"}, "finish_reason": "stop"}]},
@@ -177,3 +224,15 @@ async def test_ollama_noop_endpoints_and_health() -> None:
         assert (await client.post("/api/chat", json={"model": "qwen", "messages": []})).json()[
             "done_reason"
         ] == "load"
+
+
+async def test_ollama_model_management_accepts_current_model_field() -> None:
+    async with await _client() as client:
+        show = await client.post("/api/show", json={"model": "qwen3.5-35b"})
+        pull = await client.post("/api/pull", json={"model": "qwen3.5-35b"})
+        delete = await client.request("DELETE", "/api/delete", json={"model": "qwen3.5-35b"})
+
+    assert show.status_code == 200
+    assert show.json()["details"]["family"] == "qwen"
+    assert pull.status_code == 200
+    assert delete.status_code == 200

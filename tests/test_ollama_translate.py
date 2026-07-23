@@ -94,3 +94,19 @@ def test_models_translation_uses_created_timestamp_and_safe_defaults() -> None:
     assert result.models[0].modified_at.startswith("2023-")
     assert result.models[0].details.family == "llama"
     assert result.models[0].details.parameter_size == "8B"
+
+
+def test_current_ollama_aliases_and_thinking_levels_are_forwarded() -> None:
+    request = OllamaChatRequest(
+        model="qwen3.5-35b",
+        messages=[OllamaMessage(role="user", content="think")],
+        think="high",
+        logprobs=True,
+        top_logprobs=3,
+        stream=False,
+    )
+    translated = ollama_chat_to_openai(request)
+
+    assert translated["chat_template_kwargs"] == {"enable_thinking": "high"}
+    assert translated["logprobs"] is True
+    assert translated["top_logprobs"] == 3

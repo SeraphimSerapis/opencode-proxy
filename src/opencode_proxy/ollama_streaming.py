@@ -67,28 +67,12 @@ async def stream_chat_to_ollama(
 ) -> AsyncIterator[bytes]:
     tools = _ToolAccumulator()
     usage: dict[str, Any] = {}
-    done = False
+    terminal: dict[int, tuple[OllamaMessage, str]] = {}
     async for raw_frame in _rewrite_sse_stream(request, response, settings):
         for event in _json_events(raw_frame):
             if event == "[DONE]":
-                if not done:
-                    for choice_index in sorted({key[0] for key in tools.names | tools.arguments}):
-                        calls = tools.pop(choice_index)
-                        if calls:
-                            yield _chat_line(
-                                model,
-                                OllamaMessage(role="assistant", tool_calls=calls),
-                                True,
-                                "stop",
-                                usage,
-                            )
-                    yield _chat_line(
-                        model,
-                        OllamaMessage(role="assistant", content=""),
-                        True,
-                        "stop",
-                        usage,
-                    )
+                async for line in _terminal_chat_lines(terminal, tools, model, usage):
+                    yield line
                 return
             if not isinstance(event, dict):
                 continue
@@ -117,20 +101,16 @@ async def stream_chat_to_ollama(
                 finish_reason = raw_choice.get("finish_reason")
                 message = _message_from_delta(delta)
                 if finish_reason in {"tool_calls", "stop", "length", "content_filter"}:
+                    if message.content is None:
+                        message.content = ""
                     calls = tools.pop(choice_index)
                     if calls:
                         message.tool_calls = calls
-                    yield _chat_line(model, message, True, _ollama_finish(finish_reason), usage)
-                    done = True
+                    terminal[choice_index] = (message, _ollama_finish(finish_reason))
                 elif _message_has_content(message):
                     yield _chat_line(model, message, False, None, {})
-    if not done:
-        calls = tools.pop(0)
-        if calls:
-            yield _chat_line(
-                model, OllamaMessage(role="assistant", tool_calls=calls), True, "stop", usage
-            )
-        yield _chat_line(model, OllamaMessage(role="assistant", content=""), True, "stop", usage)
+    async for line in _terminal_chat_lines(terminal, tools, model, usage):
+        yield line
 
 
 async def stream_generate_to_ollama(
@@ -139,15 +119,19 @@ async def stream_generate_to_ollama(
     settings: Settings,
     model: str,
 ) -> AsyncIterator[bytes]:
-    done = False
+    terminal: tuple[str, str | None, str] | None = None
+    usage: dict[str, Any] = {}
+    stream_complete = False
     async for raw_frame in _rewrite_sse_stream(request, response, settings):
         for event in _json_events(raw_frame):
             if event == "[DONE]":
-                if not done:
-                    yield _generate_line(model, "", None, True, "stop", {})
-                return
+                stream_complete = True
+                break
             if not isinstance(event, dict):
                 continue
+            raw_usage = event.get("usage")
+            if isinstance(raw_usage, dict):
+                usage = raw_usage
             choices = event.get("choices")
             if not isinstance(choices, list) or not choices:
                 continue
@@ -167,18 +151,39 @@ async def stream_generate_to_ollama(
                 "content_filter",
             }
             if is_done:
-                done = True
-            if content or thinking or is_done:
+                terminal = (content, thinking, _ollama_finish(finish_reason))
+            elif content or thinking:
                 yield _generate_line(
                     model,
                     content,
                     thinking,
-                    is_done,
-                    _ollama_finish(finish_reason) if is_done else None,
+                    False,
+                    None,
                     {},
                 )
-    if not done:
-        yield _generate_line(model, "", None, True, "stop", {})
+        if stream_complete:
+            break
+    if terminal is None:
+        terminal = ("", None, "stop")
+    yield _generate_line(model, terminal[0], terminal[1], True, terminal[2], usage)
+
+
+async def _terminal_chat_lines(
+    terminal: dict[int, tuple[OllamaMessage, str]],
+    tools: _ToolAccumulator,
+    model: str,
+    usage: dict[str, Any],
+) -> AsyncIterator[bytes]:
+    for choice_index in sorted({*terminal, *(key[0] for key in tools.names | tools.arguments)}):
+        message, reason = terminal.get(
+            choice_index, (OllamaMessage(role="assistant", content=""), "stop")
+        )
+        calls = tools.pop(choice_index)
+        if calls:
+            message.tool_calls = calls
+        yield _chat_line(model, message, True, reason, usage)
+    if not terminal and not tools.names and not tools.arguments:
+        yield _chat_line(model, OllamaMessage(role="assistant", content=""), True, "stop", usage)
 
 
 def _json_events(frame: bytes) -> list[dict[str, Any] | str]:

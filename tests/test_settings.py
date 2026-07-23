@@ -49,11 +49,13 @@ def test_settings_reads_legacy_ollama_environment_aliases(
 ) -> None:
     monkeypatch.setenv("OLLAMA_PROXY_UPSTREAM_URL", "http://legacy.test:4000")
     monkeypatch.setenv("OLLAMA_PROXY_UPSTREAM_API_KEY", "legacy-key")
+    monkeypatch.setenv("OLLAMA_PROXY_LOG_LEVEL", "debug")
 
     settings = Settings()
 
     assert settings.upstream_url == "http://legacy.test:4000"
     assert settings.upstream_api_key == "legacy-key"
+    assert settings.log_level == "debug"
 
 
 def test_parse_model_aliases_from_json_object() -> None:

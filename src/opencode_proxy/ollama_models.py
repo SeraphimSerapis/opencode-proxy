@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class OllamaFunction(BaseModel):
@@ -37,6 +37,8 @@ class OllamaTool(BaseModel):
 
 
 class OllamaChatRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     model: str
     messages: list[OllamaMessage] = Field(default_factory=list)
     tools: list[OllamaTool] | None = None
@@ -44,13 +46,16 @@ class OllamaChatRequest(BaseModel):
     options: dict[str, Any] | None = None
     stream: bool = True
     keep_alive: str | int | None = None
-    think: bool | None = None
+    think: bool | str | None = None
+    logprobs: bool | None = None
+    top_logprobs: int | None = None
 
 
 class OllamaChatResponse(BaseModel):
     model: str = ""
     created_at: str = ""
     message: OllamaMessage = Field(default_factory=lambda: OllamaMessage(role="assistant"))
+    images: list[str] | None = None
     done: bool = False
     done_reason: str | None = None
     total_duration: int | None = None
@@ -84,7 +89,9 @@ class OllamaModelList(BaseModel):
 
 
 class OllamaShowRequest(BaseModel):
-    name: str
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str = Field(validation_alias=AliasChoices("name", "model"))
     verbose: bool = False
 
 
@@ -107,7 +114,14 @@ class OllamaGenerateRequest(BaseModel):
     stream: bool = True
     raw: bool = False
     keep_alive: str | int | None = None
-    think: bool | None = None
+    think: bool | str | None = None
+    context: list[int] | None = None
+    template: str | None = None
+    logprobs: bool | None = None
+    top_logprobs: int | None = None
+    width: int | None = None
+    height: int | None = None
+    steps: int | None = None
 
 
 class OllamaGenerateResponse(BaseModel):
@@ -170,7 +184,9 @@ class OllamaRunningModels(BaseModel):
 
 
 class OllamaPullRequest(BaseModel):
-    name: str
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str = Field(validation_alias=AliasChoices("name", "model"))
     insecure: bool = False
     stream: bool = True
 
@@ -185,11 +201,15 @@ class OllamaCopyRequest(BaseModel):
 
 
 class OllamaDeleteRequest(BaseModel):
-    name: str
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str = Field(validation_alias=AliasChoices("name", "model"))
 
 
 class OllamaCreateRequest(BaseModel):
-    name: str
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str = Field(validation_alias=AliasChoices("name", "model"))
     modelfile: str | None = None
     stream: bool = True
     quantize: str | None = None

@@ -47,6 +47,7 @@ from opencode_proxy.proxy import (
     _forward_request_headers,
     _forward_response_headers,
     _proxy_error,
+    _set_header,
     _upstream_client,
     _upstream_url,
 )
@@ -259,7 +260,7 @@ async def _send_streaming(
 ) -> httpx.Response | Response:
     client = _upstream_client(request)
     headers = _forward_request_headers(request, settings=settings, stream=True)
-    headers["content-type"] = "application/json"
+    _set_header(headers, "Content-Type", "application/json")
     try:
         upstream_request = client.build_request(
             "POST", _upstream_url(settings, path, request.url.query), headers=headers, json=payload
@@ -305,7 +306,7 @@ async def _request_upstream_raw(
     client = _upstream_client(request)
     headers = _forward_request_headers(request, settings=settings, stream=False)
     if payload is not None:
-        headers["content-type"] = "application/json"
+        _set_header(headers, "Content-Type", "application/json")
     request_kwargs: dict[str, Any] = {}
     if payload is not None:
         request_kwargs["json"] = payload

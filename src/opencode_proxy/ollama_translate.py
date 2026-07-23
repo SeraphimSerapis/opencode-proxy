@@ -86,6 +86,10 @@ def ollama_chat_to_openai(request: OllamaChatRequest) -> dict[str, Any]:
         payload["chat_template_kwargs"] = {
             "enable_thinking": request.think if request.think is not None else thinking_enabled
         }
+    if request.logprobs is not None:
+        payload["logprobs"] = request.logprobs
+    if request.top_logprobs is not None:
+        payload["top_logprobs"] = request.top_logprobs
 
     if request.tools:
         payload["tools"] = [
@@ -238,9 +242,20 @@ def ollama_generate_to_openai(request: OllamaGenerateRequest) -> dict[str, Any]:
         "stream": request.stream,
     }
     if is_qwen3_thinking_model(request.model):
-        payload["chat_template_kwargs"] = {"enable_thinking": bool(request.think)}
-    if request.suffix:
-        payload.setdefault("extra_body", {})["suffix"] = request.suffix
+        payload["chat_template_kwargs"] = {
+            "enable_thinking": request.think if request.think is not None else False
+        }
+    if request.logprobs is not None:
+        payload["logprobs"] = request.logprobs
+    if request.top_logprobs is not None:
+        payload["top_logprobs"] = request.top_logprobs
+    extra_body: dict[str, Any] = {}
+    for key in ("suffix", "template", "context", "raw", "width", "height", "steps"):
+        value = getattr(request, key, None)
+        if value is not None and (key != "raw" or value):
+            extra_body[key] = value
+    if extra_body:
+        payload["extra_body"] = extra_body
     _apply_format(request.format, payload)
     _apply_options(request.options, payload)
     if request.stream:
