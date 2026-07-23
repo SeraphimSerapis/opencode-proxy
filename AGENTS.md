@@ -2,7 +2,7 @@
 
 ## Project Mission
 
-Build a small, production-ready FastAPI proxy between OpenCode and an OpenAI-compatible LiteLLM router. The proxy should preserve normal OpenAI-compatible traffic while repairing model responses that emit tool calls as non-standard text formats such as DeepSeek DSML or Qwen XML.
+Build a small, production-ready FastAPI proxy between OpenCode/Ollama clients and an OpenAI-compatible LiteLLM router. The proxy should preserve normal OpenAI-compatible traffic while repairing model responses that emit tool calls as non-standard text formats such as DeepSeek DSML or Qwen XML. OpenAI and Ollama traffic must share one upstream client and one deployed service.
 
 ## Engineering Standards
 
@@ -13,6 +13,11 @@ Build a small, production-ready FastAPI proxy between OpenCode and an OpenAI-com
 - Prefer typed, explicit code over broad `Any` use. When dynamic JSON is unavoidable, narrow types near the boundary.
 - Add focused tests for every supported tool-call format before changing parser behavior.
 - Keep commits atomic: scaffold, parser behavior, proxy routing/streaming, tests/docs, and validation fixes should be separate commits.
+
+The Ollama adapter is separated into `ollama_models.py`, `ollama_translate.py`,
+`ollama_streaming.py`, and `ollama.py`; keep translation logic independent from
+FastAPI route wiring. `tools/mock_openai.py` is the dependency-free upstream for
+Docker smoke tests and must not make real model calls.
 
 ## Local Commands
 
@@ -41,15 +46,21 @@ docker build -t opencode-proxy:local .
 docker run --rm -p 9526:9526 -e UPSTREAM_URL=http://host.docker.internal:4000 opencode-proxy:local
 ```
 
+The Prometheus deployment maps both host ports `9526` and `11434` to container
+port `9526`; do not bring up the retired standalone `ollama-proxy` service.
+
 ## Environment
 
 - `UPSTREAM_URL`: LiteLLM/OpenAI-compatible base URL, for example `http://127.0.0.1:4000`.
+- `UPSTREAM_API_KEY`: optional fallback bearer token. Forwarded caller `Authorization` takes precedence; leave empty to require LiteLLM virtual keys.
+- `OLLAMA_VERSION`: version returned by `/api/version`. Default: `0.5.1`.
 - `PROXY_HOST`: bind host for direct `python -m opencode_proxy` runs. Default: `0.0.0.0`.
 - `PROXY_PORT`: bind port. Default: `9526`.
 - `LOG_LEVEL`: Python logging level. Default: `INFO`.
 - `STREAM_GUARD_CHARS`: amount of non-tool text to hold while checking for split tool tags. Default: `192`.
 - `TOOL_ARGUMENT_CHUNK_SIZE`: streamed function argument chunk size. Default: `64`.
 - `CUSTOM_HEADERS`: extra headers applied to upstream requests. Prefer JSON object syntax. `UPSTREAM_HEADERS` is accepted as an alias.
+- `PROXY_UPSTREAM_FALLBACK_KEY`: Prometheus compose alias for the optional `UPSTREAM_API_KEY` fallback; do not use the LiteLLM master key as a general client credential.
 
 ## Release Expectations
 
