@@ -125,6 +125,24 @@ uv run pytest
 
 CI also runs a Docker build smoke test.
 
+For a token-free integration smoke test, run the dependency-free mock upstream
+from this repository in a second terminal and point the proxy at it:
+
+```bash
+python tools/mock_openai.py
+UPSTREAM_URL=http://127.0.0.1:4000 uv run opencode-proxy
+curl http://127.0.0.1:9526/api/tags
+curl -N http://127.0.0.1:9526/api/chat \
+  -H 'content-type: application/json' \
+  -d '{"model":"mock-model","messages":[{"role":"user","content":"hello"}]}'
+```
+
+On Prometheus, the compose stack should include only the unified service. Build
+it from `${PROJECTSDIR}/opencode-proxy`, set `UPSTREAM_URL=http://litellm:4000`,
+and map both `11434:9526` and `9526:9526` to that one container. Set
+`UPSTREAM_API_KEY=${LITELLM_MASTER_KEY}` as a fallback for clients that do not
+send a LiteLLM virtual key; caller `Authorization` headers remain per-request.
+
 ## Environment
 
 | Variable | Default | Description |
