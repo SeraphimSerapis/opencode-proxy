@@ -26,11 +26,12 @@ services:
       - UPSTREAM_API_KEY=${PROXY_UPSTREAM_FALLBACK_KEY:-}
       - LOG_LEVEL=INFO
       - OLLAMA_VERSION=0.5.1
+      - MAX_CONCURRENT_UPSTREAM=8
       - MODEL_ALIASES=dsv4-flash=DeepSeek-V4-Flash,deepseek-ai/DeepSeek-V4-Flash-DSpark=DeepSeek-V4-Flash
     healthcheck:
       test:
         - "CMD-SHELL"
-        - "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:9526/healthz', timeout=2).read()\""
+        - "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:9526/readyz', timeout=2).read()\""
       interval: 30s
       timeout: 10s
       retries: 3
