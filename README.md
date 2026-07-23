@@ -54,7 +54,7 @@ Point OpenCode at the proxy, not directly at the upstream:
       "name": "OpenCode Proxy",
       "options": {
         "baseURL": "http://127.0.0.1:9526/v1",
-        "apiKey": "dummy"
+        "apiKey": "sk-your-litellm-virtual-key"
       },
       "models": {
         "your-model": {
@@ -85,6 +85,10 @@ The adapter forwards incoming `Authorization` headers to LiteLLM. Set
 `UPSTREAM_API_KEY` only for clients that cannot provide a key; it is used as a
 fallback and never replaces a caller-provided key. This makes LiteLLM virtual
 keys and per-user budgets available without running a second proxy.
+
+When no fallback is configured, requests without `Authorization` receive the
+upstream LiteLLM authentication error. This is the default in the Prometheus
+compose deployment.
 
 LiteLLM can also host the repair logic directly through a custom callback using
 its `async_post_call_success_hook` and
@@ -139,9 +143,11 @@ curl -N http://127.0.0.1:9526/api/chat \
 
 On Prometheus, the compose stack should include only the unified service. Build
 it from `${PROJECTSDIR}/opencode-proxy`, set `UPSTREAM_URL=http://litellm:4000`,
-and map both `11434:9526` and `9526:9526` to that one container. Set
-`UPSTREAM_API_KEY=${LITELLM_MASTER_KEY}` as a fallback for clients that do not
-send a LiteLLM virtual key; caller `Authorization` headers remain per-request.
+and map both `11434:9526` and `9526:9526` to that one container. The checked-in
+compose definition leaves `UPSTREAM_API_KEY` empty, so LiteLLM virtual keys
+gate callers through forwarded `Authorization` headers. Set
+`PROXY_UPSTREAM_FALLBACK_KEY` only for trusted clients that cannot send a key;
+never use the LiteLLM master key as a general client fallback.
 
 ## Environment
 

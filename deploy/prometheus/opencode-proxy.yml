@@ -20,7 +20,10 @@ services:
     environment:
       - TZ=${TZ}
       - UPSTREAM_URL=http://litellm:4000
-      - UPSTREAM_API_KEY=${LITELLM_MASTER_KEY}
+      # Leave empty by default so LiteLLM virtual keys gate every caller.
+      # Set PROXY_UPSTREAM_FALLBACK_KEY only for trusted clients that cannot
+      # send Authorization themselves.
+      - UPSTREAM_API_KEY=${PROXY_UPSTREAM_FALLBACK_KEY:-}
       - LOG_LEVEL=INFO
       - OLLAMA_VERSION=0.5.1
       - MODEL_ALIASES=dsv4-flash=DeepSeek-V4-Flash,deepseek-ai/DeepSeek-V4-Flash-DSpark=DeepSeek-V4-Flash
