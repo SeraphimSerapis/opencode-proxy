@@ -42,11 +42,14 @@ from opencode_proxy.ollama_translate import (
 )
 from opencode_proxy.proxy import (
     MODELS_PATH,
+    _aclose_upstream_and_release_slot,
+    _acquire_upstream_slot,
     _add_model_aliases,
     _apply_model_alias,
     _forward_request_headers,
     _forward_response_headers,
     _proxy_error,
+    _release_upstream_slot,
     _set_header,
     _upstream_client,
     _upstream_url,
@@ -89,18 +92,24 @@ def build_ollama_router(settings: Settings) -> APIRouter:
 
         openai_payload = ollama_chat_to_openai(payload)
         _apply_model_alias(openai_payload, settings.parsed_model_aliases)
+        overload = await _acquire_upstream_slot(request)
+        if overload is not None:
+            return overload
         if payload.stream:
             return await _stream_chat(request, settings, openai_payload, payload.model)
-        response = await _request_upstream(
-            request, settings, "/v1/chat/completions", openai_payload
-        )
-        if isinstance(response, Response):
-            return response
-        repaired = _repair_response(_json_response(response), settings)
-        return JSONResponse(
-            openai_chat_to_ollama(repaired, payload.model).model_dump(exclude_none=True),
-            status_code=response.status_code,
-        )
+        try:
+            response = await _request_upstream(
+                request, settings, "/v1/chat/completions", openai_payload
+            )
+            if isinstance(response, Response):
+                return response
+            repaired = _repair_response(_json_response(response), settings)
+            return JSONResponse(
+                openai_chat_to_ollama(repaired, payload.model).model_dump(exclude_none=True),
+                status_code=response.status_code,
+            )
+        finally:
+            await _release_upstream_slot(request)
 
     @router.post("/api/generate")
     async def generate(payload: OllamaGenerateRequest, request: Request) -> Response:
@@ -114,18 +123,26 @@ def build_ollama_router(settings: Settings) -> APIRouter:
 
         openai_payload = ollama_generate_to_openai(payload)
         _apply_model_alias(openai_payload, settings.parsed_model_aliases)
+        overload = await _acquire_upstream_slot(request)
+        if overload is not None:
+            return overload
         if payload.stream:
             return await _stream_generate(request, settings, openai_payload, payload.model)
-        response = await _request_upstream(
-            request, settings, "/v1/chat/completions", openai_payload
-        )
-        if isinstance(response, Response):
-            return response
-        repaired = _repair_response(_json_response(response), settings)
-        return JSONResponse(
-            openai_chat_to_ollama_generate(repaired, payload.model).model_dump(exclude_none=True),
-            status_code=response.status_code,
-        )
+        try:
+            response = await _request_upstream(
+                request, settings, "/v1/chat/completions", openai_payload
+            )
+            if isinstance(response, Response):
+                return response
+            repaired = _repair_response(_json_response(response), settings)
+            return JSONResponse(
+                openai_chat_to_ollama_generate(repaired, payload.model).model_dump(
+                    exclude_none=True
+                ),
+                status_code=response.status_code,
+            )
+        finally:
+            await _release_upstream_slot(request)
 
     @router.post("/api/embed")
     async def embed(payload: OllamaEmbedRequest, request: Request) -> Response:
@@ -227,14 +244,19 @@ async def _stream_chat(
     payload: JsonObject,
     model: str,
 ) -> Response:
-    response = await _send_streaming(request, settings, "/v1/chat/completions", payload)
+    try:
+        response = await _send_streaming(request, settings, "/v1/chat/completions", payload)
+    except Exception:
+        await _release_upstream_slot(request)
+        raise
     if isinstance(response, Response):
+        await _release_upstream_slot(request)
         return response
     return StreamingResponse(
         stream_chat_to_ollama(request, response, settings, model),
         status_code=response.status_code,
         media_type="application/x-ndjson",
-        background=BackgroundTask(response.aclose),
+        background=BackgroundTask(_aclose_upstream_and_release_slot, response, request),
     )
 
 
@@ -244,14 +266,19 @@ async def _stream_generate(
     payload: JsonObject,
     model: str,
 ) -> Response:
-    response = await _send_streaming(request, settings, "/v1/chat/completions", payload)
+    try:
+        response = await _send_streaming(request, settings, "/v1/chat/completions", payload)
+    except Exception:
+        await _release_upstream_slot(request)
+        raise
     if isinstance(response, Response):
+        await _release_upstream_slot(request)
         return response
     return StreamingResponse(
         stream_generate_to_ollama(request, response, settings, model),
         status_code=response.status_code,
         media_type="application/x-ndjson",
-        background=BackgroundTask(response.aclose),
+        background=BackgroundTask(_aclose_upstream_and_release_slot, response, request),
     )
 
 

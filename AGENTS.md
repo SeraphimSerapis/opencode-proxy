@@ -51,12 +51,14 @@ port `9526`; do not bring up the retired standalone `ollama-proxy` service.
 
 ## Environment
 
-- `UPSTREAM_URL`: LiteLLM/OpenAI-compatible base URL, for example `http://127.0.0.1:4000`.
+- `UPSTREAM_URL`: LiteLLM/OpenAI-compatible base URL, for example `http://127.0.0.1:4000`. A trailing `/v1` is stripped automatically.
 - `UPSTREAM_API_KEY`: optional fallback bearer token. Forwarded caller `Authorization` takes precedence; leave empty to require LiteLLM virtual keys.
 - `OLLAMA_VERSION`: version returned by `/api/version`. Default: `0.5.1`.
 - `PROXY_HOST`: bind host for direct `python -m opencode_proxy` runs. Default: `0.0.0.0`.
 - `PROXY_PORT`: bind port. Default: `9526`.
 - `LOG_LEVEL`: Python logging level. Default: `INFO`.
+- `MAX_CONCURRENT_UPSTREAM`: max concurrent chat/generate upstream requests. Default: `8`. Use `0` for unlimited.
+- `UPSTREAM_READY_TIMEOUT`: `/readyz` upstream probe timeout in seconds. Default: `2`.
 - `STREAM_GUARD_CHARS`: amount of non-tool text to hold while checking for split tool tags. Default: `192`.
 - `TOOL_ARGUMENT_CHUNK_SIZE`: streamed function argument chunk size. Default: `64`.
 - `CUSTOM_HEADERS`: extra headers applied to upstream requests. Prefer JSON object syntax. `UPSTREAM_HEADERS` is accepted as an alias.

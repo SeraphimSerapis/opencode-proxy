@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
-from urllib.parse import urlsplit
+import logging
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+LOG = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -38,6 +41,12 @@ class Settings(BaseSettings):
     upstream_read_timeout: float = Field(default=0.0, ge=0)
     upstream_write_timeout: float = Field(default=30.0, ge=0)
     upstream_pool_timeout: float = Field(default=30.0, ge=0)
+    upstream_ready_timeout: float = Field(default=2.0, ge=0.1)
+    max_concurrent_upstream: int = Field(
+        default=8,
+        ge=0,
+        validation_alias="MAX_CONCURRENT_UPSTREAM",
+    )
     stream_guard_chars: int = Field(default=192, ge=1)
     tool_argument_chunk_size: int = Field(default=64, ge=1)
     max_raw_tool_block_chars: int = Field(default=131_072, ge=1)
@@ -55,6 +64,11 @@ class Settings(BaseSettings):
     )
     model_aliases: str = Field(default="", validation_alias="MODEL_ALIASES")
     alias_conflict_policy: str = Field(default="skip", validation_alias="ALIAS_CONFLICT_POLICY")
+
+    @field_validator("upstream_url")
+    @classmethod
+    def normalize_upstream_url(cls, value: str) -> str:
+        return strip_upstream_v1_suffix(value)
 
     @field_validator("tool_call_scan_fields", mode="before")
     @classmethod
@@ -126,7 +140,9 @@ class Settings(BaseSettings):
                     "read": None if self.upstream_read_timeout == 0 else self.upstream_read_timeout,
                     "write": self.upstream_write_timeout,
                     "pool": self.upstream_pool_timeout,
+                    "ready": self.upstream_ready_timeout,
                 },
+                "max_concurrent": self.max_concurrent_upstream or None,
             },
             "streaming": {
                 "guard_chars": self.stream_guard_chars,
@@ -153,6 +169,26 @@ class Settings(BaseSettings):
                 "version": self.ollama_version,
             },
         }
+
+
+def strip_upstream_v1_suffix(url: str) -> str:
+    """Strip a trailing ``/v1`` path so callers can paste OpenAI base URLs safely."""
+    cleaned = url.strip().rstrip("/")
+    parsed = urlsplit(cleaned)
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/v1"):
+        return cleaned
+
+    new_path = path[: -len("/v1")]
+    normalized = urlunsplit(
+        (parsed.scheme, parsed.netloc, new_path, parsed.query, parsed.fragment)
+    ).rstrip("/")
+    LOG.warning(
+        "stripped trailing /v1 from UPSTREAM_URL; using %s "
+        "(OpenAI paths are appended by the proxy)",
+        normalized or cleaned,
+    )
+    return normalized
 
 
 def parse_custom_headers(raw_headers: str) -> dict[str, str]:

@@ -153,7 +153,7 @@ never use the LiteLLM master key as a general client fallback.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `UPSTREAM_URL` | `http://127.0.0.1:4000` | Upstream OpenAI-compatible base URL. |
+| `UPSTREAM_URL` | `http://127.0.0.1:4000` | Upstream OpenAI-compatible base URL. A trailing `/v1` is stripped automatically. |
 | `UPSTREAM_API_KEY` | unset | Fallback upstream bearer token. Incoming `Authorization` headers take precedence. `OLLAMA_PROXY_UPSTREAM_URL` and `OLLAMA_PROXY_UPSTREAM_API_KEY` remain accepted aliases for existing Ollama deployments. |
 | `PROXY_HOST` | `0.0.0.0` | Bind host for `opencode-proxy`. |
 | `PROXY_PORT` | `9526` | Bind port for `opencode-proxy`. |
@@ -162,6 +162,8 @@ never use the LiteLLM master key as a general client fallback.
 | `UPSTREAM_READ_TIMEOUT` | `0` | Upstream read timeout in seconds. `0` disables read timeout for long streams. |
 | `UPSTREAM_WRITE_TIMEOUT` | `30` | Upstream write timeout in seconds. |
 | `UPSTREAM_POOL_TIMEOUT` | `30` | Upstream connection-pool timeout in seconds. |
+| `UPSTREAM_READY_TIMEOUT` | `2` | Timeout in seconds for the `/readyz` upstream probe. |
+| `MAX_CONCURRENT_UPSTREAM` | `8` | Max concurrent chat/generate requests to upstream. Extra requests get `429` with `Retry-After: 1`. `0` disables the limit. |
 | `STREAM_GUARD_CHARS` | `192` | Text held back while detecting split raw tool-call tags. |
 | `TOOL_ARGUMENT_CHUNK_SIZE` | `64` | Size for streamed function argument deltas. |
 | `MAX_RAW_TOOL_BLOCK_CHARS` | `131072` | Maximum raw tool-call block size to convert. Larger blocks pass through as text. |
@@ -219,7 +221,8 @@ discovery entry with the alias target metadata, and `error` returns `409`.
 
 ## API Surface
 
-- `GET /healthz`: local proxy health check.
+- `GET /healthz`: local proxy liveness check.
+- `GET /readyz`: readiness check that probes upstream `GET /v1/models`. Connection failures and upstream `5xx` return `503`; auth errors still count as ready.
 - `GET /healthz/config`: safe local config summary, with header values and URL credentials omitted.
 - `/v1/chat/completions`: proxied to the upstream with request tool sanitization and response tool-call repair.
 - `/v1/models` and `/models`: upstream model discovery with configured alias entries added.
@@ -229,7 +232,9 @@ discovery entry with the alias target metadata, and `error` returns `409`.
 
 ## Notes
 
-- Set `UPSTREAM_URL` to the upstream base URL, not the `/v1` path.
+- Set `UPSTREAM_URL` to the upstream base URL, not the `/v1` path. If `/v1` is included anyway, the proxy strips it and logs a warning.
+- Chat and generate requests are limited by `MAX_CONCURRENT_UPSTREAM` (default `8`) so a shared GPU backend is not stampeded by OpenCode, Home Assistant, and other clients.
+- Upstream transport failures return typed `502` bodies (`connection_refused`, `connect_timeout`, `read_timeout`, and related) without leaking hostnames from exception text.
 - The proxy strips compressed SSE request headers so streamed responses can be parsed line by line.
 - If an upstream response already contains standard OpenAI `tool_calls`, it is passed through unchanged.
 - `reasoning_content` and `reasoning` fields (DeepSeek R1 / o1-style streaming) are scanned for raw tool-call blocks by default, but ordinary reasoning text remains in reasoning fields.
