@@ -36,9 +36,10 @@ def test_classify_upstream_error_types() -> None:
     assert classify_upstream_error(
         httpx.ConnectError("connection refused to secret-host:4000")
     ) == ("upstream connection refused", "connection_refused")
-    assert classify_upstream_error(
-        httpx.ConnectError("[Errno -2] Name or service not known")
-    ) == ("upstream DNS resolution failed", "dns_error")
+    assert classify_upstream_error(httpx.ConnectError("[Errno -2] Name or service not known")) == (
+        "upstream DNS resolution failed",
+        "dns_error",
+    )
     assert classify_upstream_error(httpx.ConnectError("network unreachable")) == (
         "upstream connection failed",
         "connect_error",
