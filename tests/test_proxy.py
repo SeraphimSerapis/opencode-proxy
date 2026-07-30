@@ -672,6 +672,88 @@ async def test_streaming_mixed_reasoning_and_content_documents_field_ordering() 
 
 
 @respx.mock
+async def test_streaming_reasoning_tail_does_not_trail_content() -> None:
+    """stream_guard must not leave reasoning tails after the answer body."""
+
+    reasoning = "THINK-" + ("R" * 300)
+    content = "ANSWER-" + ("C" * 400)
+    sse_lines: list[str] = []
+    for start in range(0, len(reasoning), 40):
+        chunk = {
+            "id": "chatcmpl-r-order",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"reasoning_content": reasoning[start : start + 40]},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        sse_lines.append(f"data: {json.dumps(chunk)}\n\n")
+    for start in range(0, len(content), 40):
+        chunk = {
+            "id": "chatcmpl-r-order",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": content[start : start + 40]},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        sse_lines.append(f"data: {json.dumps(chunk)}\n\n")
+    finish = {
+        "id": "chatcmpl-r-order",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-v4",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }
+    sse = "".join(sse_lines) + f"data: {json.dumps(finish)}\n\ndata: [DONE]\n\n"
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=sse.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "deepseek-v4",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert response.status_code == 200
+    order: list[str] = []
+    reasoning_out = []
+    content_out = []
+    for line in response.text.splitlines():
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        payload = json.loads(line.removeprefix("data: "))
+        delta = payload["choices"][0]["delta"]
+        if delta.get("reasoning_content"):
+            order.append("R")
+            reasoning_out.append(delta["reasoning_content"])
+        if delta.get("content"):
+            order.append("C")
+            content_out.append(delta["content"])
+
+    assert "".join(reasoning_out) == reasoning
+    assert "".join(content_out) == content
+    assert "R" not in "".join(order).split("C", 1)[1]
+
+
+@respx.mock
 async def test_streaming_false_tool_prefix_does_not_starve() -> None:
     filler = "x" * 200
     pieces = ["I need a tool to do ", filler, ". The end."]

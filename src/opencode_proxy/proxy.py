@@ -57,6 +57,7 @@ DECODED_BODY_HEADERS = {
 
 CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
 MODELS_PATH = "/v1/models"
+REASONING_SCAN_FIELDS = ("reasoning", "reasoning_content")
 
 
 @dataclass
@@ -520,6 +521,19 @@ def _rewrite_stream_choice(
         emitted_any_delta = True
 
     for field_name in _ordered_scan_fields(scanned_text, scan_fields):
+        # stream_guard holds the tail of each field; release reasoning before any
+        # content so the thinking tail cannot trail the answer in clients like Pi.
+        if field_name == "content":
+            flushed_reasoning = _flush_choice_buffers(
+                state,
+                chunk_id=chunk_id,
+                model=model,
+                choice_index=choice_index,
+                only_fields=REASONING_SCAN_FIELDS,
+            )
+            if flushed_reasoning:
+                outputs.extend(flushed_reasoning)
+                emitted_any_delta = True
         outputs.extend(
             _process_stream_field_text(
                 state,
@@ -765,9 +779,18 @@ def _flush_choice_buffers(
     chunk_id: str,
     model: str,
     choice_index: int,
+    only_fields: tuple[str, ...] | None = None,
 ) -> list[JsonObject]:
     outputs: list[JsonObject] = []
-    for field_name, buffered_text in list(state.field_buffers.items()):
+    if only_fields is None:
+        preferred = [*REASONING_SCAN_FIELDS, "content"]
+        field_names = [name for name in preferred if name in state.field_buffers]
+        field_names.extend(name for name in state.field_buffers if name not in field_names)
+    else:
+        field_names = [name for name in only_fields if name in state.field_buffers]
+
+    for field_name in field_names:
+        buffered_text = state.field_buffers.get(field_name) or ""
         if buffered_text:
             outputs.append(
                 _field_chunk(
@@ -780,6 +803,7 @@ def _flush_choice_buffers(
                 )
             )
             state.field_buffers[field_name] = ""
+            state.pending_raw_fields.discard(field_name)
     return outputs
 
 

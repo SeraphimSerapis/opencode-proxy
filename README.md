@@ -238,5 +238,5 @@ discovery entry with the alias target metadata, and `error` returns `409`.
 - The proxy strips compressed SSE request headers so streamed responses can be parsed line by line.
 - If an upstream response already contains standard OpenAI `tool_calls`, it is passed through unchanged.
 - `reasoning_content` and `reasoning` fields (DeepSeek R1 / o1-style streaming) are scanned for raw tool-call blocks by default, but ordinary reasoning text remains in reasoning fields.
-- Because scanned text is buffered, reasoning deltas from the same upstream event may be emitted before that event's content delta.
+- Because scanned text is buffered with `STREAM_GUARD_CHARS`, reasoning deltas from the same upstream event may be emitted before that event's content delta. Before any `content` is emitted, held reasoning/reasoning_content tails are flushed so thinking cannot trail the answer in streaming clients (for example Pi).
 - The Docker image runs as a non-root user and includes a `/healthz` healthcheck.
