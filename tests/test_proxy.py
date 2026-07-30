@@ -753,6 +753,133 @@ async def test_streaming_reasoning_tail_does_not_trail_content() -> None:
     assert "R" not in "".join(order).split("C", 1)[1]
 
 
+def _reasoning_chunk(field: str, text: str) -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-mix",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-v4",
+        "choices": [{"index": 0, "delta": {field: text}, "finish_reason": None}],
+    }
+
+
+@respx.mock
+async def test_streaming_reasoning_tool_call_survives_interleaved_content() -> None:
+    """Pre-flushing reasoning must not break a raw tool block still being parsed."""
+
+    chunks = [
+        _reasoning_chunk("reasoning_content", "I should call a tool. <tool_call>"),
+        _reasoning_chunk("reasoning_content", '{"name": "get_weather", "arg'),
+        _reasoning_chunk("content", "Meanwhile here is text. "),
+        _reasoning_chunk("reasoning_content", 'uments": {"city": "Berlin"}}</tool_call>'),
+        {
+            "id": "chatcmpl-mix",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        },
+    ]
+    sse = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=sse.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "deepseek-v4",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert response.status_code == 200
+    payloads = _stream_payloads(response)
+    reasoning = "".join(
+        p["choices"][0]["delta"].get("reasoning_content", "")
+        for p in payloads
+        if p["choices"] and isinstance(p["choices"][0].get("delta"), dict)
+    )
+    names = [
+        call["function"]["name"]
+        for p in payloads
+        if p["choices"] and isinstance(p["choices"][0].get("delta"), dict)
+        for call in p["choices"][0]["delta"].get("tool_calls", [])
+        if "function" in call and "name" in call["function"]
+    ]
+
+    assert names == ["get_weather"]
+    assert "<tool_call>" not in reasoning
+    assert payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+@respx.mock
+async def test_streaming_reasoning_precedes_unscanned_content() -> None:
+    """Reasoning tails flush first even when content is not a scanned field."""
+
+    reasoning = "R" * 300
+    content = "ANSWER " * 40
+    chunks = [
+        _reasoning_chunk("reasoning_content", reasoning),
+        _reasoning_chunk("content", content),
+        {
+            "id": "chatcmpl-mix",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        },
+    ]
+    sse = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=sse.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        tool_call_scan_fields="reasoning,reasoning_content",
+    )
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "deepseek-v4",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert response.status_code == 200
+    order: list[str] = []
+    reasoning_out: list[str] = []
+    content_out: list[str] = []
+    for payload in _stream_payloads(response):
+        if not payload["choices"]:
+            continue
+        delta = payload["choices"][0].get("delta")
+        if not isinstance(delta, dict):
+            continue
+        if delta.get("reasoning_content"):
+            order.append("R")
+            reasoning_out.append(delta["reasoning_content"])
+        if delta.get("content"):
+            order.append("C")
+            content_out.append(delta["content"])
+
+    assert "".join(reasoning_out) == reasoning
+    assert "".join(content_out) == content
+    assert "R" not in "".join(order).split("C", 1)[1]
+
+
 @respx.mock
 async def test_streaming_false_tool_prefix_does_not_starve() -> None:
     filler = "x" * 200
@@ -1735,3 +1862,46 @@ async def test_streaming_scanned_content_preserves_choice_and_event_metadata() -
     assert any(payload.get("created") == 123 for payload in payloads)
     assert any(payload.get("system_fingerprint") == "fp_test" for payload in payloads)
     assert any(payload["choices"][0].get("logprobs") for payload in payloads)
+
+
+@respx.mock
+async def test_streaming_null_choice_extras_do_not_emit_empty_deltas() -> None:
+    """vLLM sends logprobs/stop_reason as null on every choice; they carry nothing."""
+
+    chunks = [
+        {
+            "id": "chatcmpl-vllm",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": text, "reasoning_content": None},
+                    "logprobs": None,
+                    "finish_reason": None,
+                    "stop_reason": None,
+                }
+            ],
+        }
+        for text in ("hello ", "world")
+    ]
+    sse = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=sse.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    payloads = _stream_payloads(response)
+    deltas = [payload["choices"][0]["delta"] for payload in payloads if payload["choices"]]
+    assert "".join(delta.get("content", "") for delta in deltas) == "hello world"
+    assert all(delta for delta in deltas)
