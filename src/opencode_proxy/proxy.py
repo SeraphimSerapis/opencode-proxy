@@ -516,24 +516,36 @@ def _rewrite_stream_choice(
     )
 
     emitted_any_delta = False
+
+    def _flush_reasoning_before_content() -> None:
+        """Release held reasoning tails so thinking cannot trail the answer.
+
+        Fields mid raw tool-call block keep their buffer: flushing there would
+        leak a half-parsed block as visible text.
+        """
+        nonlocal emitted_any_delta
+        flushed = _flush_choice_buffers(
+            state,
+            chunk_id=chunk_id,
+            model=model,
+            choice_index=choice_index,
+            only_fields=tuple(
+                name for name in REASONING_SCAN_FIELDS if name not in state.pending_raw_fields
+            ),
+        )
+        if flushed:
+            outputs.extend(flushed)
+            emitted_any_delta = True
+
     if other_delta or _has_stream_metadata(choice):
+        if other_delta.get("content"):
+            _flush_reasoning_before_content()
         outputs.append(_choice_delta_event(event, choice, other_delta, finish_reason=None))
         emitted_any_delta = True
 
     for field_name in _ordered_scan_fields(scanned_text, scan_fields):
-        # stream_guard holds the tail of each field; release reasoning before any
-        # content so the thinking tail cannot trail the answer in clients like Pi.
         if field_name == "content":
-            flushed_reasoning = _flush_choice_buffers(
-                state,
-                chunk_id=chunk_id,
-                model=model,
-                choice_index=choice_index,
-                only_fields=REASONING_SCAN_FIELDS,
-            )
-            if flushed_reasoning:
-                outputs.extend(flushed_reasoning)
-                emitted_any_delta = True
+            _flush_reasoning_before_content()
         outputs.extend(
             _process_stream_field_text(
                 state,
@@ -977,8 +989,10 @@ def _choice_delta_event(
 
 
 def _has_stream_metadata(choice: JsonObject) -> bool:
+    # Null-valued extras carry no information; vLLM sends logprobs and stop_reason
+    # on every choice, which would otherwise force an empty delta event per chunk.
     choice_envelope = {"index", "delta", "finish_reason"}
-    return bool(choice.keys() - choice_envelope)
+    return any(value is not None for key, value in choice.items() if key not in choice_envelope)
 
 
 def _forward_request_headers(
