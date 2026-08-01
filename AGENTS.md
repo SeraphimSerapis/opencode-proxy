@@ -14,10 +14,20 @@ Build a small, production-ready FastAPI proxy between OpenCode/Ollama clients an
 - Add focused tests for every supported tool-call format before changing parser behavior.
 - Keep commits atomic: scaffold, parser behavior, proxy routing/streaming, tests/docs, and validation fixes should be separate commits.
 
-The Ollama adapter is separated into `ollama_models.py`, `ollama_translate.py`,
+`routing.py` holds modality detection and upstream selection and `config_file.py`
+holds YAML loading; both stay free of FastAPI imports so they can be unit tested
+directly. The Ollama adapter is separated into `ollama_models.py`, `ollama_translate.py`,
 `ollama_streaming.py`, and `ollama.py`; keep translation logic independent from
 FastAPI route wiring. `tools/mock_openai.py` is the dependency-free upstream for
 Docker smoke tests and must not make real model calls.
+
+## Documentation
+
+`docs/` is an OKF v0.2 knowledge bundle. Reserved files (`docs/index.md`,
+`docs/log.md`, section `index.md` files) carry no frontmatter except the bundle
+root, which declares `okf_version`. Every other document needs YAML frontmatter
+with a non-empty `type`. When behaviour changes, update the affected concept
+document and add a `docs/log.md` entry in the same commit.
 
 ## Local Commands
 
@@ -59,8 +69,13 @@ port `9526`; do not bring up the retired standalone `ollama-proxy` service.
 - `LOG_LEVEL`: Python logging level. Default: `INFO`.
 - `MAX_CONCURRENT_UPSTREAM`: max concurrent chat/generate upstream requests. Default: `8`. Use `0` for unlimited.
 - `UPSTREAM_READY_TIMEOUT`: `/readyz` upstream probe timeout in seconds. Default: `2`.
+- `SSE_KEEPALIVE_INTERVAL`: seconds of upstream silence before sending an SSE keepalive comment. Default: `10`. Use `0` to disable.
+- `UPSTREAM_MAX_RETRIES`: retries for chat/generate requests that fail before any response byte reaches the client. Default: `2`. Use `0` to disable. Never retries once a stream has started.
+- `UPSTREAM_STREAM_IDLE_TIMEOUT`: seconds to wait for the next upstream SSE frame before terminating the client stream. Default: `120`. Use `0` to disable.
 - `STREAM_GUARD_CHARS`: amount of non-tool text to hold while checking for split tool tags. Default: `192`.
 - `TOOL_ARGUMENT_CHUNK_SIZE`: streamed function argument chunk size. Default: `64`.
+- `PROXY_CONFIG_FILE`: optional YAML file with `models:` (aliases) and `routes:` (modality routes). Environment variables win over the file; a missing or malformed file fails startup.
+- `MODALITY_ROUTES`: JSON map of `vision`/`audio` to `{upstream, model, api_key, headers}` for routing image/audio requests to a multimodal host.
 - `CUSTOM_HEADERS`: extra headers applied to upstream requests. Prefer JSON object syntax. `UPSTREAM_HEADERS` is accepted as an alias.
 - `PROXY_UPSTREAM_FALLBACK_KEY`: Prometheus compose alias for the optional `UPSTREAM_API_KEY` fallback; do not use the LiteLLM master key as a general client credential.
 
