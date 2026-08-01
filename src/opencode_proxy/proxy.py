@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import random
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
@@ -27,9 +29,14 @@ from opencode_proxy.compat import (
     tool_calls_within_limits,
 )
 from opencode_proxy.concurrency import UpstreamConcurrencyLimiter
+from opencode_proxy.routing import (
+    UpstreamTarget,
+    default_upstream_target,
+    resolve_upstream_target,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping
+    from collections.abc import AsyncIterator, Callable, Mapping
 
     from opencode_proxy.settings import Settings
 
@@ -54,6 +61,12 @@ DECODED_BODY_HEADERS = {
     "digest",
     "etag",
 }
+
+SSE_KEEPALIVE_COMMENT = b": keepalive\n\n"
+
+# Upstream statuses worth one more attempt: overload and gateway failures, where
+# the model most likely never ran.
+RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
 CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
 MODELS_PATH = "/v1/models"
@@ -113,19 +126,22 @@ def build_router(settings: Settings) -> APIRouter:
 async def proxy_chat_completions(request: Request, settings: Settings) -> Response:
     body = await request.body()
     parsed_body = _parse_json_object(body)
+    target = default_upstream_target(settings)
     if parsed_body is not None:
         if settings.sanitize_tools:
             _sanitize_tools(parsed_body)
         _drop_request_fields(parsed_body, settings.parsed_request_drop_fields)
         _apply_model_alias(parsed_body, settings.parsed_model_aliases)
+        target = resolve_upstream_target(settings, parsed_body)
+        apply_target_model(parsed_body, target)
 
     stream = bool(parsed_body.get("stream")) if parsed_body is not None else False
     overload = await _acquire_upstream_slot(request)
     if overload is not None:
         return overload
     if stream:
-        return await _proxy_streaming_chat_completion(request, settings, parsed_body, body)
-    return await _proxy_buffered_chat_completion(request, settings, parsed_body, body)
+        return await _proxy_streaming_chat_completion(request, settings, parsed_body, body, target)
+    return await _proxy_buffered_chat_completion(request, settings, parsed_body, body, target)
 
 
 async def proxy_passthrough(request: Request, settings: Settings, path: str) -> Response:
@@ -215,16 +231,24 @@ async def _proxy_buffered_chat_completion(
     settings: Settings,
     parsed_body: JsonObject | None,
     raw_body: bytes,
+    target: UpstreamTarget,
 ) -> Response:
-    headers = _forward_request_headers(request, settings=settings, stream=False)
+    headers = _forward_request_headers(request, settings=settings, stream=False, target=target)
     client = _upstream_client(request)
     try:
         try:
-            upstream_response = await client.request(
-                request.method,
-                _upstream_url(settings, CHAT_COMPLETIONS_PATH, request.url.query),
-                headers=headers,
-                **_body_kwargs(parsed_body, raw_body),
+            upstream_response = await send_upstream_with_retries(
+                client,
+                lambda: client.build_request(
+                    request.method,
+                    _upstream_url(
+                        settings, CHAT_COMPLETIONS_PATH, request.url.query, target=target
+                    ),
+                    headers=headers,
+                    **_body_kwargs(parsed_body, raw_body),
+                ),
+                settings=settings,
+                stream=False,
             )
         except httpx.HTTPError as exc:
             return _proxy_error(exc)
@@ -279,18 +303,23 @@ async def _proxy_streaming_chat_completion(
     settings: Settings,
     parsed_body: JsonObject | None,
     raw_body: bytes,
+    target: UpstreamTarget,
 ) -> Response:
-    headers = _forward_request_headers(request, settings=settings, stream=True)
+    headers = _forward_request_headers(request, settings=settings, stream=True, target=target)
 
     client = _upstream_client(request)
     try:
-        upstream_request = client.build_request(
-            request.method,
-            _upstream_url(settings, CHAT_COMPLETIONS_PATH, request.url.query),
-            headers=headers,
-            **_body_kwargs(parsed_body, raw_body),
+        upstream_response = await send_upstream_with_retries(
+            client,
+            lambda: client.build_request(
+                request.method,
+                _upstream_url(settings, CHAT_COMPLETIONS_PATH, request.url.query, target=target),
+                headers=headers,
+                **_body_kwargs(parsed_body, raw_body),
+            ),
+            settings=settings,
+            stream=True,
         )
-        upstream_response = await client.send(upstream_request, stream=True)
     except httpx.HTTPError as exc:
         await _release_upstream_slot(request)
         return _proxy_error(exc)
@@ -327,10 +356,59 @@ async def _proxy_streaming_chat_completion(
     return StreamingResponse(
         generator,
         status_code=upstream_response.status_code,
-        headers=response_headers,
+        headers=apply_stream_response_headers(response_headers),
         media_type="text/event-stream",
         background=background,
     )
+
+
+def apply_stream_response_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Mark an SSE response as unbuffered so intermediaries relay it verbatim."""
+    _set_header(headers, "Cache-Control", "no-cache")
+    _set_header(headers, "X-Accel-Buffering", "no")
+    return headers
+
+
+async def send_upstream_with_retries(
+    client: httpx.AsyncClient,
+    build_request: Callable[[], httpx.Request],
+    *,
+    settings: Settings,
+    stream: bool,
+) -> httpx.Response:
+    """Send an upstream request, retrying transport and overload failures.
+
+    Retries only happen here, before any response bytes have reached the client,
+    so a stream that has already started is never restarted. The request is
+    rebuilt each attempt because httpx consumes the outgoing body.
+    """
+    attempt = 0
+    while True:
+        try:
+            response = await client.send(build_request(), stream=stream)
+        except httpx.HTTPError as exc:
+            if attempt >= settings.upstream_max_retries or not isinstance(
+                exc, httpx.TransportError
+            ):
+                raise
+            attempt += 1
+            await _retry_backoff(attempt, reason=type(exc).__name__)
+            continue
+
+        if response.status_code not in RETRYABLE_STATUS or attempt >= settings.upstream_max_retries:
+            return response
+
+        await response.aread()
+        await response.aclose()
+        attempt += 1
+        await _retry_backoff(attempt, reason=f"HTTP {response.status_code}")
+
+
+async def _retry_backoff(attempt: int, *, reason: str) -> None:
+    jitter = random.uniform(0, 0.25)  # noqa: S311 - retry jitter, not security
+    delay = min(0.5 * (2**attempt), 8.0) + jitter
+    LOG.warning("retrying upstream request (attempt %d) after %s in %.1fs", attempt, reason, delay)
+    await asyncio.sleep(delay)
 
 
 async def _rewrite_sse_stream(
@@ -344,10 +422,18 @@ async def _rewrite_sse_stream(
     choice_states: dict[int, StreamChoiceState] = {}
 
     try:
-        async for frame in _iter_sse_frames(upstream_response):
+        async for frame in _iter_sse_frames_with_idle_guard(
+            upstream_response,
+            settings.upstream_stream_idle_timeout,
+            settings.sse_keepalive_interval,
+        ):
             if await request.is_disconnected():
                 LOG.info("client disconnected; stopping upstream SSE rewrite")
                 return
+
+            if frame is None:
+                yield SSE_KEEPALIVE_COMMENT
+                continue
 
             if frame.data is None:
                 yield _encode_sse_raw_frame(frame.raw_lines)
@@ -402,6 +488,74 @@ async def _rewrite_sse_stream(
         yield done_payload
 
 
+async def _iter_sse_frames_with_idle_guard(
+    upstream_response: httpx.Response,
+    idle_timeout: float,
+    keepalive_interval: float = 0.0,
+) -> AsyncIterator[SseFrame | None]:
+    """Yield upstream SSE frames, plus ``None`` whenever the upstream is quiet.
+
+    A ``None`` is a keepalive tick: the caller turns it into an SSE comment so
+    intermediaries do not drop an idle connection and the client keeps seeing
+    signs of life during a long reasoning pause.
+
+    Iteration also ends once the upstream has been silent for ``idle_timeout``.
+    An upstream that stops sending without closing the connection would
+    otherwise strand the caller forever, because the read timeout is usually
+    disabled to allow slow local models. Ending iteration lets the caller flush
+    its buffers and terminate the client stream normally.
+    """
+    frames = _iter_sse_frames(upstream_response).__aiter__()
+    pending: asyncio.Task[SseFrame] | None = None
+    silence = 0.0
+    try:
+        while True:
+            if pending is None:
+                # Held across timeouts so a keepalive tick never cancels a
+                # partially received frame.
+                pending = asyncio.ensure_future(anext(frames))
+
+            wait_seconds = _next_wait_interval(idle_timeout, keepalive_interval, silence)
+            done, _ = await asyncio.wait({pending}, timeout=wait_seconds)
+            if not done:
+                silence += wait_seconds or 0.0
+                if idle_timeout > 0 and silence >= idle_timeout:
+                    LOG.warning(
+                        "upstream sent no SSE frame for %.1fs; terminating the client stream",
+                        silence,
+                    )
+                    return
+                yield None
+                continue
+
+            finished, pending = pending, None
+            try:
+                frame = finished.result()
+            except StopAsyncIteration:
+                return
+            silence = 0.0
+            yield frame
+    finally:
+        if pending is not None:
+            pending.cancel()
+            with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration, Exception):
+                await pending
+
+
+def _next_wait_interval(
+    idle_timeout: float,
+    keepalive_interval: float,
+    silence: float,
+) -> float | None:
+    """Seconds to wait for the next frame, or ``None`` to wait indefinitely."""
+    remaining_idle = idle_timeout - silence if idle_timeout > 0 else None
+    if keepalive_interval > 0 and remaining_idle is not None:
+        return min(keepalive_interval, remaining_idle)
+    if keepalive_interval > 0:
+        return keepalive_interval
+    return remaining_idle
+
+
 async def _iter_sse_frames(upstream_response: httpx.Response) -> AsyncIterator[SseFrame]:
     raw_lines: list[str] = []
     data_lines: list[str] = []
@@ -444,12 +598,15 @@ async def _finish_sse_stream(
             choice_index=choice_index,
         ):
             yield _encode_sse_json(payload)
-        if state.raw_tool_calls_emitted and not state.finish_sent:
+        if not state.finish_sent:
+            # A stream that ends without a finish_reason leaves agent clients
+            # waiting on a turn the model already completed; always close the
+            # choice out.
             yield _encode_sse_json(
                 make_finish_chunk(
                     chunk_id=chunk_id,
                     model=model,
-                    finish_reason="tool_calls",
+                    finish_reason=_finish_reason_for_state(None, state),
                     choice_index=choice_index,
                 ),
             )
@@ -859,6 +1016,18 @@ def _body_kwargs(parsed_body: JsonObject | None, raw_body: bytes) -> dict[str, A
     return {"content": raw_body}
 
 
+def apply_target_model(body: JsonObject, target: UpstreamTarget) -> None:
+    """Swap in the routed model so the alternate upstream sees a name it serves."""
+    if target.model and body.get("model") != target.model:
+        LOG.info(
+            "rewriting model %r to %r for the %s route",
+            body.get("model"),
+            target.model,
+            target.modality,
+        )
+        body["model"] = target.model
+
+
 def _apply_model_alias(body: JsonObject, aliases: Mapping[str, str]) -> None:
     model = body.get("model")
     if isinstance(model, str) and model in aliases:
@@ -996,7 +1165,11 @@ def _has_stream_metadata(choice: JsonObject) -> bool:
 
 
 def _forward_request_headers(
-    request: Request, *, settings: Settings, stream: bool
+    request: Request,
+    *,
+    settings: Settings,
+    stream: bool,
+    target: UpstreamTarget | None = None,
 ) -> dict[str, str]:
     headers: dict[str, str] = {}
     for key, value in request.headers.items():
@@ -1026,6 +1199,16 @@ def _forward_request_headers(
             continue
         _set_header(headers, key, value)
 
+    if target is not None and target.modality:
+        # A routed request goes to a different host, so the caller credential for
+        # the primary upstream must not follow it there.
+        if target.api_key:
+            _set_header(headers, "Authorization", f"Bearer {target.api_key}")
+        for key, value in target.extra_headers:
+            if key.lower() in HOP_BY_HOP_HEADERS:
+                continue
+            _set_header(headers, key, value)
+
     return headers
 
 
@@ -1050,9 +1233,16 @@ def _forward_response_headers(
     return forwarded
 
 
-def _upstream_url(settings: Settings, path: str, query: str) -> str:
+def _upstream_url(
+    settings: Settings,
+    path: str,
+    query: str,
+    *,
+    target: UpstreamTarget | None = None,
+) -> str:
+    base_url = target.base_url if target is not None else settings.upstream_base_url
     normalized_path = "/" + quote(path.lstrip("/"), safe="/:")
-    url = f"{settings.upstream_base_url}{normalized_path}"
+    url = f"{base_url}{normalized_path}"
     if query:
         return f"{url}?{query}"
     return url

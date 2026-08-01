@@ -16,12 +16,14 @@ dependencies = [
   "fastapi>=0.128.0",
   "httpx>=0.28.1",
   "pydantic-settings>=2.12.0",
+  "pyyaml>=6.0.2",
   "uvicorn[standard]>=0.38.0",
 ]
 
 [dependency-groups]
 dev = [
   "mypy>=1.19.0",
+  "types-pyyaml>=6.0.12",
   "pytest>=9.0.0",
   "pytest-asyncio>=1.3.0",
   "pytest-cov>=6.0.0",

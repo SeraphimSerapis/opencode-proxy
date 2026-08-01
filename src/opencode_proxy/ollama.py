@@ -53,7 +53,11 @@ from opencode_proxy.proxy import (
     _set_header,
     _upstream_client,
     _upstream_url,
+    apply_stream_response_headers,
+    apply_target_model,
+    send_upstream_with_retries,
 )
+from opencode_proxy.routing import UpstreamTarget, resolve_upstream_target
 
 if TYPE_CHECKING:
     from opencode_proxy.compat import JsonObject
@@ -92,14 +96,16 @@ def build_ollama_router(settings: Settings) -> APIRouter:
 
         openai_payload = ollama_chat_to_openai(payload)
         _apply_model_alias(openai_payload, settings.parsed_model_aliases)
+        target = resolve_upstream_target(settings, openai_payload)
+        apply_target_model(openai_payload, target)
         overload = await _acquire_upstream_slot(request)
         if overload is not None:
             return overload
         if payload.stream:
-            return await _stream_chat(request, settings, openai_payload, payload.model)
+            return await _stream_chat(request, settings, openai_payload, payload.model, target)
         try:
             response = await _request_upstream(
-                request, settings, "/v1/chat/completions", openai_payload
+                request, settings, "/v1/chat/completions", openai_payload, target=target
             )
             if isinstance(response, Response):
                 return response
@@ -123,14 +129,16 @@ def build_ollama_router(settings: Settings) -> APIRouter:
 
         openai_payload = ollama_generate_to_openai(payload)
         _apply_model_alias(openai_payload, settings.parsed_model_aliases)
+        target = resolve_upstream_target(settings, openai_payload)
+        apply_target_model(openai_payload, target)
         overload = await _acquire_upstream_slot(request)
         if overload is not None:
             return overload
         if payload.stream:
-            return await _stream_generate(request, settings, openai_payload, payload.model)
+            return await _stream_generate(request, settings, openai_payload, payload.model, target)
         try:
             response = await _request_upstream(
-                request, settings, "/v1/chat/completions", openai_payload
+                request, settings, "/v1/chat/completions", openai_payload, target=target
             )
             if isinstance(response, Response):
                 return response
@@ -243,9 +251,12 @@ async def _stream_chat(
     settings: Settings,
     payload: JsonObject,
     model: str,
+    target: UpstreamTarget | None = None,
 ) -> Response:
     try:
-        response = await _send_streaming(request, settings, "/v1/chat/completions", payload)
+        response = await _send_streaming(
+            request, settings, "/v1/chat/completions", payload, target=target
+        )
     except Exception:
         await _release_upstream_slot(request)
         raise
@@ -255,6 +266,7 @@ async def _stream_chat(
     return StreamingResponse(
         stream_chat_to_ollama(request, response, settings, model),
         status_code=response.status_code,
+        headers=apply_stream_response_headers({}),
         media_type="application/x-ndjson",
         background=BackgroundTask(_aclose_upstream_and_release_slot, response, request),
     )
@@ -265,9 +277,12 @@ async def _stream_generate(
     settings: Settings,
     payload: JsonObject,
     model: str,
+    target: UpstreamTarget | None = None,
 ) -> Response:
     try:
-        response = await _send_streaming(request, settings, "/v1/chat/completions", payload)
+        response = await _send_streaming(
+            request, settings, "/v1/chat/completions", payload, target=target
+        )
     except Exception:
         await _release_upstream_slot(request)
         raise
@@ -277,22 +292,35 @@ async def _stream_generate(
     return StreamingResponse(
         stream_generate_to_ollama(request, response, settings, model),
         status_code=response.status_code,
+        headers=apply_stream_response_headers({}),
         media_type="application/x-ndjson",
         background=BackgroundTask(_aclose_upstream_and_release_slot, response, request),
     )
 
 
 async def _send_streaming(
-    request: Request, settings: Settings, path: str, payload: JsonObject
+    request: Request,
+    settings: Settings,
+    path: str,
+    payload: JsonObject,
+    *,
+    target: UpstreamTarget | None = None,
 ) -> httpx.Response | Response:
     client = _upstream_client(request)
-    headers = _forward_request_headers(request, settings=settings, stream=True)
+    headers = _forward_request_headers(request, settings=settings, stream=True, target=target)
     _set_header(headers, "Content-Type", "application/json")
     try:
-        upstream_request = client.build_request(
-            "POST", _upstream_url(settings, path, request.url.query), headers=headers, json=payload
+        response = await send_upstream_with_retries(
+            client,
+            lambda: client.build_request(
+                "POST",
+                _upstream_url(settings, path, request.url.query, target=target),
+                headers=headers,
+                json=payload,
+            ),
+            settings=settings,
+            stream=True,
         )
-        response = await client.send(upstream_request, stream=True)
     except httpx.HTTPError as exc:
         return _proxy_error(exc)
     if response.status_code >= 400:
@@ -318,9 +346,14 @@ async def _send_streaming(
 
 
 async def _request_upstream(
-    request: Request, settings: Settings, path: str, payload: JsonObject
+    request: Request,
+    settings: Settings,
+    path: str,
+    payload: JsonObject,
+    *,
+    target: UpstreamTarget | None = None,
 ) -> httpx.Response | Response:
-    return await _request_upstream_raw(request, settings, "POST", path, payload)
+    return await _request_upstream_raw(request, settings, "POST", path, payload, target=target)
 
 
 async def _request_upstream_raw(
@@ -329,20 +362,27 @@ async def _request_upstream_raw(
     method: str,
     path: str,
     payload: JsonObject | None = None,
+    *,
+    target: UpstreamTarget | None = None,
 ) -> httpx.Response | Response:
     client = _upstream_client(request)
-    headers = _forward_request_headers(request, settings=settings, stream=False)
+    headers = _forward_request_headers(request, settings=settings, stream=False, target=target)
     if payload is not None:
         _set_header(headers, "Content-Type", "application/json")
     request_kwargs: dict[str, Any] = {}
     if payload is not None:
         request_kwargs["json"] = payload
     try:
-        response = await client.request(
-            method,
-            _upstream_url(settings, path, request.url.query),
-            headers=headers,
-            **request_kwargs,
+        response = await send_upstream_with_retries(
+            client,
+            lambda: client.build_request(
+                method,
+                _upstream_url(settings, path, request.url.query, target=target),
+                headers=headers,
+                **request_kwargs,
+            ),
+            settings=settings,
+            stream=False,
         )
     except httpx.HTTPError as exc:
         return _proxy_error(exc)

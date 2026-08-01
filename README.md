@@ -9,6 +9,17 @@ Ollama clients -> opencode-proxy -> OpenAI-compatible upstream -> model backend
 
 The proxy passes normal OpenAI-compatible traffic through unchanged and repairs known malformed assistant tool-call formats in `/v1/chat/completions` responses. The same process also exposes an Ollama-compatible REST adapter, so OpenCode, Home Assistant, and Ollama clients can share one gateway.
 
+## Documentation
+
+Detailed docs live in [`docs/`](docs/index.md) as an [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md) bundle:
+[request pipeline](docs/architecture/request-pipeline.md),
+[tool-call repair](docs/architecture/tool-call-repair.md),
+[streaming contract](docs/architecture/streaming-contract.md),
+[configuration](docs/reference/configuration.md),
+[API surface](docs/reference/api-surface.md),
+[decisions](docs/decisions/index.md), and
+[runbooks](docs/runbooks/index.md).
+
 ## Supported Repairs
 
 - DeepSeek DSML `<｜DSML｜tool_calls>` blocks with `<name>` / `<parameters>`.
@@ -163,6 +174,9 @@ never use the LiteLLM master key as a general client fallback.
 | `UPSTREAM_WRITE_TIMEOUT` | `30` | Upstream write timeout in seconds. |
 | `UPSTREAM_POOL_TIMEOUT` | `30` | Upstream connection-pool timeout in seconds. |
 | `UPSTREAM_READY_TIMEOUT` | `2` | Timeout in seconds for the `/readyz` upstream probe. |
+| `SSE_KEEPALIVE_INTERVAL` | `10` | Seconds of upstream silence before the proxy sends an SSE keepalive comment. `0` disables keepalives. |
+| `UPSTREAM_MAX_RETRIES` | `2` | Retries for chat/generate requests that fail before any response byte reaches the client. `0` disables retries. |
+| `UPSTREAM_STREAM_IDLE_TIMEOUT` | `120` | Seconds to wait for the next upstream SSE frame before flushing buffers, sending a terminal chunk, and closing the client stream. `0` disables the guard. |
 | `MAX_CONCURRENT_UPSTREAM` | `8` | Max concurrent chat/generate requests to upstream. Extra requests get `429` with `Retry-After: 1`. `0` disables the limit. |
 | `STREAM_GUARD_CHARS` | `192` | Text held back while detecting split raw tool-call tags. |
 | `TOOL_ARGUMENT_CHUNK_SIZE` | `64` | Size for streamed function argument deltas. |
@@ -175,6 +189,8 @@ never use the LiteLLM master key as a general client fallback.
 | `CUSTOM_HEADERS` | unset | Extra headers added to upstream requests. Overrides forwarded client headers. |
 | `UPSTREAM_HEADERS` | unset | Alias for `CUSTOM_HEADERS`. |
 | `MODEL_ALIASES` | unset | Model alias map. Request aliases are rewritten to canonical upstream model names. |
+| `PROXY_CONFIG_FILE` | unset | Path to an optional YAML file holding model aliases and modality routes. Environment variables win over the file. |
+| `MODALITY_ROUTES` | unset | JSON map of `vision`/`audio` to an alternate upstream, so image or audio requests can go to a multimodal host. |
 | `ALIAS_CONFLICT_POLICY` | `skip` | Model discovery behavior when an alias conflicts with an upstream model id: `skip`, `shadow`, or `error`. |
 | `OLLAMA_VERSION` | `0.5.1` | Version reported by `GET /api/version`. |
 
@@ -219,6 +235,80 @@ If an alias conflicts with a model already returned by upstream discovery,
 `ALIAS_CONFLICT_POLICY=skip` keeps the upstream entry, `shadow` replaces the
 discovery entry with the alias target metadata, and `error` returns `409`.
 
+### Stream liveness and retries
+
+Two guards keep a streamed turn from stalling silently:
+
+- **Keepalives.** While the upstream is quiet, the proxy emits `: keepalive`
+  SSE comments every `SSE_KEEPALIVE_INTERVAL` seconds. Comments are ignored by
+  SSE clients but stop reverse proxies and load balancers from dropping an idle
+  connection during a long reasoning pause. Streamed responses also carry
+  `Cache-Control: no-cache` and `X-Accel-Buffering: no` so intermediaries relay
+  them token by token instead of buffering.
+- **Idle cutoff.** After `UPSTREAM_STREAM_IDLE_TIMEOUT` seconds of silence the
+  proxy flushes its buffers, sends a terminal chunk and `[DONE]`, and closes.
+
+Chat and generate requests are retried up to `UPSTREAM_MAX_RETRIES` times on
+transport errors and on upstream `429`, `500`, `502`, `503`, and `504`, with
+exponential backoff and jitter. Retries only happen before any response byte has
+reached the client, so a stream that has already started is never restarted and
+a partially seen answer is never replayed. Transparent passthrough routes are
+not retried, because their request body cannot be replayed.
+
+### Config file
+
+Aliases and routes are the two settings that grow into lists, so they can also be
+written as YAML instead of packed into one-line env strings:
+
+```yaml
+# proxy.yaml
+models:
+  deepseek-v4-flash:
+    aliases: [dsv4-flash, DeepSeek-V4-Flash]
+  gemma-4-e4b: [gemma]        # shorthand: a bare list of aliases
+
+routes:
+  vision:
+    upstream: http://192.168.10.99:8080
+    model: gemma-4-e4b
+  audio:
+    upstream: http://192.168.10.99:8080
+    model: gemma-4-e4b
+```
+
+```bash
+PROXY_CONFIG_FILE=/etc/opencode-proxy/proxy.yaml
+```
+
+The file only carries `models:` and `routes:`; deployment wiring stays in the
+environment. `MODEL_ALIASES` or `MODALITY_ROUTES` in the environment replace the
+matching section entirely. A configured file that is missing or malformed fails
+startup rather than silently running with partial routing.
+
+### Modality routing
+
+Text-only models reject image and audio parts, so a request carrying them can be
+sent to a second host instead. The proxy inspects chat requests for
+`image_url`/`image`/`input_image` parts (vision) and `input_audio`/`audio`/`audio_url`
+parts (audio), including Ollama `images` fields after translation, and forwards
+matching requests to the configured route:
+
+```bash
+MODALITY_ROUTES='{"vision":{"upstream":"http://192.168.10.99:8080","model":"gemma-4-e4b"}}'
+```
+
+A route may also carry its own `api_key` and `headers`. When a route has an
+`api_key`, it replaces the caller's `Authorization` so a credential for the
+primary upstream is never forwarded to the routed host.
+
+Details worth knowing:
+
+- If a request carries both modalities, the `audio` route wins.
+- A modality with no configured route logs a warning and goes to the primary
+  upstream unchanged, since the primary model may well support it.
+- Routed models are not added to `/v1/models`; they are reachable through
+  routing, not by asking for them by name.
+
 ## API Surface
 
 - `GET /healthz`: local proxy liveness check.
@@ -240,3 +330,4 @@ discovery entry with the alias target metadata, and `error` returns `409`.
 - `reasoning_content` and `reasoning` fields (DeepSeek R1 / o1-style streaming) are scanned for raw tool-call blocks by default, but ordinary reasoning text remains in reasoning fields.
 - Because scanned text is buffered with `STREAM_GUARD_CHARS`, reasoning deltas from the same upstream event may be emitted before that event's content delta. Before any `content` is emitted, held reasoning/reasoning_content tails are flushed so thinking cannot trail the answer in streaming clients (for example Pi).
 - The Docker image runs as a non-root user and includes a `/healthz` healthcheck.
+- SSE keepalives, the unbuffered streaming headers, and the pre-first-byte retry rule were adapted from [VisionBridge](https://github.com/thomasunise/visionbridge) (MIT).

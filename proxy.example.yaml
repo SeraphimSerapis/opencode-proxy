@@ -1,0 +1,28 @@
+# Optional config file for model aliases and modality routes.
+# Point PROXY_CONFIG_FILE at a copy of this file. Environment variables win over
+# anything set here; deployment wiring (upstream URL, timeouts, ports) stays in
+# the environment.
+
+models:
+  # canonical upstream model name -> the aliases clients may ask for
+  deepseek-v4-flash:
+    aliases:
+      - dsv4-flash
+      - DeepSeek-V4-Flash
+  # shorthand when a model only needs aliases
+  gemma-4-e4b: [gemma]
+
+routes:
+  # Requests carrying image parts go here instead of the primary upstream.
+  vision:
+    upstream: http://192.168.10.99:8080
+    model: gemma-4-e4b
+  # Requests carrying audio parts. If a request has both, audio wins.
+  audio:
+    upstream: http://192.168.10.99:8080
+    model: gemma-4-e4b
+    # Optional per-route credentials; api_key replaces the caller's Authorization
+    # so the primary upstream's key never reaches this host.
+    # api_key: ""
+    # headers:
+    #   X-Skip-Auth: "true"

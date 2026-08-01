@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import gzip
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import respx
+from conftest import collect_content
 
 from opencode_proxy.app import create_app
 from opencode_proxy.proxy import classify_upstream_error
 from opencode_proxy.settings import Settings
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 BAR = "\uff5c"
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "tool_calls"
@@ -59,6 +65,10 @@ async def _client(settings: Settings | None = None) -> httpx.AsyncClient:
     app = create_app(settings or Settings(upstream_url="http://upstream.test"))
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://proxy.test")
+
+
+def _no_retry_settings() -> Settings:
+    return Settings(upstream_url="http://upstream.test", upstream_max_retries=0)
 
 
 def _stream_payloads(response: httpx.Response) -> list[dict[str, Any]]:
@@ -941,7 +951,7 @@ async def test_upstream_connection_error_returns_typed_502() -> None:
         side_effect=httpx.ConnectError("connection refused to secret-host:4000")
     )
 
-    async with await _client() as client:
+    async with await _client(_no_retry_settings()) as client:
         response = await client.post(
             "/v1/chat/completions",
             json={"model": "qwen", "messages": [{"role": "user", "content": "x"}]},
@@ -1009,7 +1019,7 @@ async def test_streaming_upstream_4xx_returns_error_body() -> None:
         ),
     )
 
-    async with await _client() as client:
+    async with await _client(_no_retry_settings()) as client:
         response = await client.post(
             "/v1/chat/completions",
             json={
@@ -1068,7 +1078,7 @@ async def test_streaming_connection_error_returns_502() -> None:
         side_effect=httpx.ConnectError("connection refused")
     )
 
-    async with await _client() as client:
+    async with await _client(_no_retry_settings()) as client:
         response = await client.post(
             "/v1/chat/completions",
             json={
@@ -1904,4 +1914,282 @@ async def test_streaming_null_choice_extras_do_not_emit_empty_deltas() -> None:
     payloads = _stream_payloads(response)
     deltas = [payload["choices"][0]["delta"] for payload in payloads if payload["choices"]]
     assert "".join(delta.get("content", "") for delta in deltas) == "hello world"
-    assert all(delta for delta in deltas)
+    # The terminal finish chunk carries an empty delta by design; nothing before it should.
+    content_deltas = [
+        payload["choices"][0]["delta"]
+        for payload in payloads
+        if payload["choices"] and not payload["choices"][0].get("finish_reason")
+    ]
+    assert all(delta for delta in content_deltas)
+    assert _finish_reasons(response) == ["stop"]
+
+
+def _finish_reasons(response: httpx.Response) -> list[str]:
+    return [
+        choice["finish_reason"]
+        for payload in _stream_payloads(response)
+        for choice in payload.get("choices", [])
+        if choice.get("finish_reason")
+    ]
+
+
+@respx.mock
+async def test_streaming_without_upstream_finish_reason_still_closes_the_turn() -> None:
+    chunk = {
+        "id": "chatcmpl-nofinish",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-v4",
+        "choices": [{"index": 0, "delta": {"content": "done thinking"}, "finish_reason": None}],
+    }
+    sse = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=sse.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    assert _finish_reasons(response) == ["stop"]
+    assert [line for line in response.text.splitlines() if line][-1] == "data: [DONE]"
+
+
+@respx.mock
+async def test_streaming_truncated_upstream_stream_still_closes_the_turn() -> None:
+    chunk = {
+        "id": "chatcmpl-truncated",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-v4",
+        "choices": [{"index": 0, "delta": {"content": "partial answer"}, "finish_reason": None}],
+    }
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=f"data: {json.dumps(chunk)}\n\n".encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    assert _finish_reasons(response) == ["stop"]
+    assert response.text.count("data: [DONE]") == 1
+
+
+@respx.mock
+async def test_streaming_idle_upstream_terminates_instead_of_hanging() -> None:
+    chunk = {
+        "id": "chatcmpl-idle",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-v4",
+        "choices": [{"index": 0, "delta": {"content": "answer text"}, "finish_reason": "stop"}],
+    }
+
+    async def stalling_stream() -> AsyncIterator[bytes]:
+        yield f"data: {json.dumps(chunk)}\n\n".encode()
+        # Upstream stops sending without closing the connection: without an idle
+        # guard the proxy would hold the client stream open forever.
+        await asyncio.sleep(30)
+        yield b"data: [DONE]\n\n"
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=stalling_stream(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        upstream_stream_idle_timeout=0.2,
+    )
+    async with await _client(settings) as client:
+        response = await asyncio.wait_for(
+            client.post(
+                "/v1/chat/completions",
+                json={"model": "deepseek-v4", "stream": True, "messages": []},
+            ),
+            timeout=10,
+        )
+
+    assert _finish_reasons(response) == ["stop"]
+    assert response.text.count("data: [DONE]") == 1
+
+
+@respx.mock
+async def test_streaming_response_disables_intermediary_buffering() -> None:
+    chunk = {
+        "id": "chatcmpl-headers",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-v4",
+        "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": "stop"}],
+    }
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
+
+
+@respx.mock
+async def test_quiet_upstream_gets_keepalive_comments() -> None:
+    chunk = {
+        "id": "chatcmpl-keepalive",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-v4",
+        "choices": [{"index": 0, "delta": {"content": "thinking done"}, "finish_reason": "stop"}],
+    }
+
+    async def slow_stream() -> AsyncIterator[bytes]:
+        # A long reasoning pause before the first token.
+        await asyncio.sleep(0.35)
+        yield f"data: {json.dumps(chunk)}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=slow_stream(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        sse_keepalive_interval=0.1,
+        upstream_stream_idle_timeout=10,
+    )
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    assert ": keepalive" in response.text
+    # The pause must not cost any content: the frame still arrives intact.
+    assert collect_content(_stream_payloads(response)) == "thinking done"
+    assert response.text.count("data: [DONE]") == 1
+
+
+@respx.mock
+async def test_upstream_503_is_retried_before_the_stream_starts() -> None:
+    chunk = {
+        "id": "chatcmpl-retry",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-v4",
+        "choices": [{"index": 0, "delta": {"content": "second try"}, "finish_reason": "stop"}],
+    }
+    route = respx.post("http://upstream.test/v1/chat/completions").mock(
+        side_effect=[
+            httpx.Response(503, json={"error": "overloaded"}),
+            httpx.Response(
+                200,
+                content=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode(),
+                headers={"content-type": "text/event-stream"},
+            ),
+        ],
+    )
+
+    settings = Settings(upstream_url="http://upstream.test", upstream_max_retries=1)
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    assert response.status_code == 200
+    assert route.call_count == 2
+    assert collect_content(_stream_payloads(response)) == "second try"
+
+
+@respx.mock
+async def test_transport_error_is_retried_for_buffered_requests() -> None:
+    route = respx.post("http://upstream.test/v1/chat/completions").mock(
+        side_effect=[
+            httpx.ConnectError("connection refused"),
+            httpx.Response(200, json={"choices": [], "model": "deepseek-v4"}),
+        ],
+    )
+
+    settings = Settings(upstream_url="http://upstream.test", upstream_max_retries=1)
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "messages": []},
+        )
+
+    assert response.status_code == 200
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_failure_after_the_stream_started_is_not_retried() -> None:
+    chunk = {
+        "id": "chatcmpl-midfail",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-v4",
+        "choices": [{"index": 0, "delta": {"content": "partial"}, "finish_reason": None}],
+    }
+
+    async def failing_stream() -> AsyncIterator[bytes]:
+        yield f"data: {json.dumps(chunk)}\n\n".encode()
+        raise httpx.RemoteProtocolError("peer closed connection")
+
+    route = respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=failing_stream(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    settings = Settings(upstream_url="http://upstream.test", upstream_max_retries=2)
+    async with await _client(settings) as client:
+        with contextlib.suppress(httpx.RemoteProtocolError):
+            await client.post(
+                "/v1/chat/completions",
+                json={"model": "deepseek-v4", "stream": True, "messages": []},
+            )
+
+    # Re-sending would replay a prompt whose answer the client already saw part of.
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_retries_give_up_and_forward_the_upstream_error() -> None:
+    route = respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(503, json={"error": {"message": "still overloaded"}}),
+    )
+
+    settings = Settings(upstream_url="http://upstream.test", upstream_max_retries=1)
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "messages": []},
+        )
+
+    assert route.call_count == 2
+    assert response.status_code == 503
+    assert response.json()["error"]["message"] == "still overloaded"

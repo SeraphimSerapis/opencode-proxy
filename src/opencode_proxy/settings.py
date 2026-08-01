@@ -4,12 +4,37 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from functools import cached_property
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import AliasChoices, Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+
+from opencode_proxy.config_file import load_config_file
+from opencode_proxy.routing import ModalityRoute, parse_modality_routes
+
+if TYPE_CHECKING:
+    from pydantic.fields import FieldInfo
 
 LOG = logging.getLogger(__name__)
+
+CONFIG_FILE_ENV = "PROXY_CONFIG_FILE"
+
+
+class ConfigFileSettingsSource(PydanticBaseSettingsSource):
+    """Lowest-priority settings source backed by the optional YAML config file."""
+
+    def __init__(self, settings_cls: type[BaseSettings], path: str) -> None:
+        super().__init__(settings_cls)
+        self._path = path
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        return None, field_name, False
+
+    def __call__(self) -> dict[str, Any]:
+        return load_config_file(self._path)
 
 
 class Settings(BaseSettings):
@@ -42,6 +67,21 @@ class Settings(BaseSettings):
     upstream_write_timeout: float = Field(default=30.0, ge=0)
     upstream_pool_timeout: float = Field(default=30.0, ge=0)
     upstream_ready_timeout: float = Field(default=2.0, ge=0.1)
+    upstream_stream_idle_timeout: float = Field(
+        default=120.0,
+        ge=0,
+        validation_alias="UPSTREAM_STREAM_IDLE_TIMEOUT",
+    )
+    sse_keepalive_interval: float = Field(
+        default=10.0,
+        ge=0,
+        validation_alias="SSE_KEEPALIVE_INTERVAL",
+    )
+    upstream_max_retries: int = Field(
+        default=2,
+        ge=0,
+        validation_alias="UPSTREAM_MAX_RETRIES",
+    )
     max_concurrent_upstream: int = Field(
         default=8,
         ge=0,
@@ -64,6 +104,32 @@ class Settings(BaseSettings):
     )
     model_aliases: str = Field(default="", validation_alias="MODEL_ALIASES")
     alias_conflict_policy: str = Field(default="skip", validation_alias="ALIAS_CONFLICT_POLICY")
+    config_file: str = Field(default="", validation_alias="PROXY_CONFIG_FILE")
+    modality_routes: str = Field(default="", validation_alias="MODALITY_ROUTES")
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        # Init kwargs are normalized to the field's preferred alias, so accept both.
+        init_kwargs = getattr(init_settings, "init_kwargs", {})
+        path: object = None
+        if isinstance(init_kwargs, dict):
+            path = init_kwargs.get("config_file") or init_kwargs.get(CONFIG_FILE_ENV)
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            ConfigFileSettingsSource(
+                settings_cls, str(path or os.environ.get(CONFIG_FILE_ENV, ""))
+            ),
+            file_secret_settings,
+        )
 
     @field_validator("upstream_url")
     @classmethod
@@ -92,6 +158,20 @@ class Settings(BaseSettings):
         msg = "REQUEST_DROP_FIELDS must be a comma-separated string or list"
         raise ValueError(msg)
 
+    @field_validator("model_aliases", "modality_routes", mode="before")
+    @classmethod
+    def serialize_mapping_values(cls, value: object) -> object:
+        """Accept mappings from the YAML config file, not just env strings."""
+        if isinstance(value, dict):
+            return json.dumps(value)
+        return value
+
+    @field_validator("modality_routes")
+    @classmethod
+    def validate_modality_routes(cls, value: str) -> str:
+        parse_modality_routes(value, normalize_upstream=strip_upstream_v1_suffix)
+        return value
+
     @field_validator("alias_conflict_policy")
     @classmethod
     def validate_alias_conflict_policy(cls, value: str) -> str:
@@ -106,13 +186,7 @@ class Settings(BaseSettings):
 
     @property
     def upstream_safe_origin(self) -> str:
-        parsed = urlsplit(self.upstream_base_url)
-        if not parsed.scheme or not parsed.hostname:
-            return self.upstream_base_url
-        host = parsed.hostname
-        if parsed.port is not None:
-            host = f"{host}:{parsed.port}"
-        return f"{parsed.scheme}://{host}"
+        return safe_origin(self.upstream_base_url)
 
     @property
     def parsed_custom_headers(self) -> dict[str, str]:
@@ -130,6 +204,13 @@ class Settings(BaseSettings):
     def parsed_model_aliases(self) -> dict[str, str]:
         return parse_model_aliases(self.model_aliases)
 
+    @cached_property
+    def parsed_modality_routes(self) -> dict[str, ModalityRoute]:
+        return parse_modality_routes(
+            self.modality_routes,
+            normalize_upstream=strip_upstream_v1_suffix,
+        )
+
     @property
     def safe_config(self) -> dict[str, object]:
         return {
@@ -141,12 +222,19 @@ class Settings(BaseSettings):
                     "write": self.upstream_write_timeout,
                     "pool": self.upstream_pool_timeout,
                     "ready": self.upstream_ready_timeout,
+                    "stream_idle": (
+                        None
+                        if self.upstream_stream_idle_timeout == 0
+                        else self.upstream_stream_idle_timeout
+                    ),
                 },
                 "max_concurrent": self.max_concurrent_upstream or None,
+                "max_retries": self.upstream_max_retries,
             },
             "streaming": {
                 "guard_chars": self.stream_guard_chars,
                 "tool_argument_chunk_size": self.tool_argument_chunk_size,
+                "keepalive_interval": self.sse_keepalive_interval or None,
             },
             "tool_call_repair": {
                 "scan_fields": list(self.parsed_tool_call_scan_fields),
@@ -162,6 +250,15 @@ class Settings(BaseSettings):
                 "aliases": sorted(self.parsed_model_aliases),
                 "conflict_policy": self.alias_conflict_policy,
             },
+            "modality_routes": {
+                modality: {
+                    "origin": safe_origin(route.upstream),
+                    "model": route.model,
+                    "header_names": sorted(route.headers),
+                }
+                for modality, route in sorted(self.parsed_modality_routes.items())
+            },
+            "config_file": self.config_file or None,
             "custom_headers": {
                 "names": sorted(self.parsed_custom_headers),
             },
@@ -169,6 +266,17 @@ class Settings(BaseSettings):
                 "version": self.ollama_version,
             },
         }
+
+
+def safe_origin(base_url: str) -> str:
+    """Return ``scheme://host[:port]`` so logs and /healthz never leak credentials."""
+    parsed = urlsplit(base_url)
+    if not parsed.scheme or not parsed.hostname:
+        return base_url
+    host = parsed.hostname
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    return f"{parsed.scheme}://{host}"
 
 
 def strip_upstream_v1_suffix(url: str) -> str:
@@ -184,7 +292,7 @@ def strip_upstream_v1_suffix(url: str) -> str:
         (parsed.scheme, parsed.netloc, new_path, parsed.query, parsed.fragment)
     ).rstrip("/")
     LOG.warning(
-        "stripped trailing /v1 from UPSTREAM_URL; using %s "
+        "stripped trailing /v1 from an upstream URL; using %s "
         "(OpenAI paths are appended by the proxy)",
         normalized or cleaned,
     )
