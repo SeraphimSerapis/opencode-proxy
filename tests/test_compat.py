@@ -56,6 +56,45 @@ def test_parse_deepseek_ascii_dsml_invoke_parameters() -> None:
     }
 
 
+def test_parse_degraded_dsml_close_tag_and_spaced_equals() -> None:
+    """Degraded DSML still parses when the close tag drops the backslashes and
+    spaces appear around ``=`` (both realistic tokenizer artefacts)."""
+    content = f"""
+    <DSML>tool_calls>
+    <{BAR}DSML{BAR}invoke name = "bash">
+      <{BAR}DSML{BAR}parameter name = "cmd" string = "true">pwd</{BAR}DSML{BAR}parameter>
+      <{BAR}DSML{BAR}parameter name = "count" string = "false">5</{BAR}DSML{BAR}parameter>
+    </{BAR}DSML{BAR}invoke>
+    </DSML>tool_calls>
+    """
+
+    tool_calls = parse_raw_tool_calls(content)
+    extracted, remainder, changed = extract_raw_tool_call_segments(content)
+
+    assert has_complete_raw_tool_block(content)
+    assert changed
+    assert not remainder.strip()
+    assert len(extracted) == 1
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "bash"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {
+        "cmd": "pwd",
+        "count": 5,
+    }
+
+
+def test_malformed_joined_dsml_marker_is_not_normalized() -> None:
+    content = f"""
+    <DSMLtool_calls>
+    <{BAR}DSML{BAR}invoke name="bash"></{BAR}DSML{BAR}invoke>
+    </DSMLtool_calls>
+    """
+
+    assert find_raw_tool_start(content) is None
+    assert not has_complete_raw_tool_block(content)
+    assert not parse_raw_tool_calls(content)
+
+
 def test_parse_bare_tool_calls_invoke_parameters() -> None:
     content = """
     <tool_calls>

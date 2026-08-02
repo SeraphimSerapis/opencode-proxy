@@ -36,7 +36,12 @@ Detection markers live in `RAW_TOOL_START_MARKERS`; matched pairs in
 `normalize_raw_tool_markup` folds every variant into the canonical DSML shape
 before parsing, so the parser has one grammar to handle rather than five. The
 ASCII and spaced variants exist because the fullwidth bar does not always
-survive tokenisation intact.
+survive tokenisation intact. Detection and normalisation share the same degraded
+grammar, including a close tag that drops the backslashes
+(`</DSML>tool_calls>`) and `name=`/`string=` with whitespace around the equals
+sign (`name = "bash"`). DeepSeek-V4's reference encoding
+(`encoding/encoding_dsv4.py`) uses exactly the U+FF5C delimiter and `string="true|false"`
+parameter attribute, both already handled.
 
 Fixtures for each format: [`/home/tim/projects/opencode-proxy/tests/fixtures/tool_calls`](/home/tim/projects/opencode-proxy/tests/fixtures/tool_calls).
 Add a fixture and a test before changing parser behaviour.

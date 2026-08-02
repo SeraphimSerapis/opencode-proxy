@@ -1,5 +1,10 @@
 # Documentation Update Log
 
+## 2026-08-02
+
+* **Fix**: An upstream `httpx.TransportError` or EOF without `[DONE]` now ends as `finish_reason: "length"` plus `[DONE]`, including before the first upstream choice. This closes agent turns without presenting partial output as a successful `stop`; local proxy failures still propagate. The observed Pi incident remains attributed to upstream silence, bounded by `UPSTREAM_STREAM_IDLE_TIMEOUT`. See [always terminate a streamed turn](decisions/stream-termination.md).
+* **Fix**: Hardened DSML repair against two more tokeniser degradations: a close tag that drops the U+FF5C delimiters (`</DSML>tool_calls>`) and whitespace around `=` in `name=`/`string=` attributes. Both previously passed the whole block through as raw text. Verified against DeepSeek-V4-Flash-0731's `encoding/encoding_dsv4.py` reference; the canonical delimiter and `string="true|false"` parameter attribute were already handled. See [tool-call repair](architecture/tool-call-repair.md).
+
 ## 2026-08-01
 
 * **Documentation**: Added this OKF bundle — architecture (request pipeline, tool-call repair, streaming contract), reference (configuration, API surface), decisions (modality routing, stream termination, retry policy), and runbooks (deploy, diagnose a stalled stream). Recorded the deployed topology, which is the inverse of what the README implies: clients reach LiteLLM, which calls the proxy, whose upstream is vLLM at `192.168.10.221:8080`.

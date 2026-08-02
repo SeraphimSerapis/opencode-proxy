@@ -52,6 +52,15 @@ the terminal chunk, sends `[DONE]`, and closes. The client gets a complete,
 well-formed turn containing whatever text arrived, rather than a truncated body
 or an error.
 
+The observed case was upstream silence (defect 2), not a proven connection reset.
+For the separate transport-failure case, an `httpx.TransportError` after SSE
+headers have been sent now emits a terminal `finish_reason: "length"` and
+`[DONE]`. The same fallback applies to EOF without an upstream `[DONE]`.
+That tells clients the partial turn was truncated rather than falsely reporting a
+successful `stop`; local proxy bugs still propagate normally. If the failure or
+EOF occurs before any upstream choice, the proxy synthesises choice `0` with the
+same `length` terminal so agent clients can close the turn.
+
 ## Why synthesise rather than pass through
 
 A transparent proxy would forward whatever the upstream sent, including nothing.

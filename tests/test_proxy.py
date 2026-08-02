@@ -772,6 +772,101 @@ def _reasoning_chunk(field: str, text: str) -> dict[str, Any]:
     }
 
 
+class _BoomStream(httpx.AsyncByteStream):
+    """Yield one frame then raise, mimicking an upstream that dies mid-stream."""
+
+    def __init__(self, first: bytes) -> None:
+        self.first = first
+        self.sent = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        if not self.sent:
+            self.sent = True
+            yield self.first
+            raise httpx.ReadError("connection reset by peer")
+        return
+
+
+@respx.mock
+async def test_streaming_upstream_error_ends_as_truncated() -> None:
+    """A transport failure ends the partial SSE turn without claiming success."""
+
+    first = (
+        "data: "
+        + json.dumps(
+            {
+                "id": "chatcmpl-boom",
+                "object": "chat.completion.chunk",
+                "model": "deepseek-v4",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"reasoning_content": "thinking..."},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        )
+        + "\n\n"
+    ).encode()
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            stream=_BoomStream(first),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "deepseek-v4",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.text.strip().endswith("data: [DONE]")
+    payloads = _stream_payloads(response)
+    finished = payloads[-1]
+    assert finished["choices"][0]["finish_reason"] == "length"
+    assert "thinking..." in "".join(
+        p["choices"][0]["delta"].get("reasoning_content", "")
+        for p in payloads
+        if isinstance(p, dict) and p["choices"] and isinstance(p["choices"][0].get("delta"), dict)
+    )
+
+
+@respx.mock
+async def test_streaming_upstream_error_before_first_choice_ends_as_truncated() -> None:
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            stream=_BoomStream(b""),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "deepseek-v4",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.text.strip().endswith("data: [DONE]")
+    payloads = _stream_payloads(response)
+    assert len(payloads) == 1
+    assert payloads[0]["choices"][0]["finish_reason"] == "length"
+
+
 @respx.mock
 async def test_streaming_reasoning_tool_call_survives_interleaved_content() -> None:
     """Pre-flushing reasoning must not break a raw tool block still being parsed."""
@@ -1982,7 +2077,27 @@ async def test_streaming_truncated_upstream_stream_still_closes_the_turn() -> No
             json={"model": "deepseek-v4", "stream": True, "messages": []},
         )
 
-    assert _finish_reasons(response) == ["stop"]
+    assert _finish_reasons(response) == ["length"]
+    assert response.text.count("data: [DONE]") == 1
+
+
+@respx.mock
+async def test_streaming_empty_upstream_stream_ends_as_truncated() -> None:
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=b"",
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    assert _finish_reasons(response) == ["length"]
     assert response.text.count("data: [DONE]") == 1
 
 

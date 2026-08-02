@@ -421,6 +421,9 @@ async def _rewrite_sse_stream(
     model = "unknown"
     choice_states: dict[int, StreamChoiceState] = {}
 
+    # Only an explicit upstream [DONE] proves a turn completed normally.
+    fallback_finish_reason = "length"
+
     try:
         async for frame in _iter_sse_frames_with_idle_guard(
             upstream_response,
@@ -479,11 +482,22 @@ async def _rewrite_sse_stream(
     except asyncio.CancelledError:
         LOG.info("SSE rewrite cancelled")
         raise
+    except httpx.TransportError as exc:
+        _, error_type = classify_upstream_error(exc)
+        LOG.warning(
+            "upstream SSE stream interrupted type=%s chunk_id=%s model=%s",
+            error_type,
+            chunk_id,
+            model,
+        )
+        # The response is already 200/SSE, so it cannot become an HTTP error.
+        # The default ``length`` finish truthfully marks the partial turn truncated.
 
     async for done_payload in _finish_sse_stream(
         choice_states,
         chunk_id=chunk_id,
         model=model,
+        fallback_finish_reason=fallback_finish_reason,
     ):
         yield done_payload
 
@@ -589,8 +603,13 @@ async def _finish_sse_stream(
     *,
     chunk_id: str,
     model: str,
+    fallback_finish_reason: str | None = None,
 ) -> AsyncIterator[bytes]:
-    for choice_index, state in sorted(choice_states.items()):
+    state_items = sorted(choice_states.items())
+    if fallback_finish_reason is not None and not state_items:
+        state_items = [(0, StreamChoiceState())]
+
+    for choice_index, state in state_items:
         for payload in _flush_choice_buffers(
             state,
             chunk_id=chunk_id,
@@ -606,7 +625,7 @@ async def _finish_sse_stream(
                 make_finish_chunk(
                     chunk_id=chunk_id,
                     model=model,
-                    finish_reason=_finish_reason_for_state(None, state),
+                    finish_reason=_finish_reason_for_state(fallback_finish_reason, state),
                     choice_index=choice_index,
                 ),
             )

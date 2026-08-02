@@ -21,6 +21,9 @@ DSML_INVOKE_CLOSE = f"</{FULLWIDTH_BAR}DSML{FULLWIDTH_BAR}invoke>"
 DSML_PARAMETER_OPEN = f"<{FULLWIDTH_BAR}DSML{FULLWIDTH_BAR}parameter"
 DSML_PARAMETER_CLOSE = f"</{FULLWIDTH_BAR}DSML{FULLWIDTH_BAR}parameter>"
 
+DSML_DEGRADED_OPEN = r"<DSML(?:>\s*|:\s*|\s+)tool_calls\s*>"
+DSML_DEGRADED_CLOSE = r"</DSML(?:>\s*|:\s*|\s+)tool_calls\s*>"
+
 RAW_TOOL_START_MARKERS = (
     DSML_OPEN,
     "<|DSML|tool_calls>",
@@ -40,12 +43,8 @@ RAW_TOOL_BLOCK_PATTERNS = (
         re.compile(r"</\|DSML\|tool_calls\s*>", re.DOTALL),
     ),
     (
-        re.compile(r"<DSML>\s*tool_calls\s*>", re.DOTALL),
-        re.compile(r"</DSML[:\s]+tool_calls\s*>", re.DOTALL),
-    ),
-    (
-        re.compile(r"<DSML[:\s]+tool_calls\s*>", re.DOTALL),
-        re.compile(r"</DSML[:\s]+tool_calls\s*>", re.DOTALL),
+        re.compile(DSML_DEGRADED_OPEN, re.DOTALL),
+        re.compile(DSML_DEGRADED_CLOSE, re.DOTALL),
     ),
     (
         re.compile(r"<tool_calls\s*>", re.DOTALL),
@@ -115,8 +114,8 @@ def normalize_raw_tool_markup(text: str) -> str:
     normalized = normalized.replace("<|DSML|parameter", DSML_PARAMETER_OPEN)
     normalized = normalized.replace("</|DSML|parameter>", DSML_PARAMETER_CLOSE)
 
-    normalized = normalized.replace("<DSML>tool_calls>", DSML_OPEN, 1)
-    normalized = re.sub(r"</DSML[:\s]+tool_calls\s*>", DSML_CLOSE, normalized)
+    normalized = re.sub(DSML_DEGRADED_OPEN, DSML_OPEN, normalized, count=1)
+    normalized = re.sub(DSML_DEGRADED_CLOSE, DSML_CLOSE, normalized)
     normalized = re.sub(r"<DSML[:\s]+invoke\s+", f"{DSML_INVOKE_OPEN} ", normalized)
     normalized = re.sub(r"</DSML[:\s]+invoke\s*>", DSML_INVOKE_CLOSE, normalized)
     normalized = re.sub(r"<DSML[:\s]+parameter\s+", f"{DSML_PARAMETER_OPEN} ", normalized)
@@ -553,7 +552,8 @@ def _parse_laguna_tool_call_blocks(block: str) -> list[ToolCall]:
 def _parse_dsml_invoke_blocks(block: str) -> list[ToolCall]:
     results: list[ToolCall] = []
     invoke_pattern = re.compile(
-        re.escape(DSML_INVOKE_OPEN) + r"""\s+name=(?P<quote>["'])(?P<name>.*?)(?P=quote)\s*>""",
+        re.escape(DSML_INVOKE_OPEN)
+        + r"""\s+name\s*=\s*(?P<quote>["'])(?P<name>.*?)(?P=quote)\s*>""",
         re.DOTALL,
     )
     for invoke in invoke_pattern.finditer(block):
@@ -565,8 +565,9 @@ def _parse_dsml_invoke_blocks(block: str) -> list[ToolCall]:
         params: JsonObject = {}
         for param in re.finditer(
             re.escape(DSML_PARAMETER_OPEN)
-            + r"""\s+name=(?P<quote>["'])(?P<name>.*?)(?P=quote)"""
-            + r"""(?:\s+string=(?P<str_quote>["'])(?P<string>true|false)(?P=str_quote))?[^>]*>"""
+            + r"""\s+name\s*=\s*(?P<quote>["'])(?P<name>.*?)(?P=quote)"""
+            + r"""(?:\s+string\s*=\s*(?P<str_quote>["'])(?P<string>true|false)"""
+            + r"""(?P=str_quote))?[^>]*>"""
             + r"(?P<value>.*?)"
             + re.escape(DSML_PARAMETER_CLOSE),
             remaining[:end],
