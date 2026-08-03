@@ -7,8 +7,8 @@ tags: [configuration, environment, yaml, aliases, routing]
 status: active
 generated:
   by: claude-code/opus-5
-  at: 2026-08-01T16:20:00+02:00
-verified: 2026-08-01
+  at: 2026-08-03T09:40:00+02:00
+verified: 2026-08-03
 ---
 
 # Configuration
@@ -28,8 +28,8 @@ Highest wins:
 4. YAML config file (`PROXY_CONFIG_FILE`)
 
 The YAML file is the lowest-priority source, so an environment variable always
-overrides the same section in the file. Only `model_aliases` and
-`modality_routes` can come from the file; deployment wiring stays in the
+overrides the same section in the file. Model aliases, model compatibility, and
+modality routes can come from the file; deployment wiring stays in the
 environment.
 
 ## Upstream
@@ -60,6 +60,10 @@ can legitimately take minutes to produce a first token. Silence is bounded by
 | `SSE_KEEPALIVE_INTERVAL` | `10` | Seconds of silence between `: keepalive` comments. `0` disables. |
 | `STREAM_GUARD_CHARS` | `192` | Text held back while watching for a split tool-call marker. |
 | `TOOL_ARGUMENT_CHUNK_SIZE` | `64` | Size of streamed function-argument deltas. |
+| `EMPTY_TURN_NOTICE` | a short explanatory message | Content emitted before the terminal chunk when a turn the upstream closed itself ends with no content and no tool calls. Set empty to disable. See [turn usability](/decisions/turn-usability.md). |
+
+`/healthz/config` reports whether `EMPTY_TURN_NOTICE` is enabled without
+exposing the configured message text.
 
 ## Tool-call repair
 
@@ -67,12 +71,20 @@ can legitimately take minutes to produce a first token. Silence is bounded by
 | --- | --- | --- |
 | `TOOL_CALL_SCAN_FIELDS` | `content,reasoning,reasoning_content` | Fields scanned for raw markup. `all` selects all three. |
 | `MAX_RAW_TOOL_BLOCK_CHARS` | `131072` | Larger blocks pass through as text. |
-| `MAX_TOOL_CALLS` | `32` | More calls in one block pass through as text. |
-| `MAX_TOOL_ARGUMENT_CHARS` | `262144` | Larger arguments pass through as text. |
+| `MAX_TOOL_CALLS` | `32` | More raw calls in one block pass through as text; standard streamed repair tracks at most this many indexes. |
+| `MAX_TOOL_ARGUMENT_CHARS` | `262144` | Larger raw arguments pass through as text; standard streamed tool-call repair stops accumulating at this bound. |
 | `SANITIZE_TOOLS` | `true` | Drop non-`function` tools from requests. |
 | `REQUEST_DROP_FIELDS` | unset | Comma-separated request fields removed before forwarding. |
 
 Every limit degrades to passthrough-as-text. None of them drop content.
+
+The `deepseek_v4` compatibility profile is configured per canonical upstream
+model in YAML. `recover_orphan_invokes: true` repairs the narrow vLLM #49117
+failure only when the request declares function tools, `tool_choice` is not
+`none`, the marker is canonical fullwidth-bar V4 DSML in `content`, and the
+completed name exactly matches a declared tool. Rejected blocks remain
+byte-for-byte text. This fallback is temporary; see the
+[DeepSeek V4 runbook](../runbooks/deepseek-v4.md).
 
 ## Models and routing
 
@@ -101,6 +113,8 @@ one-line environment strings become unreadable. `PROXY_CONFIG_FILE` points at:
 models:
   deepseek-v4-flash:
     aliases: [dsv4-flash, DeepSeek-V4-Flash]
+    compatibility: deepseek_v4
+    recover_orphan_invokes: true
   gemma-4-e4b: [gemma]          # bare list is shorthand for aliases
 
 routes:

@@ -20,6 +20,7 @@ verified: 2026-08-01
 | `GET /healthz` | Liveness only. Never touches the upstream. Used by the container healthcheck. |
 | `GET /readyz` | Probes upstream `GET /v1/models`. Any non-5xx counts as ready, so an auth rejection still means "reachable". Connection failure or upstream 5xx returns `503`. |
 | `GET /healthz/config` | Effective configuration with credentials and header values omitted — header and alias *names* only. |
+| `GET /metrics` | Prometheus counters for proxy-owned repair and transport behavior. vLLM must be scraped separately for model-serving metrics. |
 
 `/readyz` treating `401` as ready is deliberate: readiness asks whether the
 backend is up, not whether this proxy holds a valid key.

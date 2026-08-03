@@ -6,6 +6,7 @@ import html
 import json
 import re
 import uuid
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 
 if TYPE_CHECKING:
@@ -20,12 +21,13 @@ DSML_INVOKE_OPEN = f"<{FULLWIDTH_BAR}DSML{FULLWIDTH_BAR}invoke"
 DSML_INVOKE_CLOSE = f"</{FULLWIDTH_BAR}DSML{FULLWIDTH_BAR}invoke>"
 DSML_PARAMETER_OPEN = f"<{FULLWIDTH_BAR}DSML{FULLWIDTH_BAR}parameter"
 DSML_PARAMETER_CLOSE = f"</{FULLWIDTH_BAR}DSML{FULLWIDTH_BAR}parameter>"
+ORPHAN_DSML_INVOKE_START = DSML_INVOKE_OPEN
 
 DSML_DEGRADED_OPEN = r"<DSML(?:>\s*|:\s*|\s+)tool_calls\s*>"
 DSML_DEGRADED_CLOSE = r"</DSML(?:>\s*|:\s*|\s+)tool_calls\s*>"
 
-# Every degraded opener the block patterns accept must also appear here, or the
-# streaming guard will not hold back a marker that arrives split across tokens.
+# Common complete openers recognized by ``has_raw_tool_prefix``. Complete block
+# detection is governed by ``RAW_TOOL_BLOCK_PATTERNS`` below.
 RAW_TOOL_START_MARKERS = (
     DSML_OPEN,
     "<|DSML|tool_calls>",
@@ -107,12 +109,23 @@ class ChatCompletionChunk(TypedDict):
     created: NotRequired[int]
 
 
+@dataclass
+class RepairStats:
+    raw_repairs: list[tuple[str, str]] = field(default_factory=list)
+    orphan_accepted: int = 0
+    orphan_rejected: dict[str, int] = field(default_factory=dict)
+    synthesized_ids: int = 0
+
+    def reject_orphan(self, reason: str) -> None:
+        self.orphan_rejected[reason] = self.orphan_rejected.get(reason, 0) + 1
+
+
 def normalize_raw_tool_markup(text: str) -> str:
     """Convert known raw tool-call variants into one canonical DSML-ish shape."""
 
     normalized = text
-    normalized = normalized.replace("<|DSML|tool_calls>", DSML_OPEN)
-    normalized = normalized.replace("</|DSML|tool_calls>", DSML_CLOSE)
+    normalized = re.sub(r"<\|DSML\|tool_calls\s*>", DSML_OPEN, normalized)
+    normalized = re.sub(r"</\|DSML\|tool_calls\s*>", DSML_CLOSE, normalized)
     normalized = normalized.replace("<|DSML|invoke", DSML_INVOKE_OPEN)
     normalized = normalized.replace("</|DSML|invoke>", DSML_INVOKE_CLOSE)
     normalized = normalized.replace("<|DSML|parameter", DSML_PARAMETER_OPEN)
@@ -125,9 +138,9 @@ def normalize_raw_tool_markup(text: str) -> str:
     normalized = re.sub(r"<DSML[:\s]+parameter\s+", f"{DSML_PARAMETER_OPEN} ", normalized)
     normalized = re.sub(r"</DSML[:\s]+parameter\s*>", DSML_PARAMETER_CLOSE, normalized)
 
-    if "<tool_calls>" in normalized and "</tool_calls>" in normalized:
-        normalized = normalized.replace("<tool_calls>", DSML_OPEN, 1)
-        normalized = normalized.replace("</tool_calls>", DSML_CLOSE, 1)
+    if re.search(r"<tool_calls\s*>", normalized) and re.search(r"</tool_calls\s*>", normalized):
+        normalized = re.sub(r"<tool_calls\s*>", DSML_OPEN, normalized, count=1)
+        normalized = re.sub(r"</tool_calls\s*>", DSML_CLOSE, normalized, count=1)
         normalized = re.sub(r"<invoke\s+", f"{DSML_INVOKE_OPEN} ", normalized)
         normalized = re.sub(r"</invoke\s*>", DSML_INVOKE_CLOSE, normalized)
         normalized = re.sub(r"<parameter\s+", f"{DSML_PARAMETER_OPEN} ", normalized)
@@ -223,6 +236,90 @@ def extract_raw_tool_call_segments(
     return tool_calls, "".join(text_parts), changed
 
 
+def find_orphan_dsml_invoke_start(text: str) -> int | None:
+    """Find a canonical V4 invoke opener before any non-whitespace text."""
+    cursor = 0
+    while True:
+        start = text.find(ORPHAN_DSML_INVOKE_START, cursor)
+        if start < 0:
+            return None
+        if not text[:start].strip():
+            return start
+        cursor = start + 1
+
+
+def find_complete_orphan_dsml_invoke_span(text: str) -> tuple[int, int] | None:
+    start = find_orphan_dsml_invoke_start(text)
+    while start is not None:
+        end = text.find(DSML_INVOKE_CLOSE, start + len(ORPHAN_DSML_INVOKE_START))
+        if end >= 0:
+            return start, end + len(DSML_INVOKE_CLOSE)
+        next_offset = start + len(ORPHAN_DSML_INVOKE_START)
+        nested = find_orphan_dsml_invoke_start(text[next_offset:])
+        start = None if nested is None else next_offset + nested
+    return None
+
+
+def extract_orphan_dsml_invokes(
+    text: str,
+    *,
+    declared_tool_names: frozenset[str],
+    max_raw_tool_block_chars: int | None = None,
+    max_tool_calls: int | None = None,
+    max_tool_argument_chars: int | None = None,
+    stats: RepairStats | None = None,
+) -> tuple[list[ToolCall], str, bool]:
+    """Recover canonical V4 invokes missing only their outer tool-call wrapper.
+
+    Rejected candidates remain byte-for-byte identical in ``remaining_text``.
+    ASCII/degraded DSML is deliberately excluded because this fallback targets
+    one concrete DeepSeek V4/vLLM regression, not every DSML-looking dialect.
+    """
+    tool_calls: list[ToolCall] = []
+    text_parts: list[str] = []
+    cursor = 0
+    changed = False
+
+    while cursor < len(text):
+        span = find_complete_orphan_dsml_invoke_span(text[cursor:])
+        if span is None:
+            text_parts.append(text[cursor:])
+            break
+        start = cursor + span[0]
+        end = cursor + span[1]
+        block = text[start:end]
+        text_parts.append(text[cursor:start])
+
+        rejection: str | None = None
+        parsed = _parse_single_orphan_dsml_invoke(block)
+        if max_raw_tool_block_chars is not None and len(block) > max_raw_tool_block_chars:
+            rejection = "oversized_block"
+        elif parsed is None:
+            rejection = "malformed"
+        elif parsed["function"]["name"] not in declared_tool_names:
+            rejection = "undeclared_tool"
+        elif not tool_calls_within_limits(
+            [*tool_calls, parsed],
+            max_tool_calls=max_tool_calls,
+            max_tool_argument_chars=max_tool_argument_chars,
+        ):
+            rejection = "limits"
+
+        if rejection is not None:
+            text_parts.append(block)
+            if stats is not None:
+                stats.reject_orphan(rejection)
+        else:
+            assert parsed is not None
+            tool_calls.append(parsed)
+            changed = True
+            if stats is not None:
+                stats.orphan_accepted += 1
+        cursor = end
+
+    return tool_calls, "".join(text_parts), changed
+
+
 def normalize_argument_value(value: object) -> str:
     if value is None:
         return "{}"
@@ -273,7 +370,11 @@ def parse_dsml_tool_calls(text: str) -> list[ToolCall]:
 
 def parse_qwen_xml_tool_calls(text: str) -> list[ToolCall]:
     results: list[ToolCall] = []
-    for match in re.finditer(r"<tool_call>\s*(?P<body>.*?)\s*</tool_call>", text, re.DOTALL):
+    for match in re.finditer(
+        r"<tool_call\b[^>]*>\s*(?P<body>.*?)\s*</tool_call\s*>",
+        text,
+        re.DOTALL,
+    ):
         block = match.group("body")
         name_matches = _parse_name_parameter_blocks(block)
         if name_matches:
@@ -315,6 +416,9 @@ def convert_chat_completion_response(
     max_raw_tool_block_chars: int | None = None,
     max_tool_calls: int | None = None,
     max_tool_argument_chars: int | None = None,
+    recover_orphan_invokes: bool = False,
+    declared_tool_names: frozenset[str] = frozenset(),
+    stats: RepairStats | None = None,
 ) -> tuple[JsonObject, bool]:
     """Convert non-streaming OpenAI-compatible chat completion JSON in place."""
     choices = body.get("choices")
@@ -330,6 +434,9 @@ def convert_chat_completion_response(
             max_raw_tool_block_chars=max_raw_tool_block_chars,
             max_tool_calls=max_tool_calls,
             max_tool_argument_chars=max_tool_argument_chars,
+            recover_orphan_invokes=recover_orphan_invokes,
+            declared_tool_names=declared_tool_names,
+            stats=stats,
         ):
             changed = True
 
@@ -343,17 +450,23 @@ def _convert_chat_completion_choice(
     max_raw_tool_block_chars: int | None,
     max_tool_calls: int | None,
     max_tool_argument_chars: int | None,
+    recover_orphan_invokes: bool,
+    declared_tool_names: frozenset[str],
+    stats: RepairStats | None,
 ) -> bool:
     message = choice.get("message")
     if not isinstance(message, dict):
         return False
 
     existing_tool_calls = message.get("tool_calls")
-    if existing_tool_calls:
-        return False
+    if isinstance(existing_tool_calls, list) and existing_tool_calls:
+        synthesized = normalize_native_tool_call_ids(existing_tool_calls)
+        if stats is not None:
+            stats.synthesized_ids += synthesized
+        return synthesized > 0
 
-    for field in tool_call_scan_fields:
-        value = message.get(field)
+    for field_name in tool_call_scan_fields:
+        value = message.get(field_name)
         if not isinstance(value, str) or not has_complete_raw_tool_block(value):
             continue
 
@@ -371,13 +484,69 @@ def _convert_chat_completion_choice(
             continue
 
         message["tool_calls"] = tool_calls
-        message[field] = remaining_text if remaining_text.strip() else None
+        message[field_name] = remaining_text if remaining_text.strip() else None
         if "content" not in message:
             message["content"] = None
         choice["finish_reason"] = "tool_calls"
+        if stats is not None:
+            stats.raw_repairs.append((raw_tool_format(value), field_name))
         return True
 
+    content = message.get("content")
+    if (
+        recover_orphan_invokes
+        and declared_tool_names
+        and isinstance(content, str)
+        and find_orphan_dsml_invoke_start(content) is not None
+    ):
+        tool_calls, remaining_text, changed = extract_orphan_dsml_invokes(
+            content,
+            declared_tool_names=declared_tool_names,
+            max_raw_tool_block_chars=max_raw_tool_block_chars,
+            max_tool_calls=max_tool_calls,
+            max_tool_argument_chars=max_tool_argument_chars,
+            stats=stats,
+        )
+        if changed and tool_calls:
+            message["tool_calls"] = tool_calls
+            message["content"] = remaining_text if remaining_text.strip() else None
+            choice["finish_reason"] = "tool_calls"
+            if stats is not None:
+                stats.raw_repairs.append(("deepseek_v4_orphan", "content"))
+            return True
+
     return False
+
+
+def normalize_native_tool_call_ids(tool_calls: list[object]) -> int:
+    """Add IDs only to otherwise valid OpenAI function tool calls."""
+    synthesized = 0
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            continue
+        existing_id = tool_call.get("id")
+        if isinstance(existing_id, str) and existing_id:
+            continue
+        function = tool_call.get("function")
+        if (
+            tool_call.get("type", "function") != "function"
+            or not isinstance(function, dict)
+            or not isinstance(function.get("name"), str)
+            or not function["name"]
+            or not isinstance(function.get("arguments"), str)
+        ):
+            continue
+        tool_call["id"] = f"call_{uuid.uuid4().hex[:24]}"
+        synthesized += 1
+    return synthesized
+
+
+def raw_tool_format(text: str) -> str:
+    if DSML_OPEN in text or "<|DSML|tool_calls" in text or "<DSML" in text:
+        return "dsml"
+    if "<tool_call" in text:
+        return "qwen_xml"
+    return "unknown"
 
 
 def tool_calls_within_limits(
@@ -415,7 +584,7 @@ def complete_truncated_json(text: str) -> str | None:
 
     try:
         json.loads(text)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         pass
     else:
         return ""
@@ -698,6 +867,57 @@ def _parse_dsml_invoke_blocks(block: str) -> list[ToolCall]:
             params[html.unescape(param.group("name")).strip()] = parsed_value
         results.append(make_tool_call(invoke.group("name"), params))
     return results
+
+
+def _parse_single_orphan_dsml_invoke(block: str) -> ToolCall | None:
+    invoke_pattern = re.compile(
+        r"\A"
+        + re.escape(DSML_INVOKE_OPEN)
+        + r"""\s+name\s*=\s*(?P<quote>["'])(?P<name>.*?)(?P=quote)\s*>"""
+        + r"(?P<body>.*)"
+        + re.escape(DSML_INVOKE_CLOSE)
+        + r"\Z",
+        re.DOTALL,
+    )
+    invoke = invoke_pattern.fullmatch(block)
+    if invoke is None:
+        return None
+
+    name = html.unescape(invoke.group("name")).strip()
+    if not name:
+        return None
+
+    parameter_pattern = re.compile(
+        re.escape(DSML_PARAMETER_OPEN)
+        + r"""\s+name\s*=\s*(?P<quote>["'])(?P<name>.*?)(?P=quote)"""
+        + r"""(?:\s+string\s*=\s*(?P<str_quote>["'])(?P<string>true|false)"""
+        + r"""(?P=str_quote))?[^>]*>"""
+        + r"(?P<value>.*?)"
+        + re.escape(DSML_PARAMETER_CLOSE),
+        re.DOTALL,
+    )
+    params: JsonObject = {}
+    cursor = 0
+    body = invoke.group("body")
+    for parameter in parameter_pattern.finditer(body):
+        if body[cursor : parameter.start()].strip():
+            return None
+        parameter_name = html.unescape(parameter.group("name")).strip()
+        if not parameter_name or parameter_name in params:
+            return None
+        value = html.unescape(parameter.group("value")).strip()
+        if parameter.group("string") == "false":
+            try:
+                parsed_value: object = json.loads(value)
+            except json.JSONDecodeError:
+                return None
+        else:
+            parsed_value = value
+        params[parameter_name] = parsed_value
+        cursor = parameter.end()
+    if body[cursor:].strip():
+        return None
+    return make_tool_call(name, params)
 
 
 def _parse_json_tool_call_block(block: str) -> list[ToolCall]:

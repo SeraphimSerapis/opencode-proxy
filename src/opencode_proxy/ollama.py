@@ -50,6 +50,7 @@ from opencode_proxy.proxy import (
     _forward_response_headers,
     _proxy_error,
     _release_upstream_slot,
+    _request_metrics,
     _set_header,
     _upstream_client,
     _upstream_url,
@@ -320,6 +321,7 @@ async def _send_streaming(
             ),
             settings=settings,
             stream=True,
+            metrics=_request_metrics(request),
         )
     except httpx.HTTPError as exc:
         return _proxy_error(exc)
@@ -383,6 +385,7 @@ async def _request_upstream_raw(
             ),
             settings=settings,
             stream=False,
+            metrics=_request_metrics(request),
         )
     except httpx.HTTPError as exc:
         return _proxy_error(exc)

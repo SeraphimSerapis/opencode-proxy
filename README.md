@@ -23,14 +23,18 @@ Detailed docs live in [`docs/`](docs/index.md) as an [OKF](https://github.com/Go
 ## Supported Repairs
 
 - DeepSeek DSML `<｜DSML｜tool_calls>` blocks with `<name>` / `<parameters>`.
-- DeepSeek DSML invoke blocks such as `<｜DSML｜invoke name="...">`.
+- DeepSeek DSML invoke blocks inside the normal outer wrapper.
+- Opt-in DeepSeek V4 recovery for canonical orphan
+  `<｜DSML｜invoke name="...">` blocks missing only that outer wrapper.
 - ASCII DSML variants such as `<|DSML|tool_calls>`.
 - Qwen-style `<tool_call>` XML blocks.
 - Qwen-style JSON objects inside `<tool_call>` blocks.
 - Poolside / Laguna S 2.1 `<tool_call>func<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>` blocks.
 - Spurious empty streamed `tool_calls: []` chunks from some OpenAI-compatible servers.
 
-Native OpenAI `tool_calls` are passed through unchanged.
+Native OpenAI `tool_calls` are passed through unchanged except that otherwise
+valid calls missing an `id` receive a stable synthetic ID. In a stream, the same
+ID is reused for every fragment of one choice/tool index.
 
 The proxy scans `content`, `reasoning`, and `reasoning_content` by default. If a
 raw tool-call block is found in a reasoning field, only that raw block is
@@ -180,9 +184,10 @@ never use the LiteLLM master key as a general client fallback.
 | `MAX_CONCURRENT_UPSTREAM` | `8` | Max concurrent chat/generate requests to upstream. Extra requests get `429` with `Retry-After: 1`. `0` disables the limit. |
 | `STREAM_GUARD_CHARS` | `192` | Text held back while detecting split raw tool-call tags. |
 | `TOOL_ARGUMENT_CHUNK_SIZE` | `64` | Size for streamed function argument deltas. |
+| `EMPTY_TURN_NOTICE` | a short explanatory message | Content emitted before the terminal chunk when an upstream-closed turn has no content or tool calls. Set empty to disable. |
 | `MAX_RAW_TOOL_BLOCK_CHARS` | `131072` | Maximum raw tool-call block size to convert. Larger blocks pass through as text. |
-| `MAX_TOOL_CALLS` | `32` | Maximum tool calls to convert from one raw block. Blocks over the limit pass through as text. |
-| `MAX_TOOL_ARGUMENT_CHARS` | `262144` | Maximum serialized argument size per converted tool call. Blocks over the limit pass through as text. |
+| `MAX_TOOL_CALLS` | `32` | Maximum raw calls to convert and standard indexes to track for streamed repair. Blocks over the raw limit pass through as text. |
+| `MAX_TOOL_ARGUMENT_CHARS` | `262144` | Maximum serialized argument size per converted call and streamed repair buffer. Larger raw blocks pass through as text; standard calls are not repaired past the bound. |
 | `TOOL_CALL_SCAN_FIELDS` | `content,reasoning,reasoning_content` | Comma-separated response fields scanned for raw tool-call blocks. Use `all` for all supported fields. |
 | `SANITIZE_TOOLS` | `true` | Drop non-function tools from chat completion requests for OpenCode/upstream compatibility. |
 | `REQUEST_DROP_FIELDS` | unset | Comma-separated request body fields to remove before forwarding, for backend-specific quirks. |
@@ -248,6 +253,11 @@ Two guards keep a streamed turn from stalling silently:
 - **Idle cutoff.** After `UPSTREAM_STREAM_IDLE_TIMEOUT` seconds of silence the
   proxy flushes its buffers, sends a terminal chunk and `[DONE]`, and closes.
 
+When the upstream closes a turn without content or tool calls, the proxy logs
+the empty turn and emits `EMPTY_TURN_NOTICE` (enabled by default) before the
+terminal chunk so an agent client has something actionable to display. Set it
+empty to keep the turn unannotated.
+
 Chat and generate requests are retried up to `UPSTREAM_MAX_RETRIES` times on
 transport errors and on upstream `429`, `500`, `502`, `503`, and `504`, with
 exponential backoff and jitter. Retries only happen before any response byte has
@@ -265,6 +275,8 @@ written as YAML instead of packed into one-line env strings:
 models:
   deepseek-v4-flash:
     aliases: [dsv4-flash, DeepSeek-V4-Flash]
+    compatibility: deepseek_v4
+    recover_orphan_invokes: true
   gemma-4-e4b: [gemma]        # shorthand: a bare list of aliases
 
 routes:
@@ -281,9 +293,11 @@ PROXY_CONFIG_FILE=/etc/opencode-proxy/proxy.yaml
 ```
 
 The file only carries `models:` and `routes:`; deployment wiring stays in the
-environment. `MODEL_ALIASES` or `MODALITY_ROUTES` in the environment replace the
-matching section entirely. A configured file that is missing or malformed fails
-startup rather than silently running with partial routing.
+environment. Model compatibility is intentionally YAML-only so the temporary
+fallback is visible beside the affected model. `MODEL_ALIASES` or
+`MODALITY_ROUTES` in the environment replace the matching section entirely. A
+configured file that is missing or malformed fails startup rather than silently
+running with partial routing.
 
 ### Modality routing
 
@@ -314,6 +328,8 @@ Details worth knowing:
 - `GET /healthz`: local proxy liveness check.
 - `GET /readyz`: readiness check that probes upstream `GET /v1/models`. Connection failures and upstream `5xx` return `503`; auth errors still count as ready.
 - `GET /healthz/config`: safe local config summary, with header values and URL credentials omitted.
+- `GET /metrics`: proxy-owned Prometheus counters. Scrape vLLM separately for
+  cache, KV utilization, queueing, and model latency.
 - `/v1/chat/completions`: proxied to the upstream with request tool sanitization and response tool-call repair.
 - `/v1/models` and `/models`: upstream model discovery with configured alias entries added.
 - `/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`: Ollama-compatible translations backed by the same upstream client and tool-call repair pipeline.

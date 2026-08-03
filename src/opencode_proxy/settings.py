@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
@@ -21,6 +22,12 @@ if TYPE_CHECKING:
 LOG = logging.getLogger(__name__)
 
 CONFIG_FILE_ENV = "PROXY_CONFIG_FILE"
+
+
+@dataclass(frozen=True)
+class ModelCompatibility:
+    profile: str
+    recover_orphan_invokes: bool
 
 
 class ConfigFileSettingsSource(PydanticBaseSettingsSource):
@@ -114,6 +121,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("CUSTOM_HEADERS", "UPSTREAM_HEADERS"),
     )
     model_aliases: str = Field(default="", validation_alias="MODEL_ALIASES")
+    model_compatibility: str = ""
     alias_conflict_policy: str = Field(default="skip", validation_alias="ALIAS_CONFLICT_POLICY")
     config_file: str = Field(default="", validation_alias="PROXY_CONFIG_FILE")
     modality_routes: str = Field(default="", validation_alias="MODALITY_ROUTES")
@@ -169,12 +177,18 @@ class Settings(BaseSettings):
         msg = "REQUEST_DROP_FIELDS must be a comma-separated string or list"
         raise ValueError(msg)
 
-    @field_validator("model_aliases", "modality_routes", mode="before")
+    @field_validator("model_aliases", "model_compatibility", "modality_routes", mode="before")
     @classmethod
     def serialize_mapping_values(cls, value: object) -> object:
         """Accept mappings from the YAML config file, not just env strings."""
         if isinstance(value, dict):
             return json.dumps(value)
+        return value
+
+    @field_validator("model_compatibility")
+    @classmethod
+    def validate_model_compatibility(cls, value: str) -> str:
+        parse_model_compatibility(value)
         return value
 
     @field_validator("modality_routes")
@@ -216,6 +230,10 @@ class Settings(BaseSettings):
         return parse_model_aliases(self.model_aliases)
 
     @cached_property
+    def parsed_model_compatibility(self) -> dict[str, ModelCompatibility]:
+        return parse_model_compatibility(self.model_compatibility)
+
+    @cached_property
     def parsed_modality_routes(self) -> dict[str, ModalityRoute]:
         return parse_modality_routes(
             self.modality_routes,
@@ -246,6 +264,7 @@ class Settings(BaseSettings):
                 "guard_chars": self.stream_guard_chars,
                 "tool_argument_chunk_size": self.tool_argument_chunk_size,
                 "keepalive_interval": self.sse_keepalive_interval or None,
+                "empty_turn_notice": bool(self.empty_turn_notice),
             },
             "tool_call_repair": {
                 "scan_fields": list(self.parsed_tool_call_scan_fields),
@@ -260,6 +279,13 @@ class Settings(BaseSettings):
             "model_aliases": {
                 "aliases": sorted(self.parsed_model_aliases),
                 "conflict_policy": self.alias_conflict_policy,
+            },
+            "model_compatibility": {
+                model: {
+                    "profile": profile.profile,
+                    "recover_orphan_invokes": profile.recover_orphan_invokes,
+                }
+                for model, profile in sorted(self.parsed_model_compatibility.items())
             },
             "modality_routes": {
                 modality: {
@@ -341,6 +367,35 @@ def parse_custom_headers(raw_headers: str) -> dict[str, str]:
             raise ValueError(msg)
         headers[name] = value.strip()
     return headers
+
+
+def parse_model_compatibility(raw: str | dict[str, object]) -> dict[str, ModelCompatibility]:
+    if not raw:
+        return {}
+    parsed: object = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(parsed, dict):
+        msg = "model compatibility must be a JSON object"
+        raise ValueError(msg)
+
+    profiles: dict[str, ModelCompatibility] = {}
+    for raw_model, raw_entry in parsed.items():
+        model = str(raw_model).strip()
+        if not model or not isinstance(raw_entry, dict):
+            msg = "model compatibility entries must map model names to objects"
+            raise ValueError(msg)
+        profile = raw_entry.get("compatibility")
+        recover = raw_entry.get("recover_orphan_invokes", False)
+        if profile != "deepseek_v4":
+            msg = f"unsupported compatibility profile for model {model!r}"
+            raise ValueError(msg)
+        if not isinstance(recover, bool):
+            msg = f"recover_orphan_invokes for model {model!r} must be a boolean"
+            raise ValueError(msg)
+        profiles[model] = ModelCompatibility(
+            profile=profile,
+            recover_orphan_invokes=recover,
+        )
+    return profiles
 
 
 def parse_tool_call_scan_fields(value: object) -> tuple[str, ...]:

@@ -19,10 +19,14 @@ from starlette.background import BackgroundTask
 
 from opencode_proxy.compat import (
     JsonObject,
+    RepairStats,
     build_tool_call_chunks,
     complete_truncated_json,
     convert_chat_completion_response,
+    extract_orphan_dsml_invokes,
+    find_complete_orphan_dsml_invoke_span,
     find_complete_raw_tool_block_span,
+    find_orphan_dsml_invoke_start,
     find_raw_tool_start,
     make_content_chunk,
     make_finish_chunk,
@@ -32,6 +36,7 @@ from opencode_proxy.compat import (
     tool_calls_within_limits,
 )
 from opencode_proxy.concurrency import UpstreamConcurrencyLimiter
+from opencode_proxy.metrics import ProxyMetrics
 from opencode_proxy.routing import (
     UpstreamTarget,
     default_upstream_target,
@@ -87,6 +92,9 @@ class StreamChoiceState:
     # Streamed ``arguments`` fragments per upstream tool-call index, kept so a
     # truncated JSON payload can be completed before the turn closes.
     tool_call_arguments: dict[int, str] = field(default_factory=dict)
+    unrepairable_tool_call_indexes: set[int] = field(default_factory=set)
+    invalid_tool_call_index_seen: bool = False
+    native_tool_call_ids: dict[int, str] = field(default_factory=dict)
     emitted_content: bool = False
     emitted_tool_calls: bool = False
 
@@ -95,6 +103,15 @@ class StreamChoiceState:
 class SseFrame:
     data: str | None
     raw_lines: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ToolRepairContext:
+    recover_orphan_invokes: bool = False
+    declared_tool_names: frozenset[str] = frozenset()
+
+
+DEFAULT_TOOL_REPAIR_CONTEXT = ToolRepairContext()
 
 
 def build_router(settings: Settings) -> APIRouter:
@@ -135,6 +152,7 @@ async def proxy_chat_completions(request: Request, settings: Settings) -> Respon
     body = await request.body()
     parsed_body = _parse_json_object(body)
     target = default_upstream_target(settings)
+    repair_context = ToolRepairContext()
     if parsed_body is not None:
         if settings.sanitize_tools:
             _sanitize_tools(parsed_body)
@@ -142,14 +160,19 @@ async def proxy_chat_completions(request: Request, settings: Settings) -> Respon
         _apply_model_alias(parsed_body, settings.parsed_model_aliases)
         target = resolve_upstream_target(settings, parsed_body)
         apply_target_model(parsed_body, target)
+        repair_context = _tool_repair_context(parsed_body, settings)
 
     stream = bool(parsed_body.get("stream")) if parsed_body is not None else False
     overload = await _acquire_upstream_slot(request)
     if overload is not None:
         return overload
     if stream:
-        return await _proxy_streaming_chat_completion(request, settings, parsed_body, body, target)
-    return await _proxy_buffered_chat_completion(request, settings, parsed_body, body, target)
+        return await _proxy_streaming_chat_completion(
+            request, settings, parsed_body, body, target, repair_context
+        )
+    return await _proxy_buffered_chat_completion(
+        request, settings, parsed_body, body, target, repair_context
+    )
 
 
 async def proxy_passthrough(request: Request, settings: Settings, path: str) -> Response:
@@ -240,6 +263,7 @@ async def _proxy_buffered_chat_completion(
     parsed_body: JsonObject | None,
     raw_body: bytes,
     target: UpstreamTarget,
+    repair_context: ToolRepairContext,
 ) -> Response:
     headers = _forward_request_headers(request, settings=settings, stream=False, target=target)
     client = _upstream_client(request)
@@ -257,6 +281,7 @@ async def _proxy_buffered_chat_completion(
                 ),
                 settings=settings,
                 stream=False,
+                metrics=_request_metrics(request),
             )
         except httpx.HTTPError as exc:
             return _proxy_error(exc)
@@ -282,13 +307,18 @@ async def _proxy_buffered_chat_completion(
             )
 
         if isinstance(response_body, dict):
+            stats = RepairStats()
             converted, changed = convert_chat_completion_response(
                 response_body,
                 tool_call_scan_fields=settings.parsed_tool_call_scan_fields,
                 max_raw_tool_block_chars=settings.max_raw_tool_block_chars,
                 max_tool_calls=settings.max_tool_calls,
                 max_tool_argument_chars=settings.max_tool_argument_chars,
+                recover_orphan_invokes=repair_context.recover_orphan_invokes,
+                declared_tool_names=repair_context.declared_tool_names,
+                stats=stats,
             )
+            _record_repair_stats(_request_metrics(request), stats, transport="buffered")
             if changed:
                 LOG.info("converted raw tool call in non-streaming chat completion")
             return JSONResponse(
@@ -312,6 +342,7 @@ async def _proxy_streaming_chat_completion(
     parsed_body: JsonObject | None,
     raw_body: bytes,
     target: UpstreamTarget,
+    repair_context: ToolRepairContext,
 ) -> Response:
     headers = _forward_request_headers(request, settings=settings, stream=True, target=target)
 
@@ -327,6 +358,7 @@ async def _proxy_streaming_chat_completion(
             ),
             settings=settings,
             stream=True,
+            metrics=_request_metrics(request),
         )
     except httpx.HTTPError as exc:
         await _release_upstream_slot(request)
@@ -359,7 +391,7 @@ async def _proxy_streaming_chat_completion(
             media_type=content_type or None,
         )
 
-    generator = _rewrite_sse_stream(request, upstream_response, settings)
+    generator = _rewrite_sse_stream(request, upstream_response, settings, repair_context)
     background = BackgroundTask(_aclose_upstream_and_release_slot, upstream_response, request)
     return StreamingResponse(
         generator,
@@ -383,6 +415,7 @@ async def send_upstream_with_retries(
     *,
     settings: Settings,
     stream: bool,
+    metrics: ProxyMetrics | None = None,
 ) -> httpx.Response:
     """Send an upstream request, retrying transport and overload failures.
 
@@ -400,6 +433,8 @@ async def send_upstream_with_retries(
             ):
                 raise
             attempt += 1
+            if metrics is not None:
+                metrics.upstream_retries.labels(reason="transport").inc()
             await _retry_backoff(attempt, reason=type(exc).__name__)
             continue
 
@@ -409,6 +444,8 @@ async def send_upstream_with_retries(
         await response.aread()
         await response.aclose()
         attempt += 1
+        if metrics is not None:
+            metrics.upstream_retries.labels(reason=f"http_{response.status_code}").inc()
         await _retry_backoff(attempt, reason=f"HTTP {response.status_code}")
 
 
@@ -423,6 +460,7 @@ async def _rewrite_sse_stream(
     request: Request,
     upstream_response: httpx.Response,
     settings: Settings,
+    repair_context: ToolRepairContext = DEFAULT_TOOL_REPAIR_CONTEXT,
 ) -> AsyncIterator[bytes]:
     """Rewrite an SSE chat-completion stream into OpenAI ``tool_calls`` deltas."""
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -437,6 +475,7 @@ async def _rewrite_sse_stream(
             upstream_response,
             settings.upstream_stream_idle_timeout,
             settings.sse_keepalive_interval,
+            metrics=_request_metrics(request),
         ):
             if await request.is_disconnected():
                 LOG.info("client disconnected; stopping upstream SSE rewrite")
@@ -456,7 +495,9 @@ async def _rewrite_sse_stream(
                     choice_states,
                     chunk_id=chunk_id,
                     model=model,
+                    upstream_completed=True,
                     empty_turn_notice=settings.empty_turn_notice,
+                    metrics=_request_metrics(request),
                 ):
                     yield done_payload
                 return
@@ -486,6 +527,8 @@ async def _rewrite_sse_stream(
                     chunk_id=chunk_id,
                     model=model,
                     settings=settings,
+                    repair_context=repair_context,
+                    metrics=_request_metrics(request),
                 ):
                     yield _encode_sse_json(payload)
     except asyncio.CancelledError:
@@ -517,6 +560,7 @@ async def _rewrite_sse_stream(
         model=model,
         fallback_finish_reason=fallback_finish_reason,
         empty_turn_notice=settings.empty_turn_notice,
+        metrics=_request_metrics(request),
     ):
         yield done_payload
 
@@ -525,6 +569,8 @@ async def _iter_sse_frames_with_idle_guard(
     upstream_response: httpx.Response,
     idle_timeout: float,
     keepalive_interval: float = 0.0,
+    *,
+    metrics: ProxyMetrics | None = None,
 ) -> AsyncIterator[SseFrame | None]:
     """Yield upstream SSE frames, plus ``None`` whenever the upstream is quiet.
 
@@ -557,6 +603,8 @@ async def _iter_sse_frames_with_idle_guard(
                         "upstream sent no SSE frame for %.1fs; terminating the client stream",
                         silence,
                     )
+                    if metrics is not None:
+                        metrics.stream_idle_terminations.inc()
                     return
                 yield None
                 continue
@@ -623,35 +671,63 @@ async def _finish_sse_stream(
     chunk_id: str,
     model: str,
     fallback_finish_reason: str | None = None,
+    upstream_completed: bool = False,
     empty_turn_notice: str = "",
+    metrics: ProxyMetrics | None = None,
 ) -> AsyncIterator[bytes]:
     state_items = sorted(choice_states.items())
-    if fallback_finish_reason is not None and not state_items:
+    if not state_items and upstream_completed and metrics is not None:
+        metrics.empty_turns.inc()
+    if not state_items and (
+        fallback_finish_reason is not None or (upstream_completed and empty_turn_notice)
+    ):
         state_items = [(0, StreamChoiceState())]
 
     for choice_index, state in state_items:
-        for payload in _flush_choice_buffers(
-            state,
-            chunk_id=chunk_id,
-            model=model,
-            choice_index=choice_index,
+        if not state.finish_sent:
+            for payload in _flush_choice_buffers(
+                state,
+                chunk_id=chunk_id,
+                model=model,
+                choice_index=choice_index,
+            ):
+                yield _encode_sse_json(payload)
+            for payload in _repair_tool_call_arguments(
+                state,
+                chunk_id=chunk_id,
+                model=model,
+                choice_index=choice_index,
+                metrics=metrics,
+            ):
+                yield _encode_sse_json(payload)
+            for payload in _annotate_empty_turn(
+                state,
+                chunk_id=chunk_id,
+                model=model,
+                choice_index=choice_index,
+                notice=empty_turn_notice,
+                upstream_completed=upstream_completed,
+                metrics=metrics,
+            ):
+                yield _encode_sse_json(payload)
+        elif (
+            state.tool_call_arguments
+            or state.unrepairable_tool_call_indexes
+            or state.invalid_tool_call_index_seen
         ):
-            yield _encode_sse_json(payload)
-        for payload in _repair_tool_call_arguments(
-            state,
-            chunk_id=chunk_id,
-            model=model,
-            choice_index=choice_index,
-        ):
-            yield _encode_sse_json(payload)
-        for payload in _annotate_empty_turn(
-            state,
-            chunk_id=chunk_id,
-            model=model,
-            choice_index=choice_index,
-            notice=empty_turn_notice,
-        ):
-            yield _encode_sse_json(payload)
+            # A terminal chunk has already reached the client. There is no safe
+            # place to append a repair after it, so discard only this impossible
+            # leftover state rather than emitting an out-of-order delta.
+            LOG.error(
+                "tool-call repair state remained after terminal chunk; "
+                "chunk_id=%s model=%s choice=%d",
+                chunk_id,
+                model,
+                choice_index,
+            )
+            state.tool_call_arguments.clear()
+            state.unrepairable_tool_call_indexes.clear()
+            state.invalid_tool_call_index_seen = False
         if not state.finish_sent:
             # A stream that ends without a finish_reason leaves agent clients
             # waiting on a turn the model already completed; always close the
@@ -676,11 +752,22 @@ def _rewrite_stream_choice(
     chunk_id: str,
     model: str,
     settings: Settings,
+    repair_context: ToolRepairContext = DEFAULT_TOOL_REPAIR_CONTEXT,
+    metrics: ProxyMetrics | None = None,
 ) -> list[JsonObject]:
     delta = choice.get("delta")
     finish_reason = choice.get("finish_reason")
     choice_index = _choice_index(choice)
     outputs: list[JsonObject] = []
+
+    if state.finish_sent:
+        LOG.warning(
+            "ignoring SSE choice data after terminal chunk; chunk_id=%s model=%s choice=%d",
+            chunk_id,
+            model,
+            choice_index,
+        )
+        return outputs
 
     if isinstance(delta, dict) and isinstance(delta.get("content"), str) and delta["content"]:
         state.emitted_content = True
@@ -700,6 +787,26 @@ def _rewrite_stream_choice(
                 finish_reason,
                 state,
             )
+            outputs.extend(
+                _repair_tool_call_arguments(
+                    state,
+                    chunk_id=chunk_id,
+                    model=model,
+                    choice_index=choice_index,
+                    metrics=metrics,
+                ),
+            )
+            outputs.extend(
+                _annotate_empty_turn(
+                    state,
+                    chunk_id=chunk_id,
+                    model=model,
+                    choice_index=choice_index,
+                    notice=settings.empty_turn_notice,
+                    upstream_completed=True,
+                    metrics=metrics,
+                ),
+            )
             state.finish_sent = True
         outputs.append({**event, "choices": [passthrough_choice]})
         return outputs
@@ -713,8 +820,22 @@ def _rewrite_stream_choice(
                 choice_index=choice_index,
             ),
         )
+        normalized_tool_calls, synthesized = _normalize_stream_tool_call_ids(
+            delta["tool_calls"],
+            state,
+        )
+        if synthesized and metrics is not None:
+            metrics.synthesized_tool_call_ids.labels(transport="streaming").inc(synthesized)
+        if normalized_tool_calls is not delta["tool_calls"]:
+            delta = {**delta, "tool_calls": normalized_tool_calls}
+            choice = {**choice, "delta": delta}
         state.emitted_tool_calls = True
-        _record_tool_call_arguments(state, delta["tool_calls"])
+        _record_tool_call_arguments(
+            state,
+            delta["tool_calls"],
+            max_tool_calls=settings.max_tool_calls,
+            max_argument_chars=settings.max_tool_argument_chars,
+        )
         if finish_reason is None:
             outputs.append(_single_choice_event(event, choice))
             return outputs
@@ -729,6 +850,18 @@ def _rewrite_stream_choice(
                 chunk_id=chunk_id,
                 model=model,
                 choice_index=choice_index,
+                metrics=metrics,
+            ),
+        )
+        outputs.extend(
+            _annotate_empty_turn(
+                state,
+                chunk_id=chunk_id,
+                model=model,
+                choice_index=choice_index,
+                notice=settings.empty_turn_notice,
+                upstream_completed=True,
+                metrics=metrics,
             ),
         )
         outputs.append(
@@ -796,6 +929,8 @@ def _rewrite_stream_choice(
                 model=model,
                 choice_index=choice_index,
                 settings=settings,
+                repair_context=repair_context,
+                metrics=metrics,
             ),
         )
         emitted_any_delta = True
@@ -815,6 +950,18 @@ def _rewrite_stream_choice(
                 chunk_id=chunk_id,
                 model=model,
                 choice_index=choice_index,
+                metrics=metrics,
+            ),
+        )
+        outputs.extend(
+            _annotate_empty_turn(
+                state,
+                chunk_id=chunk_id,
+                model=model,
+                choice_index=choice_index,
+                notice=settings.empty_turn_notice,
+                upstream_completed=True,
+                metrics=metrics,
             ),
         )
         outputs.append(
@@ -872,6 +1019,8 @@ def _annotate_empty_turn(
     model: str,
     choice_index: int,
     notice: str,
+    upstream_completed: bool,
+    metrics: ProxyMetrics | None = None,
 ) -> list[JsonObject]:
     """Give the client something to act on when a turn produced nothing.
 
@@ -884,20 +1033,23 @@ def _annotate_empty_turn(
     if state.emitted_content or state.emitted_tool_calls or state.raw_tool_calls_emitted:
         return []
 
+    if metrics is not None:
+        metrics.empty_turns.inc()
     LOG.warning(
         "upstream turn produced no content and no tool calls; "
         "chunk_id=%s model=%s choice=%d upstream_finished=%s",
         chunk_id,
         model,
         choice_index,
-        state.finish_sent,
+        state.finish_sent or upstream_completed,
     )
     # Only explain the turn when the upstream closed it itself. If the proxy is
     # synthesising the terminator after a failure or an idle timeout, the turn
     # is empty because the stream broke, and blaming the token budget would be
     # wrong; the synthetic finish_reason already says it was truncated.
-    if not notice or not state.finish_sent:
+    if not notice or not (state.finish_sent or upstream_completed):
         return []
+    state.emitted_content = True
     return [
         cast(
             "JsonObject",
@@ -911,7 +1063,13 @@ def _annotate_empty_turn(
     ]
 
 
-def _record_tool_call_arguments(state: StreamChoiceState, tool_calls: object) -> None:
+def _record_tool_call_arguments(
+    state: StreamChoiceState,
+    tool_calls: object,
+    *,
+    max_tool_calls: int,
+    max_argument_chars: int,
+) -> None:
     """Accumulate streamed ``arguments`` fragments per tool-call index."""
     if not isinstance(tool_calls, list):
         return
@@ -925,8 +1083,27 @@ def _record_tool_call_arguments(state: StreamChoiceState, tool_calls: object) ->
         if not isinstance(arguments, str):
             continue
         index = tool_call.get("index")
-        index = index if isinstance(index, int) else 0
-        state.tool_call_arguments[index] = state.tool_call_arguments.get(index, "") + arguments
+        if type(index) is not int or index < 0:
+            # An invalid index makes it unsafe to attach a repair to a
+            # particular call, especially when several calls are interleaved.
+            state.invalid_tool_call_index_seen = True
+            continue
+        if index in state.unrepairable_tool_call_indexes:
+            continue
+
+        current = state.tool_call_arguments.get(index)
+        if current is None:
+            if len(state.tool_call_arguments) + len(state.unrepairable_tool_call_indexes) >= (
+                max_tool_calls
+            ):
+                continue
+            current = ""
+
+        if len(current) + len(arguments) > max_argument_chars:
+            state.tool_call_arguments.pop(index, None)
+            state.unrepairable_tool_call_indexes.add(index)
+            continue
+        state.tool_call_arguments[index] = current + arguments
 
 
 def _repair_tool_call_arguments(
@@ -935,6 +1112,7 @@ def _repair_tool_call_arguments(
     chunk_id: str,
     model: str,
     choice_index: int,
+    metrics: ProxyMetrics | None = None,
 ) -> list[JsonObject]:
     """Complete any tool ``arguments`` the upstream truncated mid-value.
 
@@ -944,9 +1122,30 @@ def _repair_tool_call_arguments(
     already on the wire, so the repair is appended as one final fragment.
     """
     repairs: list[JsonObject] = []
+    if state.invalid_tool_call_index_seen:
+        if metrics is not None:
+            metrics.tool_argument_repair.labels(outcome="invalid_index").inc()
+        LOG.error(
+            "upstream tool call has an invalid index; skipping argument repair; "
+            "chunk_id=%s model=%s",
+            chunk_id,
+            model,
+        )
+    for tool_index in sorted(state.unrepairable_tool_call_indexes):
+        if metrics is not None:
+            metrics.tool_argument_repair.labels(outcome="limit_exceeded").inc()
+        LOG.error(
+            "upstream tool call arguments exceeded repair limit; "
+            "chunk_id=%s model=%s tool_index=%d",
+            chunk_id,
+            model,
+            tool_index,
+        )
     for tool_index, arguments in sorted(state.tool_call_arguments.items()):
         suffix = complete_truncated_json(arguments)
         if suffix is None:
+            if metrics is not None:
+                metrics.tool_argument_repair.labels(outcome="unrepairable").inc()
             LOG.error(
                 "upstream tool call has unrepairable arguments; "
                 "chunk_id=%s model=%s tool_index=%d arguments=%r",
@@ -958,6 +1157,8 @@ def _repair_tool_call_arguments(
             continue
         if not suffix:
             continue
+        if metrics is not None:
+            metrics.tool_argument_repair.labels(outcome="completed").inc()
         LOG.warning(
             "completing truncated tool-call arguments; "
             "chunk_id=%s model=%s tool_index=%d suffix=%r",
@@ -979,6 +1180,8 @@ def _repair_tool_call_arguments(
             ),
         )
     state.tool_call_arguments.clear()
+    state.unrepairable_tool_call_indexes.clear()
+    state.invalid_tool_call_index_seen = False
     return repairs
 
 
@@ -992,6 +1195,8 @@ def _process_stream_field_text(
     model: str,
     choice_index: int,
     settings: Settings,
+    repair_context: ToolRepairContext,
+    metrics: ProxyMetrics | None,
 ) -> list[JsonObject]:
     outputs: list[JsonObject] = []
     state.field_event_metadata[field_name] = {
@@ -1023,15 +1228,28 @@ def _process_stream_field_text(
 
     while state.field_buffers[field_name]:
         buffer = state.field_buffers[field_name]
-        span = find_complete_raw_tool_block_span(buffer)
+        wrapped_span = find_complete_raw_tool_block_span(buffer)
+        orphan_span = (
+            find_complete_orphan_dsml_invoke_span(buffer)
+            if field_name == "content" and repair_context.recover_orphan_invokes
+            else None
+        )
+        span = _earliest_span(wrapped_span, orphan_span)
         if span is not None:
             state.pending_raw_fields.discard(field_name)
             start, end = span
             prefix = buffer[:start]
             block = buffer[start:end]
             suffix = buffer[end:]
+            is_orphan = orphan_span == span and (
+                wrapped_span is None or orphan_span[0] <= wrapped_span[0]
+            )
 
             if len(block) > settings.max_raw_tool_block_chars:
+                if is_orphan and metrics is not None:
+                    metrics.orphan_recovery.labels(
+                        outcome="rejected", reason="oversized_block"
+                    ).inc()
                 LOG.warning(
                     "raw tool-call block exceeded max size; passing through as text",
                 )
@@ -1048,7 +1266,22 @@ def _process_stream_field_text(
                 state.field_buffers[field_name] = suffix
                 continue
 
-            tool_calls = parse_raw_tool_calls(block)
+            orphan_stats = RepairStats()
+            if is_orphan:
+                tool_calls, rejected_text, changed = extract_orphan_dsml_invokes(
+                    block,
+                    declared_tool_names=repair_context.declared_tool_names,
+                    max_raw_tool_block_chars=settings.max_raw_tool_block_chars,
+                    max_tool_calls=settings.max_tool_calls,
+                    max_tool_argument_chars=settings.max_tool_argument_chars,
+                    stats=orphan_stats,
+                )
+                _record_repair_stats(metrics, orphan_stats, transport="streaming")
+                if not changed:
+                    tool_calls = []
+                    block = rejected_text
+            else:
+                tool_calls = parse_raw_tool_calls(block)
             if not tool_calls:
                 LOG.info("raw tool-call block could not be parsed; passing through as text")
                 outputs.append(
@@ -1100,6 +1333,9 @@ def _process_stream_field_text(
                 "converted %d raw tool call(s) in streaming chat completion",
                 len(tool_calls),
             )
+            if metrics is not None:
+                repair_format = "deepseek_v4_orphan" if is_orphan else _raw_format(block)
+                metrics.raw_tool_repair.labels(format=repair_format, field=field_name).inc()
             for tool_chunk in build_tool_call_chunks(
                 tool_calls,
                 chunk_id=chunk_id,
@@ -1120,7 +1356,13 @@ def _process_stream_field_text(
             state.field_buffers[field_name] = suffix
             continue
 
-        raw_start = find_raw_tool_start(buffer)
+        wrapped_start = find_raw_tool_start(buffer)
+        orphan_start = (
+            find_orphan_dsml_invoke_start(buffer)
+            if field_name == "content" and repair_context.recover_orphan_invokes
+            else None
+        )
+        raw_start = _earliest_index(wrapped_start, orphan_start)
         if raw_start is not None:
             if len(buffer) - raw_start > settings.max_raw_tool_block_chars:
                 LOG.warning(
@@ -1238,6 +1480,116 @@ def _parse_json_object(body: bytes) -> JsonObject | None:
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _tool_repair_context(body: JsonObject, settings: Settings) -> ToolRepairContext:
+    model = body.get("model")
+    profile = settings.parsed_model_compatibility.get(model) if isinstance(model, str) else None
+    tools = body.get("tools")
+    declared_names: frozenset[str] = frozenset()
+    if isinstance(tools, list):
+        names: set[str] = set()
+        for tool in tools:
+            if not isinstance(tool, dict) or tool.get("type") != "function":
+                continue
+            function = tool.get("function")
+            if isinstance(function, dict) and isinstance(function.get("name"), str):
+                name = function["name"]
+                if name:
+                    names.add(name)
+        declared_names = frozenset(names)
+    return ToolRepairContext(
+        recover_orphan_invokes=bool(
+            profile
+            and profile.profile == "deepseek_v4"
+            and profile.recover_orphan_invokes
+            and declared_names
+            and body.get("tool_choice") != "none"
+        ),
+        declared_tool_names=declared_names,
+    )
+
+
+def _normalize_stream_tool_call_ids(
+    tool_calls: object,
+    state: StreamChoiceState,
+) -> tuple[object, int]:
+    if not isinstance(tool_calls, list):
+        return tool_calls, 0
+
+    normalized: list[object] = []
+    changed = False
+    synthesized = 0
+    for raw_tool_call in tool_calls:
+        if not isinstance(raw_tool_call, dict):
+            normalized.append(raw_tool_call)
+            continue
+        index = raw_tool_call.get("index")
+        function = raw_tool_call.get("function")
+        if type(index) is not int or index < 0 or not isinstance(function, dict):
+            normalized.append(raw_tool_call)
+            continue
+
+        existing_id = raw_tool_call.get("id")
+        if isinstance(existing_id, str) and existing_id:
+            state.native_tool_call_ids[index] = existing_id
+            normalized.append(raw_tool_call)
+            continue
+
+        call_id = state.native_tool_call_ids.get(index)
+        if call_id is None:
+            call_id = f"call_{uuid.uuid4().hex[:24]}"
+            state.native_tool_call_ids[index] = call_id
+            synthesized += 1
+        normalized.append({**raw_tool_call, "id": call_id})
+        changed = True
+    return (normalized if changed else tool_calls), synthesized
+
+
+def _request_metrics(request: Request) -> ProxyMetrics | None:
+    metrics = getattr(request.app.state, "metrics", None)
+    return metrics if isinstance(metrics, ProxyMetrics) else None
+
+
+def _record_repair_stats(
+    metrics: ProxyMetrics | None,
+    stats: RepairStats,
+    *,
+    transport: str,
+) -> None:
+    if metrics is None:
+        return
+    for repair_format, field_name in stats.raw_repairs:
+        metrics.raw_tool_repair.labels(format=repair_format, field=field_name).inc()
+    if stats.orphan_accepted:
+        metrics.orphan_recovery.labels(outcome="accepted", reason="valid").inc(
+            stats.orphan_accepted
+        )
+    for reason, count in stats.orphan_rejected.items():
+        metrics.orphan_recovery.labels(outcome="rejected", reason=reason).inc(count)
+    if stats.synthesized_ids:
+        metrics.synthesized_tool_call_ids.labels(transport=transport).inc(stats.synthesized_ids)
+
+
+def _earliest_span(
+    first: tuple[int, int] | None,
+    second: tuple[int, int] | None,
+) -> tuple[int, int] | None:
+    spans = [span for span in (first, second) if span is not None]
+    return min(spans, key=lambda span: (span[0], span[1])) if spans else None
+
+
+def _earliest_index(first: int | None, second: int | None) -> int | None:
+    indexes = [index for index in (first, second) if index is not None]
+    return min(indexes) if indexes else None
+
+
+def _raw_format(text: str) -> str:
+    if "<tool_call" in text:
+        return "qwen_xml"
+    if "DSML" in text:
+        return "dsml"
+    return "unknown"
 
 
 def _body_kwargs(parsed_body: JsonObject | None, raw_body: bytes) -> dict[str, Any]:
@@ -1361,6 +1713,8 @@ def _finish_reason_for_state(finish_reason: object, state: StreamChoiceState) ->
         return "tool_calls"
     if isinstance(finish_reason, str):
         return finish_reason
+    if state.emitted_tool_calls:
+        return "tool_calls"
     return "stop"
 
 

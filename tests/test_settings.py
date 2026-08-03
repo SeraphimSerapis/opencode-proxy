@@ -161,6 +161,7 @@ def test_settings_safe_config_omits_custom_header_values() -> None:
     assert safe_config["upstream"]["origin"] == "http://upstream.test:4000"
     assert safe_config["upstream"]["max_concurrent"] == 8
     assert safe_config["upstream"]["timeouts"]["ready"] == 2.0
+    assert safe_config["streaming"]["empty_turn_notice"] is True
     assert safe_config["custom_headers"] == {"names": ["Authorization", "X-Skip-Auth"]}
     assert safe_config["model_aliases"]["aliases"] == ["alias"]
     assert safe_config["request_transforms"]["drop_fields"] == ["parallel_tool_calls"]

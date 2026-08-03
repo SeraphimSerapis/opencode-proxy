@@ -1,10 +1,33 @@
 # Documentation Update Log
 
+## 2026-08-03 (3)
+
+* **Feature**: Added an explicit YAML `deepseek_v4` compatibility profile and a
+  request-aware fallback for canonical orphan DSML invokes associated with vLLM
+  #49117. Recovery requires declared tools, an enabled tool choice, an exact
+  declared name, and `content`; rejected candidates remain unchanged.
+* **Compatibility**: Otherwise valid native OpenAI tool calls missing IDs now
+  receive distinct synthetic IDs. Streamed IDs are stable per choice/tool index,
+  while valid upstream IDs remain authoritative.
+* **Observability**: Added `GET /metrics` with bounded proxy counters for raw and
+  orphan repair, synthesized IDs, argument repair outcomes, retries, idle
+  termination, and empty turns. vLLM model/cache metrics remain a separate
+  scrape target.
+* **Operations**: Added a DeepSeek V4 serving runbook and an environment-gated
+  direct-vLLM/proxy capability probe. Removing the temporary fallback requires
+  the pinned image, full local quality gates, and this live probe.
+
+## 2026-08-03 (2)
+
+* **Documentation**: Caught up `streaming-contract.md` and `tool-call-repair.md` to the fixes committed earlier today (`0bdec5d`) — both still described the pre-session mechanism (`stop`/`tool_calls` only, no argument repair, no empty-turn notice, the two-entry degraded-marker table). Added `EMPTY_TURN_NOTICE` to `configuration.md`, which was missing entirely. Corrected an overclaim in `turn-usability.md`: it referenced "the repair's counter" as an observability signal, but no counter exists yet — only log lines.
+* **Audit fix**: Duplicate or post-terminal choice events are ignored; append-only argument repairs are emitted before terminal chunks even when `delta` is missing; repair accumulation is bounded by `MAX_TOOL_CALLS` and `MAX_TOOL_ARGUMENT_CHARS`; and clean empty `[DONE]` turns can receive the configured notice. Added regressions for multi-tool indexes, invalid fragments, and disabled notices.
+* **Audit fix**: Raw Qwen blocks with opener attributes or trailing whitespace are now normalized and parsed consistently with block detection. End-to-end streaming regressions exercise those forms through the production guard buffer.
+
 ## 2026-08-03
 
-* **Fix**: Truncated streamed tool-call `arguments` are now completed before the turn closes, and turns that produce no content and no tool calls are logged and optionally annotated. Both were found by driving a real agentic tool loop against the deployed vLLM; both produce a perfectly well-formed stream that nonetheless strands an agent client, which is why the earlier termination work did not catch them. See [a terminated turn must also be a usable turn](decisions/turn-usability.md).
+* **Fix**: Truncated streamed tool-call `arguments` are now completed before the turn closes, and turns that produce no content and no tool calls are logged and optionally annotated before their terminal chunk. Both were found by driving a real agentic tool loop against the deployed vLLM; both produce a perfectly well-formed stream that nonetheless strands an agent client, which is why the earlier termination work did not catch them. See [a terminated turn must also be a usable turn](decisions/turn-usability.md).
 * **Fix**: An exception of any type during SSE rewriting now terminates the turn instead of truncating the body. Once the 200/SSE headers are out the status is committed, so re-raising cannot produce an HTTP error — it only strands the client, which was the exact symptom being chased.
-* **Fix**: `RAW_TOOL_START_MARKERS` gained the two degraded openers the block grammar already accepted (`<DSML:tool_calls>`, `<DSML tool_calls>`). Streaming holds a marker back only if it matches this table, so an opener split across tokens was flushed as text and the block could never reassemble. A test now asserts the two tables agree in both directions.
+* **Fix**: `RAW_TOOL_START_MARKERS` gained the two degraded openers the block grammar already accepted (`<DSML:tool_calls>`, `<DSML tool_calls>`). The marker table and complete block grammar now agree for their common forms; the production stream path is covered separately through its fixed-size guard buffer.
 
 ## 2026-08-02
 

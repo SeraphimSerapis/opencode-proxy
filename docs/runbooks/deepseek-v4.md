@@ -1,0 +1,125 @@
+---
+type: runbook
+title: Serve DeepSeek V4 safely
+description: Pin vLLM, launch DeepSeek V4 with the matching parsers, observe cache behavior, and retire the orphan-invoke fallback.
+resource: /home/tim/projects/opencode-proxy/tests/test_live_vllm.py
+tags: [deepseek-v4, vllm, dsml, prefix-cache, prometheus, deployment]
+status: active
+verified: 2026-08-03
+---
+
+# Serve DeepSeek V4 safely
+
+## Deployment record and launch profile
+
+Do not deploy a mutable vLLM tag. The deployment record must contain all four
+values below before rollout:
+
+| Field | Required value |
+| --- | --- |
+| Image | Registry/repository plus immutable `@sha256:...` digest |
+| Source | A build containing [vLLM PR #49117](https://github.com/vllm-project/vllm/pull/49117), or the first release verified to contain it |
+| Model | Exact DeepSeek V4 repository and revision |
+| Date/evidence | Probe command, result, and operator |
+
+This repository does not own the vLLM deployment manifest and therefore cannot
+safely invent its registry digest. Resolve and record the actual deployment
+artifact, for example with `docker image inspect`, before enabling traffic.
+
+The V4 server command must include:
+
+```text
+--tokenizer-mode deepseek_v4
+--tool-call-parser deepseek_v4
+--reasoning-parser deepseek_v4
+--enable-auto-tool-choice
+--enable-prefix-caching
+```
+
+Keep vLLM authoritative for tokenization, chat templates, reasoning/tool
+parsing, and GPU execution. The proxy does not reshape prompts, replay sessions,
+execute tools, compact history, or retry after response bytes reach a client.
+
+## Temporary proxy fallback
+
+Enable the fallback only on the affected canonical upstream model:
+
+```yaml
+models:
+  deepseek-v4:
+    compatibility: deepseek_v4
+    recover_orphan_invokes: true
+```
+
+It accepts only canonical V4 orphan invokes in `content`, and only when the
+request declares the exact function name and permits tools. Set the flag false
+after the removal gate passes. This is the rollback switch; it does not require
+a proxy image rollback.
+
+## Prometheus targets
+
+Scrape both services:
+
+* Proxy `/metrics` reports transport/compatibility behavior:
+  `opencode_proxy_orphan_recovery_total`,
+  `opencode_proxy_raw_tool_repair_total`,
+  `opencode_proxy_synthesized_tool_call_ids_total`,
+  `opencode_proxy_tool_argument_repair_total`,
+  `opencode_proxy_upstream_retries_total`,
+  `opencode_proxy_stream_idle_terminations_total`, and
+  `opencode_proxy_empty_turns_total`.
+* vLLM `/metrics` reports model-serving behavior. Track
+  `vllm:prefix_cache_queries` and `vllm:prefix_cache_hits` (both token
+  counters), KV-cache utilization, waiting requests/queue time, time to first
+  token, and end-to-end request latency. Metric names beyond the prefix-cache
+  counters can change between vLLM releases, so verify them against the pinned
+  image's `/metrics` output when writing scrape rules.
+
+Prefix-cache hit rate over an interval is
+`rate(vllm:prefix_cache_hits[...]) / rate(vllm:prefix_cache_queries[...])`.
+Hits measure cached prefix tokens. Automatic prefix caching improves repeated
+prefix prefill; it does not accelerate generation tokens.
+
+References: [automatic prefix caching](https://docs.vllm.ai/en/stable/features/automatic_prefix_caching/),
+[production metrics](https://docs.vllm.ai/en/stable/usage/metrics/), and the
+[official DeepSeek V4 recipe](https://github.com/vllm-project/vllm-project.github.io/blob/main/_posts/2026-04-24-deepseek-v4.md).
+
+## Live capability probe
+
+Run the normal gates first, then point the gated test at vLLM directly and at
+this proxy:
+
+```bash
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src tests
+uv run pytest
+
+VLLM_PROBE_DIRECT_URL=http://vllm-host:8000 \
+VLLM_PROBE_PROXY_URL=http://proxy-host:9526 \
+VLLM_PROBE_MODEL=deepseek-v4 \
+uv run pytest -q tests/test_live_vllm.py
+```
+
+The probe requires native structured calls with non-empty IDs directly and
+through the proxy, replays the provider reasoning/tool-result shape, interrupts
+a client stream and verifies recovery, repeats a cacheable prefix, and checks
+vLLM's direct prefix-cache counters. Deterministic unit tests separately inject
+wrapped and orphan DSML at every marker split point.
+
+## Fallback removal gate
+
+Set `recover_orphan_invokes: false` only when all are true:
+
+1. The running vLLM image is recorded by immutable digest and contains #49117.
+2. The launch profile above is visible in the running process.
+3. Ruff, formatting, mypy, and all unit tests pass.
+4. The live capability probe passes against the exact deployed digest.
+5. Repeated production-like tool prompts show no orphan invokes in direct vLLM
+   responses and the proxy accepted-orphan counter remains flat.
+6. Direct vLLM metrics show prefix-cache queries/hits and healthy KV, queue, and
+   latency behavior.
+
+If direct responses regress, re-enable the flag only for the affected model and
+retain the captured response shape privately; never put prompts, arguments,
+tool names, or model output into metric labels.

@@ -7,8 +7,8 @@ tags: [tool-calls, dsml, qwen, deepseek, streaming, parsing]
 status: active
 generated:
   by: claude-code/opus-5
-  at: 2026-08-01T16:20:00+02:00
-verified: 2026-08-01
+  at: 2026-08-03T09:40:00+02:00
+verified: 2026-08-03
 ---
 
 # Tool-call repair
@@ -23,15 +23,25 @@ field the client expects.
 
 ## Recognised formats
 
-Detection markers live in `RAW_TOOL_START_MARKERS`; matched pairs in
-`RAW_TOOL_BLOCK_PATTERNS`:
+Complete opener/closer detection lives in `RAW_TOOL_BLOCK_PATTERNS`.
+`RAW_TOOL_START_MARKERS` enumerates common complete openers for the standalone
+prefix helper:
 
 | Marker | Origin |
 | --- | --- |
 | `<｜DSML｜tool_calls>` (fullwidth bar, U+FF5C) | DeepSeek, canonical form |
 | `<\|DSML\|tool_calls>` (ASCII pipe) | DeepSeek, degraded tokenisation |
-| `<DSML>tool_calls>`, `<DSML: tool_calls>` | DeepSeek, further degraded |
+| `<DSML>tool_calls>`, `<DSML: tool_calls>`, `<DSML tool_calls>`, `<DSML:tool_calls>` | DeepSeek, further degraded |
 | `<tool_calls>`, `<tool_call ...>` | Qwen XML |
+
+The streaming state machine does not call the prefix helper. It retains the last
+`STREAM_GUARD_CHARS` of ordinary text, then applies the complete block patterns
+after more text arrives. `test_block_grammar_and_common_marker_table_agree` in
+[`tests/test_compat.py`](/home/tim/projects/opencode-proxy/tests/test_compat.py)
+keeps the common marker table valid, while
+`test_streaming_guard_reassembles_accepted_marker_variants` in
+[`tests/test_proxy.py`](/home/tim/projects/opencode-proxy/tests/test_proxy.py)
+exercises the production buffering path.
 
 `normalize_raw_tool_markup` folds every variant into the canonical DSML shape
 before parsing, so the parser has one grammar to handle rather than five. The
@@ -42,6 +52,10 @@ grammar, including a close tag that drops the backslashes
 sign (`name = "bash"`). DeepSeek-V4's reference encoding
 (`encoding/encoding_dsv4.py`) uses exactly the U+FF5C delimiter and `string="true|false"`
 parameter attribute, both already handled.
+
+Qwen openers may carry trailing whitespace or attributes (`<tool_calls >`,
+`<tool_call name="…">`); the same forms are normalized and parsed rather than
+being accepted by block detection and then passed through as raw text.
 
 Fixtures for each format: [`/home/tim/projects/opencode-proxy/tests/fixtures/tool_calls`](/home/tim/projects/opencode-proxy/tests/fixtures/tool_calls).
 Add a fixture and a test before changing parser behaviour.
@@ -65,7 +79,10 @@ frame boundary is still detectable. Per scanned field, the state machine is:
 
 A block that never closes, or exceeds `MAX_RAW_TOOL_BLOCK_CHARS`, or fails to
 parse, or breaches `MAX_TOOL_CALLS` / `MAX_TOOL_ARGUMENT_CHARS`, is emitted as
-plain text. The proxy degrades to a passthrough rather than dropping content.
+plain text. Standard streamed tool-call arguments are also accumulated only for
+valid indexes, up to those same call and argument limits; an over-limit or
+malformed call is passed through without a guessed repair. The proxy degrades
+to a passthrough rather than dropping content.
 
 ## Scanned fields and reasoning order
 
@@ -93,5 +110,26 @@ blocks in one response, and `raw_tool_calls_emitted` forces the terminal
 that sees `stop` will not execute the tools it was just handed.
 
 Responses that already contain standard `tool_calls` are passed through
-untouched. Repair only engages when the field is missing and the markup is in
-the text.
+unchanged when their IDs are valid. An otherwise valid buffered call without an
+ID receives a distinct synthetic ID. Streaming keeps one ID per choice/tool
+index and reuses it on every fragment; valid upstream IDs always win.
+
+## Temporary DeepSeek V4 orphan fallback
+
+vLLM issue/PR
+[#49117](https://github.com/vllm-project/vllm/pull/49117) describes V4
+occasionally emitting a canonical `<｜DSML｜invoke ...>` without its outer
+`tool_calls` wrapper. That shape cannot enter the general raw-block parser,
+because accepting wrapperless dialect fragments globally would turn quoted
+markup and prose into tool execution.
+
+The YAML-only `deepseek_v4` model profile enables a request-aware fallback. It
+scans `content` only, requires declared function tools and `tool_choice !=
+"none"`, accepts only the fullwidth-bar V4 dialect before any non-whitespace
+content, and requires an exact declared-tool name. Partial, malformed,
+oversized, undeclared, quoted/prose, reasoning-field, and foreign-dialect candidates stay text
+byte-for-byte. Trailing prose remains in `content`.
+
+Remove `recover_orphan_invokes: true` after the pinned vLLM image passes the
+[live capability probe](../runbooks/deepseek-v4.md). The profile may remain with
+the flag false as an explicit record of the upstream contract.

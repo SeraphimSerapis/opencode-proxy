@@ -49,9 +49,11 @@ def load_config_file(path: str | Path) -> dict[str, Any]:
         raise ValueError(msg)
 
     values: dict[str, Any] = {}
-    aliases = _parse_models_section(document.get("models"), config_path)
+    aliases, compatibility = _parse_models_section(document.get("models"), config_path)
     if aliases:
         values["model_aliases"] = aliases
+    if compatibility:
+        values["model_compatibility"] = compatibility
     routes = document.get("routes")
     if routes:
         values["modality_routes"] = routes
@@ -65,15 +67,19 @@ def load_config_file(path: str | Path) -> dict[str, Any]:
     return values
 
 
-def _parse_models_section(models: object, config_path: Path) -> dict[str, str]:
-    """Flatten ``models: {target: {aliases: [...]}}`` into ``{alias: target}``."""
+def _parse_models_section(
+    models: object,
+    config_path: Path,
+) -> tuple[dict[str, str], dict[str, dict[str, object]]]:
+    """Flatten aliases and retain opt-in compatibility settings by target model."""
     if models is None:
-        return {}
+        return {}, {}
     if not isinstance(models, dict):
         msg = f"{config_path}: 'models' must be a mapping of upstream model to settings"
         raise ValueError(msg)
 
     aliases: dict[str, str] = {}
+    compatibility: dict[str, dict[str, object]] = {}
     for raw_target, entry in models.items():
         target = str(raw_target).strip()
         if not target:
@@ -83,7 +89,11 @@ def _parse_models_section(models: object, config_path: Path) -> dict[str, str]:
         if isinstance(entry, list):
             raw_aliases: list[Any] = entry
         elif isinstance(entry, dict):
-            unknown = set(entry) - {"aliases"}
+            unknown = set(entry) - {
+                "aliases",
+                "compatibility",
+                "recover_orphan_invokes",
+            }
             if unknown:
                 msg = f"{config_path}: unsupported keys for model {target!r}: {sorted(unknown)}"
                 raise ValueError(msg)
@@ -91,6 +101,22 @@ def _parse_models_section(models: object, config_path: Path) -> dict[str, str]:
             if not isinstance(raw_aliases, list):
                 msg = f"{config_path}: 'aliases' for model {target!r} must be a list"
                 raise ValueError(msg)
+            raw_profile = entry.get("compatibility")
+            recover_orphans = entry.get("recover_orphan_invokes", False)
+            if raw_profile is not None or "recover_orphan_invokes" in entry:
+                if raw_profile != "deepseek_v4":
+                    msg = f"{config_path}: compatibility for model {target!r} must be 'deepseek_v4'"
+                    raise ValueError(msg)
+                if not isinstance(recover_orphans, bool):
+                    msg = (
+                        f"{config_path}: 'recover_orphan_invokes' for model "
+                        f"{target!r} must be a boolean"
+                    )
+                    raise ValueError(msg)
+                compatibility[target] = {
+                    "compatibility": raw_profile,
+                    "recover_orphan_invokes": recover_orphans,
+                }
         elif entry is None:
             raw_aliases = []
         else:
@@ -109,4 +135,4 @@ def _parse_models_section(models: object, config_path: Path) -> dict[str, str]:
                 )
                 raise ValueError(msg)
             aliases[alias] = target
-    return aliases
+    return aliases, compatibility

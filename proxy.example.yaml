@@ -9,6 +9,10 @@ models:
     aliases:
       - dsv4-flash
       - DeepSeek-V4-Flash
+    # Temporary vLLM #49117 fallback. Remove or set false after the live probe
+    # passes against the pinned image digest.
+    compatibility: deepseek_v4
+    recover_orphan_invokes: true
   # shorthand when a model only needs aliases
   gemma-4-e4b: [gemma]
 

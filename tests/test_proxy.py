@@ -242,6 +242,116 @@ async def test_streaming_sse_comments_multiline_data_and_duplicate_done() -> Non
 
 
 @respx.mock
+async def test_streaming_duplicate_terminal_choice_is_ignored() -> None:
+    frames = [
+        {
+            "id": "chatcmpl-duplicate-finish",
+            "object": "chat.completion.chunk",
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {"content": "before"}, "finish_reason": None}],
+        },
+        {
+            "id": "chatcmpl-duplicate-finish",
+            "object": "chat.completion.chunk",
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        },
+        {
+            "id": "chatcmpl-duplicate-finish",
+            "object": "chat.completion.chunk",
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        },
+        {
+            "id": "chatcmpl-duplicate-finish",
+            "object": "chat.completion.chunk",
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {"content": "after"}, "finish_reason": None}],
+        },
+    ]
+    sse = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames)
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=(sse + "data: [DONE]\n\n").encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen", "stream": True, "messages": []},
+        )
+
+    assert collect_content(_stream_payloads(response)) == "before"
+    assert _finish_reasons(response) == ["stop"]
+    assert response.text.count("data: [DONE]") == 1
+
+
+@respx.mock
+async def test_streaming_terminal_state_is_independent_per_choice() -> None:
+    frames = [
+        {
+            "id": "chatcmpl-choice-terminals",
+            "object": "chat.completion.chunk",
+            "model": "qwen",
+            "choices": [
+                {"index": 0, "delta": {"content": "zero"}, "finish_reason": None},
+                {"index": 1, "delta": {"content": "one"}, "finish_reason": None},
+            ],
+        },
+        {
+            "id": "chatcmpl-choice-terminals",
+            "object": "chat.completion.chunk",
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        },
+        {
+            "id": "chatcmpl-choice-terminals",
+            "object": "chat.completion.chunk",
+            "model": "qwen",
+            "choices": [
+                {"index": 0, "delta": {}, "finish_reason": "stop"},
+                {"index": 1, "delta": {"content": "-continued"}, "finish_reason": None},
+            ],
+        },
+        {
+            "id": "chatcmpl-choice-terminals",
+            "object": "chat.completion.chunk",
+            "model": "qwen",
+            "choices": [{"index": 1, "delta": {}, "finish_reason": "stop"}],
+        },
+    ]
+    sse = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames)
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=(sse + "data: [DONE]\n\n").encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen", "stream": True, "messages": []},
+        )
+
+    content_by_index: dict[int, str] = {}
+    finish_indexes: list[int] = []
+    for payload in _stream_payloads(response):
+        for choice in payload.get("choices") or []:
+            index = choice["index"]
+            delta = choice.get("delta") or {}
+            content_by_index[index] = content_by_index.get(index, "") + delta.get("content", "")
+            if choice.get("finish_reason"):
+                finish_indexes.append(index)
+    assert content_by_index == {0: "zero", 1: "one-continued"}
+    assert finish_indexes == [0, 1]
+
+
+@respx.mock
 async def test_streaming_non_sse_response_passes_through() -> None:
     respx.post("http://upstream.test/v1/chat/completions").mock(
         return_value=httpx.Response(
@@ -936,6 +1046,17 @@ def _accumulated_tool_arguments(response: httpx.Response) -> str:
     return arguments
 
 
+def _accumulated_tool_arguments_by_index(response: httpx.Response) -> dict[int, str]:
+    arguments: dict[int, str] = {}
+    for payload in _stream_payloads(response):
+        for choice in payload.get("choices") or []:
+            for tool_call in (choice.get("delta") or {}).get("tool_calls") or []:
+                index = tool_call.get("index", 0)
+                fragment = (tool_call.get("function") or {}).get("arguments") or ""
+                arguments[index] = arguments.get(index, "") + fragment
+    return arguments
+
+
 @respx.mock
 @pytest.mark.parametrize("finish_with_last", [False, True])
 async def test_streaming_truncated_tool_arguments_are_completed(finish_with_last: bool) -> None:
@@ -988,6 +1109,246 @@ async def test_streaming_valid_tool_arguments_are_left_alone() -> None:
 
 
 @respx.mock
+async def test_streaming_tool_argument_repair_precedes_finish_without_delta() -> None:
+    frames = [
+        {
+            "id": "chatcmpl-null-delta",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "id": "call_abc",
+                                "index": 0,
+                                "type": "function",
+                                "function": {"name": "grep", "arguments": ""},
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl-null-delta",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"tool_calls": [{"index": 0, "function": {"arguments": '{"a": '}}]},
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl-null-delta",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [{"index": 0, "finish_reason": "tool_calls"}],
+        },
+    ]
+    sse = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames)
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=(sse + "data: [DONE]\n\n").encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    payloads = _stream_payloads(response)
+    repair_position = next(
+        position
+        for position, payload in enumerate(payloads)
+        if (payload["choices"][0]["delta"].get("tool_calls"))
+        and payload["choices"][0]["delta"]["tool_calls"][0]["function"].get("arguments") == "null}"
+    )
+    finish_position = next(
+        position
+        for position, payload in enumerate(payloads)
+        if payload["choices"][0].get("finish_reason") == "tool_calls"
+    )
+    assert repair_position < finish_position
+    assert json.loads(_accumulated_tool_arguments(response)) == {"a": None}
+
+
+@respx.mock
+async def test_streaming_tool_argument_repair_ignores_invalid_tool_index() -> None:
+    frames = [
+        {
+            "id": "chatcmpl-invalid-index",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "id": "call_abc",
+                                "type": "function",
+                                "function": {"name": "grep", "arguments": '{"a": '},
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl-invalid-index",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+        },
+    ]
+    sse = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames)
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=(sse + "data: [DONE]\n\n").encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    assert _accumulated_tool_arguments(response) == '{"a": '
+
+
+@respx.mock
+async def test_streaming_multiple_tool_argument_repairs_keep_indexes_separate() -> None:
+    frames = [
+        {
+            "id": "chatcmpl-multi-args",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "id": "call_a",
+                                "index": 0,
+                                "type": "function",
+                                "function": {"name": "read", "arguments": ""},
+                            },
+                            {
+                                "id": "call_b",
+                                "index": 1,
+                                "type": "function",
+                                "function": {"name": "write", "arguments": ""},
+                            },
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl-multi-args",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "function": {"arguments": '{"path": '}},
+                            {"index": 1, "function": {"arguments": '{"content": "hi'}},
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl-multi-args",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+        },
+    ]
+    sse = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames)
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=(sse + "data: [DONE]\n\n").encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    arguments = _accumulated_tool_arguments_by_index(response)
+    assert json.loads(arguments[0]) == {"path": None}
+    assert json.loads(arguments[1]) == {"content": "hi"}
+    assert _finish_reasons(response) == ["tool_calls"]
+
+
+@respx.mock
+async def test_streaming_standard_tool_call_without_finish_uses_tool_calls_reason() -> None:
+    frames = [
+        {
+            "id": "chatcmpl-standard-no-finish",
+            "object": "chat.completion.chunk",
+            "model": "qwen",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "id": "call_abc",
+                                "index": 0,
+                                "type": "function",
+                                "function": {"name": "read", "arguments": "{}"},
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+    ]
+    sse = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames)
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=(sse + "data: [DONE]\n\n").encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen", "stream": True, "messages": []},
+        )
+
+    assert _finish_reasons(response) == ["tool_calls"]
+
+
+@respx.mock
 async def test_streaming_unrepairable_tool_arguments_are_not_guessed() -> None:
     """Refuse to invent a completion; a wrong repair is worse than none."""
     respx.post("http://upstream.test/v1/chat/completions").mock(
@@ -1006,6 +1367,99 @@ async def test_streaming_unrepairable_tool_arguments_are_not_guessed() -> None:
 
     assert _accumulated_tool_arguments(response) == '{"a": 1, '
     assert response.text.count("data: [DONE]") == 1
+
+
+@respx.mock
+async def test_streaming_tool_argument_repair_buffer_respects_argument_limit() -> None:
+    original = '{"a": 1, '
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=_tool_arg_frames([original]),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        max_tool_argument_chars=4,
+    )
+
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    # The original delta is still transparent, but the repair accumulator must
+    # stop retaining it once the configured bound is exceeded.
+    assert _accumulated_tool_arguments(response) == original
+    assert response.text.count("data: [DONE]") == 1
+
+
+@respx.mock
+async def test_streaming_tool_argument_repair_buffer_respects_tool_call_limit() -> None:
+    frames = [
+        {
+            "id": "chatcmpl-call-limit",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "function": {"arguments": ""}},
+                            {"index": 1, "function": {"arguments": ""}},
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl-call-limit",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "function": {"arguments": '{"a": '}},
+                            {"index": 1, "function": {"arguments": '{"b": '}},
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl-call-limit",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+        },
+    ]
+    sse = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames)
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=(sse + "data: [DONE]\n\n").encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+    settings = Settings(upstream_url="http://upstream.test", max_tool_calls=1)
+
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    arguments = _accumulated_tool_arguments_by_index(response)
+    assert json.loads(arguments[0]) == {"a": None}
+    assert arguments[1] == '{"b": '
+    assert _finish_reasons(response) == ["tool_calls"]
 
 
 @respx.mock
@@ -1054,6 +1508,71 @@ async def test_streaming_empty_reasoning_only_turn_gets_a_notice() -> None:
     content = collect_content(_stream_payloads(response))
     assert "proxy:" in content
     assert _finish_reasons(response) == ["length"]
+    assert response.text.count("data: [DONE]") == 1
+    payloads = _stream_payloads(response)
+    notice_position = next(
+        position
+        for position, payload in enumerate(payloads)
+        if "proxy:" in (payload["choices"][0]["delta"].get("content") or "")
+    )
+    finish_position = next(
+        position
+        for position, payload in enumerate(payloads)
+        if payload["choices"][0].get("finish_reason")
+    )
+    assert notice_position < finish_position
+
+
+@respx.mock
+async def test_streaming_empty_done_without_a_choice_gets_a_notice() -> None:
+    body = (
+        b'data: {"id":"chatcmpl-empty","object":"chat.completion.chunk",'
+        b'"model":"deepseek-v4","choices":[]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=body,
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    assert "proxy:" in collect_content(_stream_payloads(response))
+    assert _finish_reasons(response) == ["stop"]
+    assert response.text.count("data: [DONE]") == 1
+
+
+@respx.mock
+async def test_streaming_empty_turn_notice_can_be_disabled() -> None:
+    body = (
+        b'data: {"id":"chatcmpl-empty","object":"chat.completion.chunk",'
+        b'"model":"deepseek-v4","choices":[]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=body,
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    settings = Settings(upstream_url="http://upstream.test", empty_turn_notice="")
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    assert "proxy:" not in response.text
+    assert _finish_reasons(response) == []
     assert response.text.count("data: [DONE]") == 1
 
 
@@ -1607,6 +2126,62 @@ async def test_streaming_multiple_tool_calls_converted() -> None:
     assert "read" in tool_names
     assert "write" in tool_names
     assert lines[-1] == "data: [DONE]"
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("opener", "closer"),
+    [
+        ("<DSML:tool_calls>", "</DSML:tool_calls>"),
+        ("<DSML tool_calls>", "</DSML tool_calls>"),
+        ("<tool_calls >", "</tool_calls >"),
+        ('<tool_call name="ignored">', "</tool_call >"),
+    ],
+)
+async def test_streaming_guard_reassembles_accepted_marker_variants(
+    opener: str,
+    closer: str,
+) -> None:
+    block = opener + '<name>read</name><parameters>{"path":"a"}</parameters>' + closer
+    split = max(1, len(opener) - 2)
+    chunks = [
+        {
+            "id": "chatcmpl-marker-variant",
+            "object": "chat.completion.chunk",
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {"content": block[:split]}}],
+        },
+        {
+            "id": "chatcmpl-marker-variant",
+            "object": "chat.completion.chunk",
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {"content": block[split:]}}],
+        },
+    ]
+    sse = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=(sse + "data: [DONE]\n\n").encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen", "stream": True, "messages": []},
+        )
+
+    assert opener not in response.text
+    assert closer not in response.text
+    tool_names = [
+        tool_call["function"]["name"]
+        for payload in _stream_payloads(response)
+        for tool_call in payload["choices"][0]["delta"].get("tool_calls", [])
+        if "name" in tool_call.get("function", {})
+    ]
+    assert tool_names == ["read"]
 
 
 @respx.mock

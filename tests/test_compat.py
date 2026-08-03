@@ -88,6 +88,30 @@ def test_parse_degraded_dsml_close_tag_and_spaced_equals() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("content", "expected_name"),
+    [
+        (
+            "<tool_calls ><name>read</name><parameters>{}</parameters></tool_calls >",
+            "read",
+        ),
+        (
+            '<tool_call name="ignored"><name>write</name>'
+            '<parameters>{"path":"a"}</parameters></tool_call>',
+            "write",
+        ),
+    ],
+)
+def test_parser_handles_all_qwen_openers_accepted_by_block_grammar(
+    content: str,
+    expected_name: str,
+) -> None:
+    tool_calls = parse_raw_tool_calls(content)
+
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == expected_name
+
+
 DEGRADED_OPENERS = (
     "<DSML>tool_calls>",
     "<DSML: tool_calls>",
@@ -97,36 +121,26 @@ DEGRADED_OPENERS = (
 
 
 @pytest.mark.parametrize("opener", DEGRADED_OPENERS)
-def test_degraded_opener_is_held_back_when_split_across_tokens(opener: str) -> None:
-    """The streaming guard must buffer a degraded opener that arrives in pieces.
-
-    Without this the first half is flushed as content and the block can never be
-    reassembled, so the tool call reaches the client as raw markup.
-    """
+def test_raw_tool_prefix_recognizes_split_degraded_openers(opener: str) -> None:
+    """The standalone prefix helper recognizes each enumerated opener."""
     for split in range(4, len(opener)):
         assert has_raw_tool_prefix("some text " + opener[:split]), opener[:split]
     assert has_raw_tool_prefix("some text " + opener)
 
 
-def test_block_grammar_and_streaming_guard_agree() -> None:
-    """Keep the block grammar and the streaming guard from drifting apart.
-
-    ``RAW_TOOL_BLOCK_PATTERNS`` decides what parses; ``RAW_TOOL_START_MARKERS``
-    decides what streaming holds back while a marker is still arriving. An
-    opener in the first but not the second parses fine in a buffered response
-    and corrupts in a streamed one, which is the harder bug to spot.
-    """
+def test_block_grammar_and_common_marker_table_agree() -> None:
+    """Every enumerated prefix-helper marker is also a complete block opener."""
     for opener in DEGRADED_OPENERS:
         assert any(p.fullmatch(opener) for p, _ in RAW_TOOL_BLOCK_PATTERNS), (
             f"{opener!r} is not accepted by the block grammar"
         )
         assert opener in RAW_TOOL_START_MARKERS, (
-            f"{opener!r} parses but streaming will not buffer it"
+            f"{opener!r} parses but is missing from the common marker table"
         )
 
     for marker in RAW_TOOL_START_MARKERS:
         assert any(p.fullmatch(marker) for p, _ in RAW_TOOL_BLOCK_PATTERNS), (
-            f"{marker!r} is buffered by streaming but never parses"
+            f"{marker!r} is recognized as a prefix but never parses"
         )
 
 
@@ -151,6 +165,10 @@ def test_complete_truncated_json_repairs_by_appending(truncated: str, expected: 
 
 def test_complete_truncated_json_returns_empty_suffix_when_already_valid() -> None:
     assert complete_truncated_json('{"a": 1}') == ""
+
+
+def test_complete_truncated_json_handles_deep_nesting_without_raising() -> None:
+    assert complete_truncated_json("[" * 10_000) is None
 
 
 @pytest.mark.parametrize(

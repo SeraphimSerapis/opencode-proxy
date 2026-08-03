@@ -8,10 +8,11 @@ from typing import TYPE_CHECKING
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from opencode_proxy import __version__
 from opencode_proxy.concurrency import UpstreamConcurrencyLimiter
+from opencode_proxy.metrics import ProxyMetrics
 from opencode_proxy.ollama import build_ollama_router
 from opencode_proxy.proxy import MODELS_PATH, build_router, create_upstream_client
 from opencode_proxy.settings import Settings
@@ -57,6 +58,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.upstream_client = upstream_client
     app.state.upstream_limiter = upstream_limiter
     app.state.settings = settings
+    app.state.metrics = ProxyMetrics.create()
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -69,6 +71,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/healthz/config")
     async def healthz_config() -> dict[str, object]:
         return settings.safe_config
+
+    @app.get("/metrics")
+    async def metrics(request: Request) -> Response:
+        payload, content_type = request.app.state.metrics.render()
+        return Response(content=payload, headers={"Content-Type": content_type})
 
     # Register Ollama routes before the OpenAI catch-all route so /api/* paths
     # are handled by the native compatibility adapter rather than passthrough.
