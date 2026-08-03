@@ -2779,6 +2779,69 @@ async def test_streaming_adjacent_raw_blocks_use_distinct_tool_indexes() -> None
 
 
 @respx.mock
+async def test_streaming_close_tag_split_mid_buffer_is_converted() -> None:
+    """A close tag whose `</` lands mid-frame must still complete the block.
+
+    Observed against real vLLM: the close tag streams as `</|DSML|tool_c` then
+    `alls>`, so `</` is several characters before the frame boundary. The guard
+    must re-parse whenever any close-tag start is held, not only when `</`
+    straddles the boundary.
+    """
+    block = (
+        "<|DSML|tool_calls><name>read</name>"
+        '<parameters>{"path":"a"}</parameters></|DSML|tool_calls>'
+    )
+    # First frame ends with `</|DSML|tool_c`; the completing `alls>` arrives alone.
+    split = len(block) - 5
+    frames = [
+        {
+            "id": "chatcmpl-split-close",
+            "object": "chat.completion.chunk",
+            "model": "deepseek",
+            "choices": [{"index": 0, "delta": {"content": block[:split]}, "finish_reason": None}],
+        },
+        {
+            "id": "chatcmpl-split-close",
+            "object": "chat.completion.chunk",
+            "model": "deepseek",
+            "choices": [{"index": 0, "delta": {"content": block[split:]}, "finish_reason": None}],
+        },
+        {
+            "id": "chatcmpl-split-close",
+            "object": "chat.completion.chunk",
+            "model": "deepseek",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        },
+    ]
+    sse = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames) + "data: [DONE]\n\n"
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200, content=sse.encode(), headers={"content-type": "text/event-stream"}
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek", "stream": True, "messages": []},
+        )
+
+    payloads = _stream_payloads(response)
+    leaked = "".join(
+        payload["choices"][0]["delta"].get("content", "") or "" for payload in payloads
+    )
+    assert leaked == ""
+    named = [
+        tool_call
+        for payload in payloads
+        for tool_call in payload["choices"][0]["delta"].get("tool_calls", [])
+        if "name" in tool_call.get("function", {})
+    ]
+    assert [(call["function"]["name"], call["index"]) for call in named] == [("read", 0)]
+    assert _finish_reasons(response) == ["tool_calls"]
+
+
+@respx.mock
 async def test_compressed_chat_response_drops_stale_content_headers() -> None:
     payload = json.dumps({"id": "chatcmpl-gzip", "choices": []}).encode()
     respx.post("http://upstream.test/v1/chat/completions").mock(

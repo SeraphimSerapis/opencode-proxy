@@ -1207,7 +1207,7 @@ def _process_stream_field_text(
     previous_buffer = state.field_buffers.get(field_name, "")
     state.field_buffers[field_name] = previous_buffer + text
 
-    if field_name in state.pending_raw_fields and "</" not in previous_buffer[-2:] + text:
+    if field_name in state.pending_raw_fields and "</" not in state.field_buffers[field_name]:
         if len(state.field_buffers[field_name]) > settings.max_raw_tool_block_chars:
             LOG.warning(
                 "incomplete raw tool-call block exceeded max size; passing through as text",

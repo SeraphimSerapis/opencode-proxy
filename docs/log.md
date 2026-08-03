@@ -1,5 +1,16 @@
 # Documentation Update Log
 
+## 2026-08-03 (4)
+
+* **Fix**: A raw tool block whose close tag splits so `</` lands mid-frame is
+  no longer stranded as pending text. The streaming guard now re-parses
+  whenever the held buffer contains any close-tag start, not only at a frame
+  boundary — vLLM streams the close tag as `</|DSML|tool_c` then `alls>`.
+  Previously the completed block was flushed as visible markup at the end of
+  the turn, so the client rendered DSML prose instead of executing the call.
+  Found and validated against the live vLLM host; see
+  [tool-call repair](architecture/tool-call-repair.md).
+
 ## 2026-08-03 (3)
 
 * **Feature**: Added an explicit YAML `deepseek_v4` compatibility profile and a

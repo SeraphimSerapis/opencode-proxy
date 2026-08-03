@@ -77,6 +77,12 @@ frame boundary is still detectable. Per scanned field, the state machine is:
    everything from the opener onward.
 3. **Neither** — release all but the last `STREAM_GUARD_CHARS` characters.
 
+A pending field is re-parsed as soon as the held buffer contains any
+close-tag start (`</`), not only when it straddles the incoming frame
+boundary. vLLM streams the DSML close tag as `</|DSML|tool_c` then `alls>`,
+so the completing text arrives without a `</` of its own; checking the whole
+held buffer keeps the block repairable across that boundary.
+
 A block that never closes, or exceeds `MAX_RAW_TOOL_BLOCK_CHARS`, or fails to
 parse, or breaches `MAX_TOOL_CALLS` / `MAX_TOOL_ARGUMENT_CHARS`, is emitted as
 plain text. Standard streamed tool-call arguments are also accumulated only for
