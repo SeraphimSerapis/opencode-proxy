@@ -24,11 +24,15 @@ DSML_PARAMETER_CLOSE = f"</{FULLWIDTH_BAR}DSML{FULLWIDTH_BAR}parameter>"
 DSML_DEGRADED_OPEN = r"<DSML(?:>\s*|:\s*|\s+)tool_calls\s*>"
 DSML_DEGRADED_CLOSE = r"</DSML(?:>\s*|:\s*|\s+)tool_calls\s*>"
 
+# Every degraded opener the block patterns accept must also appear here, or the
+# streaming guard will not hold back a marker that arrives split across tokens.
 RAW_TOOL_START_MARKERS = (
     DSML_OPEN,
     "<|DSML|tool_calls>",
     "<DSML>tool_calls>",
     "<DSML: tool_calls>",
+    "<DSML:tool_calls>",
+    "<DSML tool_calls>",
     "<tool_calls>",
     "<tool_call>",
 )
@@ -392,6 +396,75 @@ def tool_calls_within_limits(
     return True
 
 
+def complete_truncated_json(text: str) -> str | None:
+    """Return the suffix that turns truncated JSON into a valid document.
+
+    Upstreams sometimes close a turn with ``finish_reason: "tool_calls"`` while
+    the streamed ``arguments`` are cut off mid-value, which leaves the client
+    holding a tool call it cannot execute. Deltas already sent cannot be
+    retracted, so a repair has to be expressible as an *append*.
+
+    Returns ``""`` when ``text`` already parses, the completing suffix when one
+    exists, and ``None`` when the truncation cannot be repaired by appending
+    (a dangling ``,`` or an empty fragment). The result is always verified with
+    ``json.loads`` before it is returned, so a non-``None`` return is a promise
+    that ``text + suffix`` parses.
+    """
+    if not text.strip():
+        return None
+
+    try:
+        json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    else:
+        return ""
+
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char in "}]" and stack:
+            stack.pop()
+
+    suffix = ""
+    if in_string:
+        # A trailing backslash is a half-written escape; completing it as an
+        # escaped backslash is the only single-character reading that keeps the
+        # value a string.
+        if escaped:
+            suffix += "\\"
+        suffix += '"'
+
+    tail = (text + suffix).rstrip()
+    if tail.endswith(":"):
+        suffix += "null"
+    elif tail.endswith(","):
+        # Removing the comma would mean rewriting bytes the client already has.
+        return None
+
+    for opener in reversed(stack):
+        suffix += "}" if opener == "{" else "]"
+
+    try:
+        json.loads(text + suffix)
+    except (json.JSONDecodeError, RecursionError):
+        return None
+    return suffix
+
+
 def strip_empty_tool_calls(delta: JsonObject) -> JsonObject:
     tool_calls = delta.get("tool_calls")
     if tool_calls == []:
@@ -469,6 +542,47 @@ def build_tool_call_chunks(
             ),
         )
     return chunks
+
+
+def make_content_chunk(
+    *,
+    chunk_id: str,
+    model: str,
+    content: str,
+    choice_index: int = 0,
+) -> ChatCompletionChunk:
+    return _make_chunk(
+        chunk_id=chunk_id,
+        model=model,
+        delta={"content": content},
+        finish_reason=None,
+        choice_index=choice_index,
+    )
+
+
+def make_tool_argument_repair_chunk(
+    *,
+    chunk_id: str,
+    model: str,
+    tool_index: int,
+    suffix: str,
+    choice_index: int = 0,
+) -> ChatCompletionChunk:
+    """Build the delta that completes truncated streamed tool ``arguments``."""
+    return _make_chunk(
+        chunk_id=chunk_id,
+        model=model,
+        delta={
+            "tool_calls": [
+                {
+                    "index": tool_index,
+                    "function": {"arguments": suffix},
+                },
+            ],
+        },
+        finish_reason=None,
+        choice_index=choice_index,
+    )
 
 
 def make_finish_chunk(

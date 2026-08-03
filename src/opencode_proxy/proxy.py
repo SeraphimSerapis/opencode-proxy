@@ -20,10 +20,13 @@ from starlette.background import BackgroundTask
 from opencode_proxy.compat import (
     JsonObject,
     build_tool_call_chunks,
+    complete_truncated_json,
     convert_chat_completion_response,
     find_complete_raw_tool_block_span,
     find_raw_tool_start,
+    make_content_chunk,
     make_finish_chunk,
+    make_tool_argument_repair_chunk,
     parse_raw_tool_calls,
     strip_empty_tool_calls,
     tool_calls_within_limits,
@@ -81,6 +84,11 @@ class StreamChoiceState:
     raw_tool_calls_emitted: bool = False
     finish_sent: bool = False
     next_tool_call_index: int = 0
+    # Streamed ``arguments`` fragments per upstream tool-call index, kept so a
+    # truncated JSON payload can be completed before the turn closes.
+    tool_call_arguments: dict[int, str] = field(default_factory=dict)
+    emitted_content: bool = False
+    emitted_tool_calls: bool = False
 
 
 @dataclass(frozen=True)
@@ -448,6 +456,7 @@ async def _rewrite_sse_stream(
                     choice_states,
                     chunk_id=chunk_id,
                     model=model,
+                    empty_turn_notice=settings.empty_turn_notice,
                 ):
                     yield done_payload
                 return
@@ -492,12 +501,22 @@ async def _rewrite_sse_stream(
         )
         # The response is already 200/SSE, so it cannot become an HTTP error.
         # The default ``length`` finish truthfully marks the partial turn truncated.
+    except Exception:
+        # Once SSE headers are out the status is committed, so re-raising cannot
+        # produce an HTTP error - it only truncates the body and strands the
+        # client on an unterminated turn. Close the turn and log loudly instead.
+        LOG.exception(
+            "SSE rewrite failed; terminating the turn chunk_id=%s model=%s",
+            chunk_id,
+            model,
+        )
 
     async for done_payload in _finish_sse_stream(
         choice_states,
         chunk_id=chunk_id,
         model=model,
         fallback_finish_reason=fallback_finish_reason,
+        empty_turn_notice=settings.empty_turn_notice,
     ):
         yield done_payload
 
@@ -604,6 +623,7 @@ async def _finish_sse_stream(
     chunk_id: str,
     model: str,
     fallback_finish_reason: str | None = None,
+    empty_turn_notice: str = "",
 ) -> AsyncIterator[bytes]:
     state_items = sorted(choice_states.items())
     if fallback_finish_reason is not None and not state_items:
@@ -615,6 +635,21 @@ async def _finish_sse_stream(
             chunk_id=chunk_id,
             model=model,
             choice_index=choice_index,
+        ):
+            yield _encode_sse_json(payload)
+        for payload in _repair_tool_call_arguments(
+            state,
+            chunk_id=chunk_id,
+            model=model,
+            choice_index=choice_index,
+        ):
+            yield _encode_sse_json(payload)
+        for payload in _annotate_empty_turn(
+            state,
+            chunk_id=chunk_id,
+            model=model,
+            choice_index=choice_index,
+            notice=empty_turn_notice,
         ):
             yield _encode_sse_json(payload)
         if not state.finish_sent:
@@ -647,6 +682,9 @@ def _rewrite_stream_choice(
     choice_index = _choice_index(choice)
     outputs: list[JsonObject] = []
 
+    if isinstance(delta, dict) and isinstance(delta.get("content"), str) and delta["content"]:
+        state.emitted_content = True
+
     if not isinstance(delta, dict):
         outputs.extend(
             _flush_choice_buffers(
@@ -675,9 +713,35 @@ def _rewrite_stream_choice(
                 choice_index=choice_index,
             ),
         )
-        if finish_reason is not None:
-            state.finish_sent = True
-        outputs.append(_single_choice_event(event, choice))
+        state.emitted_tool_calls = True
+        _record_tool_call_arguments(state, delta["tool_calls"])
+        if finish_reason is None:
+            outputs.append(_single_choice_event(event, choice))
+            return outputs
+
+        # The same event carries the last argument fragment and the finish, so
+        # it has to be split: fragments, then the repair, then the terminator.
+        open_choice = {**choice, "finish_reason": None}
+        outputs.append({**event, "choices": [open_choice]})
+        outputs.extend(
+            _repair_tool_call_arguments(
+                state,
+                chunk_id=chunk_id,
+                model=model,
+                choice_index=choice_index,
+            ),
+        )
+        outputs.append(
+            _finish_payload(
+                event,
+                state,
+                finish_reason=finish_reason,
+                chunk_id=chunk_id,
+                model=model,
+                choice_index=choice_index,
+            ),
+        )
+        state.finish_sent = True
         return outputs
 
     scan_fields = settings.parsed_tool_call_scan_fields
@@ -745,23 +809,24 @@ def _rewrite_stream_choice(
                 choice_index=choice_index,
             ),
         )
-        finish_payload = cast(
-            "JsonObject",
-            make_finish_chunk(
+        outputs.extend(
+            _repair_tool_call_arguments(
+                state,
                 chunk_id=chunk_id,
                 model=model,
-                finish_reason=_finish_reason_for_state(finish_reason, state),
                 choice_index=choice_index,
             ),
         )
-        finish_payload.update(
-            {
-                key: value
-                for key, value in event.items()
-                if key not in {"choices", "id", "object", "model"}
-            }
+        outputs.append(
+            _finish_payload(
+                event,
+                state,
+                finish_reason=finish_reason,
+                chunk_id=chunk_id,
+                model=model,
+                choice_index=choice_index,
+            ),
         )
-        outputs.append(finish_payload)
         state.finish_sent = True
         emitted_any_delta = True
 
@@ -769,6 +834,152 @@ def _rewrite_stream_choice(
         outputs.append(_choice_delta_event(event, choice, {}, finish_reason=None))
 
     return outputs
+
+
+def _finish_payload(
+    event: JsonObject,
+    state: StreamChoiceState,
+    *,
+    finish_reason: object,
+    chunk_id: str,
+    model: str,
+    choice_index: int,
+) -> JsonObject:
+    """Build a terminal chunk, carrying over any extra upstream event fields."""
+    payload = cast(
+        "JsonObject",
+        make_finish_chunk(
+            chunk_id=chunk_id,
+            model=model,
+            finish_reason=_finish_reason_for_state(finish_reason, state),
+            choice_index=choice_index,
+        ),
+    )
+    payload.update(
+        {
+            key: value
+            for key, value in event.items()
+            if key not in {"choices", "id", "object", "model"}
+        }
+    )
+    return payload
+
+
+def _annotate_empty_turn(
+    state: StreamChoiceState,
+    *,
+    chunk_id: str,
+    model: str,
+    choice_index: int,
+    notice: str,
+) -> list[JsonObject]:
+    """Give the client something to act on when a turn produced nothing.
+
+    A reasoning model can spend its whole ``max_tokens`` budget thinking and
+    close the turn with no content and no tool calls. The stream is well formed,
+    but the agent driving it has nothing to render and nothing to execute, which
+    is indistinguishable from a hang. Always log it; optionally emit a short
+    proxy annotation so the turn is visibly a dead end rather than a silent one.
+    """
+    if state.emitted_content or state.emitted_tool_calls or state.raw_tool_calls_emitted:
+        return []
+
+    LOG.warning(
+        "upstream turn produced no content and no tool calls; "
+        "chunk_id=%s model=%s choice=%d upstream_finished=%s",
+        chunk_id,
+        model,
+        choice_index,
+        state.finish_sent,
+    )
+    # Only explain the turn when the upstream closed it itself. If the proxy is
+    # synthesising the terminator after a failure or an idle timeout, the turn
+    # is empty because the stream broke, and blaming the token budget would be
+    # wrong; the synthetic finish_reason already says it was truncated.
+    if not notice or not state.finish_sent:
+        return []
+    return [
+        cast(
+            "JsonObject",
+            make_content_chunk(
+                chunk_id=chunk_id,
+                model=model,
+                content=notice,
+                choice_index=choice_index,
+            ),
+        ),
+    ]
+
+
+def _record_tool_call_arguments(state: StreamChoiceState, tool_calls: object) -> None:
+    """Accumulate streamed ``arguments`` fragments per tool-call index."""
+    if not isinstance(tool_calls, list):
+        return
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            continue
+        function = tool_call.get("function")
+        if not isinstance(function, dict):
+            continue
+        arguments = function.get("arguments")
+        if not isinstance(arguments, str):
+            continue
+        index = tool_call.get("index")
+        index = index if isinstance(index, int) else 0
+        state.tool_call_arguments[index] = state.tool_call_arguments.get(index, "") + arguments
+
+
+def _repair_tool_call_arguments(
+    state: StreamChoiceState,
+    *,
+    chunk_id: str,
+    model: str,
+    choice_index: int,
+) -> list[JsonObject]:
+    """Complete any tool ``arguments`` the upstream truncated mid-value.
+
+    An upstream can close a turn with ``finish_reason: "tool_calls"`` while the
+    streamed JSON is cut off, handing the client a call it cannot execute and
+    that fails validation if the turn is ever replayed. Earlier deltas are
+    already on the wire, so the repair is appended as one final fragment.
+    """
+    repairs: list[JsonObject] = []
+    for tool_index, arguments in sorted(state.tool_call_arguments.items()):
+        suffix = complete_truncated_json(arguments)
+        if suffix is None:
+            LOG.error(
+                "upstream tool call has unrepairable arguments; "
+                "chunk_id=%s model=%s tool_index=%d arguments=%r",
+                chunk_id,
+                model,
+                tool_index,
+                arguments[:200],
+            )
+            continue
+        if not suffix:
+            continue
+        LOG.warning(
+            "completing truncated tool-call arguments; "
+            "chunk_id=%s model=%s tool_index=%d suffix=%r",
+            chunk_id,
+            model,
+            tool_index,
+            suffix,
+        )
+        repairs.append(
+            cast(
+                "JsonObject",
+                make_tool_argument_repair_chunk(
+                    chunk_id=chunk_id,
+                    model=model,
+                    tool_index=tool_index,
+                    suffix=suffix,
+                    choice_index=choice_index,
+                ),
+            ),
+        )
+    state.tool_call_arguments.clear()
+    return repairs
 
 
 def _process_stream_field_text(

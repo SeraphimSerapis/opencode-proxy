@@ -1,5 +1,11 @@
 # Documentation Update Log
 
+## 2026-08-03
+
+* **Fix**: Truncated streamed tool-call `arguments` are now completed before the turn closes, and turns that produce no content and no tool calls are logged and optionally annotated. Both were found by driving a real agentic tool loop against the deployed vLLM; both produce a perfectly well-formed stream that nonetheless strands an agent client, which is why the earlier termination work did not catch them. See [a terminated turn must also be a usable turn](decisions/turn-usability.md).
+* **Fix**: An exception of any type during SSE rewriting now terminates the turn instead of truncating the body. Once the 200/SSE headers are out the status is committed, so re-raising cannot produce an HTTP error — it only strands the client, which was the exact symptom being chased.
+* **Fix**: `RAW_TOOL_START_MARKERS` gained the two degraded openers the block grammar already accepted (`<DSML:tool_calls>`, `<DSML tool_calls>`). Streaming holds a marker back only if it matches this table, so an opener split across tokens was flushed as text and the block could never reassemble. A test now asserts the two tables agree in both directions.
+
 ## 2026-08-02
 
 * **Fix**: An upstream `httpx.TransportError` or EOF without `[DONE]` now ends as `finish_reason: "length"` plus `[DONE]`, including before the first upstream choice. This closes agent turns without presenting partial output as a successful `stop`; local proxy failures still propagate. The observed Pi incident remains attributed to upstream silence, bounded by `UPSTREAM_STREAM_IDLE_TIMEOUT`. See [always terminate a streamed turn](decisions/stream-termination.md).

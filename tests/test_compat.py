@@ -3,8 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from opencode_proxy.compat import (
+    RAW_TOOL_BLOCK_PATTERNS,
+    RAW_TOOL_START_MARKERS,
     build_tool_call_chunks,
+    complete_truncated_json,
     convert_chat_completion_response,
     extract_raw_tool_call_segments,
     find_raw_tool_start,
@@ -81,6 +86,84 @@ def test_parse_degraded_dsml_close_tag_and_spaced_equals() -> None:
         "cmd": "pwd",
         "count": 5,
     }
+
+
+DEGRADED_OPENERS = (
+    "<DSML>tool_calls>",
+    "<DSML: tool_calls>",
+    "<DSML:tool_calls>",
+    "<DSML tool_calls>",
+)
+
+
+@pytest.mark.parametrize("opener", DEGRADED_OPENERS)
+def test_degraded_opener_is_held_back_when_split_across_tokens(opener: str) -> None:
+    """The streaming guard must buffer a degraded opener that arrives in pieces.
+
+    Without this the first half is flushed as content and the block can never be
+    reassembled, so the tool call reaches the client as raw markup.
+    """
+    for split in range(4, len(opener)):
+        assert has_raw_tool_prefix("some text " + opener[:split]), opener[:split]
+    assert has_raw_tool_prefix("some text " + opener)
+
+
+def test_block_grammar_and_streaming_guard_agree() -> None:
+    """Keep the block grammar and the streaming guard from drifting apart.
+
+    ``RAW_TOOL_BLOCK_PATTERNS`` decides what parses; ``RAW_TOOL_START_MARKERS``
+    decides what streaming holds back while a marker is still arriving. An
+    opener in the first but not the second parses fine in a buffered response
+    and corrupts in a streamed one, which is the harder bug to spot.
+    """
+    for opener in DEGRADED_OPENERS:
+        assert any(p.fullmatch(opener) for p, _ in RAW_TOOL_BLOCK_PATTERNS), (
+            f"{opener!r} is not accepted by the block grammar"
+        )
+        assert opener in RAW_TOOL_START_MARKERS, (
+            f"{opener!r} parses but streaming will not buffer it"
+        )
+
+    for marker in RAW_TOOL_START_MARKERS:
+        assert any(p.fullmatch(marker) for p, _ in RAW_TOOL_BLOCK_PATTERNS), (
+            f"{marker!r} is buffered by streaming but never parses"
+        )
+
+
+@pytest.mark.parametrize(
+    ("truncated", "expected"),
+    [
+        # The exact shapes observed from vLLM closing a turn mid-arguments.
+        ('{"pattern": "def main|uvicorn|FastAPI', {"pattern": "def main|uvicorn|FastAPI"}),
+        ('{"path": "src/opencode_proxy/proxy.py', {"path": "src/opencode_proxy/proxy.py"}),
+        ('{"a": [1, 2', {"a": [1, 2]}),
+        ('{"a": {"b": "x', {"a": {"b": "x"}}),
+        ('{"a":', {"a": None}),
+        ('{"a": "x\\\\', {"a": "x\\"}),
+        ('{"a": "he said \\"hi', {"a": 'he said "hi'}),
+    ],
+)
+def test_complete_truncated_json_repairs_by_appending(truncated: str, expected: object) -> None:
+    suffix = complete_truncated_json(truncated)
+    assert suffix is not None
+    assert json.loads(truncated + suffix) == expected
+
+
+def test_complete_truncated_json_returns_empty_suffix_when_already_valid() -> None:
+    assert complete_truncated_json('{"a": 1}') == ""
+
+
+@pytest.mark.parametrize(
+    "unrepairable",
+    [
+        '{"a": 1, ',  # would need the trailing comma removed, not appended to
+        '{"a": tru',  # guessing the literal could invert the caller's intent
+        "",
+        "   ",
+    ],
+)
+def test_complete_truncated_json_refuses_what_it_cannot_append_to(unrepairable: str) -> None:
+    assert complete_truncated_json(unrepairable) is None
 
 
 def test_malformed_joined_dsml_marker_is_not_normalized() -> None:

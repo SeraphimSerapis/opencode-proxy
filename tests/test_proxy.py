@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
+import pytest
 import respx
 from conftest import collect_content
 
@@ -775,15 +776,16 @@ def _reasoning_chunk(field: str, text: str) -> dict[str, Any]:
 class _BoomStream(httpx.AsyncByteStream):
     """Yield one frame then raise, mimicking an upstream that dies mid-stream."""
 
-    def __init__(self, first: bytes) -> None:
+    def __init__(self, first: bytes, error: Exception | None = None) -> None:
         self.first = first
         self.sent = False
+        self.error = error or httpx.ReadError("connection reset by peer")
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         if not self.sent:
             self.sent = True
             yield self.first
-            raise httpx.ReadError("connection reset by peer")
+            raise self.error
         return
 
 
@@ -865,6 +867,301 @@ async def test_streaming_upstream_error_before_first_choice_ends_as_truncated() 
     payloads = _stream_payloads(response)
     assert len(payloads) == 1
     assert payloads[0]["choices"][0]["finish_reason"] == "length"
+
+
+def _tool_arg_frames(fragments: list[str], finish_with_last: bool = False) -> bytes:
+    """Build an upstream tool-call stream whose arguments arrive in fragments."""
+    frames = [
+        {
+            "id": "chatcmpl-trunc",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "id": "call_abc",
+                                "index": 0,
+                                "type": "function",
+                                "function": {"name": "grep", "arguments": ""},
+                            },
+                        ],
+                    },
+                    "finish_reason": None,
+                },
+            ],
+        },
+    ]
+    for position, fragment in enumerate(fragments):
+        last = position == len(fragments) - 1
+        frames.append(
+            {
+                "id": "chatcmpl-trunc",
+                "object": "chat.completion.chunk",
+                "model": "deepseek-v4",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "function": {"arguments": fragment}},
+                            ],
+                        },
+                        "finish_reason": "tool_calls" if (last and finish_with_last) else None,
+                    },
+                ],
+            },
+        )
+    if not finish_with_last:
+        frames.append(
+            {
+                "id": "chatcmpl-trunc",
+                "object": "chat.completion.chunk",
+                "model": "deepseek-v4",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            },
+        )
+    body = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames)
+    return (body + "data: [DONE]\n\n").encode()
+
+
+def _accumulated_tool_arguments(response: httpx.Response) -> str:
+    arguments = ""
+    for payload in _stream_payloads(response):
+        for choice in payload.get("choices") or []:
+            for tool_call in (choice.get("delta") or {}).get("tool_calls") or []:
+                arguments += (tool_call.get("function") or {}).get("arguments") or ""
+    return arguments
+
+
+@respx.mock
+@pytest.mark.parametrize("finish_with_last", [False, True])
+async def test_streaming_truncated_tool_arguments_are_completed(finish_with_last: bool) -> None:
+    """A turn that closes as ``tool_calls`` must carry parseable arguments.
+
+    Observed against vLLM: the upstream reports success while the streamed JSON
+    is cut off mid-string, so the client receives a call it cannot execute and
+    that fails validation when the history is replayed.
+    """
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=_tool_arg_frames(
+                ['{"pattern": "def ', "main|uvicorn|FastAPI"],
+                finish_with_last=finish_with_last,
+            ),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    assert _finish_reasons(response) == ["tool_calls"]
+    assert response.text.count("data: [DONE]") == 1
+    arguments = _accumulated_tool_arguments(response)
+    assert json.loads(arguments) == {"pattern": "def main|uvicorn|FastAPI"}
+
+
+@respx.mock
+async def test_streaming_valid_tool_arguments_are_left_alone() -> None:
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=_tool_arg_frames(['{"pattern": "def ', 'main"}']),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    assert _accumulated_tool_arguments(response) == '{"pattern": "def main"}'
+
+
+@respx.mock
+async def test_streaming_unrepairable_tool_arguments_are_not_guessed() -> None:
+    """Refuse to invent a completion; a wrong repair is worse than none."""
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=_tool_arg_frames(['{"a": 1, ']),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    assert _accumulated_tool_arguments(response) == '{"a": 1, '
+    assert response.text.count("data: [DONE]") == 1
+
+
+@respx.mock
+async def test_streaming_empty_reasoning_only_turn_gets_a_notice() -> None:
+    """A turn that spends its whole budget reasoning leaves the agent nothing.
+
+    The stream is well formed, but with no content and no tool call the client
+    has nothing to render and nothing to run, which looks exactly like a hang.
+    """
+    body = (
+        "data: "
+        + json.dumps(
+            {
+                "id": "chatcmpl-empty",
+                "object": "chat.completion.chunk",
+                "model": "deepseek-v4",
+                "choices": [
+                    {"index": 0, "delta": {"reasoning": "thinking hard..."}, "finish_reason": None},
+                ],
+            }
+        )
+        + "\n\ndata: "
+        + json.dumps(
+            {
+                "id": "chatcmpl-empty",
+                "object": "chat.completion.chunk",
+                "model": "deepseek-v4",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+            }
+        )
+        + "\n\ndata: [DONE]\n\n"
+    ).encode()
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200, content=body, headers={"content-type": "text/event-stream"}
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    content = collect_content(_stream_payloads(response))
+    assert "proxy:" in content
+    assert _finish_reasons(response) == ["length"]
+    assert response.text.count("data: [DONE]") == 1
+
+
+@respx.mock
+async def test_streaming_turn_with_content_gets_no_notice() -> None:
+    body = (
+        "data: "
+        + json.dumps(
+            {
+                "id": "chatcmpl-ok",
+                "object": "chat.completion.chunk",
+                "model": "deepseek-v4",
+                "choices": [{"index": 0, "delta": {"content": "here you go"}}],
+            }
+        )
+        + "\n\ndata: "
+        + json.dumps(
+            {
+                "id": "chatcmpl-ok",
+                "object": "chat.completion.chunk",
+                "model": "deepseek-v4",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+            }
+        )
+        + "\n\ndata: [DONE]\n\n"
+    ).encode()
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200, content=body, headers={"content-type": "text/event-stream"}
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    assert collect_content(_stream_payloads(response)) == "here you go"
+
+
+@respx.mock
+async def test_streaming_transport_failure_gets_no_misleading_notice() -> None:
+    """The notice blames the token budget, which is wrong for a broken stream."""
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            stream=_BoomStream(b""),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    assert "proxy:" not in response.text
+    assert _finish_reasons(response) == ["length"]
+
+
+@respx.mock
+async def test_streaming_non_transport_error_still_terminates_the_turn() -> None:
+    """A bug in the rewrite path must not strand the client on an open turn.
+
+    The status is already committed to 200/SSE, so re-raising cannot produce an
+    HTTP error - it only truncates the body, which is what leaves agent clients
+    spinning. The turn is closed and the failure is logged instead.
+    """
+    first = (
+        "data: "
+        + json.dumps(
+            {
+                "id": "chatcmpl-bug",
+                "object": "chat.completion.chunk",
+                "model": "deepseek-v4",
+                "choices": [
+                    {"index": 0, "delta": {"content": "partial"}, "finish_reason": None},
+                ],
+            }
+        )
+        + "\n\n"
+    ).encode()
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            stream=_BoomStream(first, RuntimeError("bug in the rewrite path")),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "deepseek-v4",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.text.count("data: [DONE]") == 1
+    assert _finish_reasons(response) == ["length"]
+    assert "partial" in response.text
 
 
 @respx.mock

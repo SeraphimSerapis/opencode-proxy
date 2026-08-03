@@ -77,6 +77,17 @@ class Settings(BaseSettings):
         ge=0,
         validation_alias="SSE_KEEPALIVE_INTERVAL",
     )
+    # Emitted when a turn closes with no content and no tool calls, which a
+    # reasoning model does when it exhausts max_tokens while still thinking.
+    # Set empty to disable and pass the empty turn through untouched.
+    empty_turn_notice: str = Field(
+        default=(
+            "[proxy: the model ended this turn without producing any output "
+            "or tool call, usually because it exhausted its token budget while "
+            "reasoning. Retry with a larger max_tokens.]"
+        ),
+        validation_alias="EMPTY_TURN_NOTICE",
+    )
     upstream_max_retries: int = Field(
         default=2,
         ge=0,
