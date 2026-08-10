@@ -106,6 +106,16 @@ class Settings(BaseSettings):
         validation_alias="MAX_CONCURRENT_UPSTREAM",
     )
     stream_guard_chars: int = Field(default=192, ge=1)
+    capture_stream_dir: str = Field(default="", validation_alias="CAPTURE_STREAM_DIR")
+    capture_stream_max_bytes: int = Field(
+        default=8_388_608,
+        ge=0,
+        validation_alias="CAPTURE_STREAM_MAX_BYTES",
+    )
+    capture_stream_include_request: bool = Field(
+        default=False,
+        validation_alias="CAPTURE_STREAM_INCLUDE_REQUEST",
+    )
     tool_argument_chunk_size: int = Field(default=64, ge=1)
     max_raw_tool_block_chars: int = Field(default=131_072, ge=1)
     max_tool_calls: int = Field(default=32, ge=1)
@@ -265,6 +275,11 @@ class Settings(BaseSettings):
                 "tool_argument_chunk_size": self.tool_argument_chunk_size,
                 "keepalive_interval": self.sse_keepalive_interval or None,
                 "empty_turn_notice": bool(self.empty_turn_notice),
+            },
+            "capture": {
+                "enabled": bool(self.capture_stream_dir),
+                "max_bytes": self.capture_stream_max_bytes or None,
+                "include_request": self.capture_stream_include_request,
             },
             "tool_call_repair": {
                 "scan_fields": list(self.parsed_tool_call_scan_fields),

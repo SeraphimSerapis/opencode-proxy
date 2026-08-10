@@ -67,6 +67,10 @@ ignore = [
   "S101",
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# Operator-facing CLI: its report goes to stdout by design.
+"tools/analyze_capture.py" = ["T201"]
+
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"

@@ -1,5 +1,32 @@
 # Documentation Update Log
 
+## 2026-08-10
+
+* **Resolved**: The DeepSeek-V4-Flash "duplicated fragment" quirk is a pi TUI
+repaint bug — confirmed, not inferred. A third sighting was caught with stream
+capture enabled: both sides of the turn are byte-identical and hold the text
+once, and the repeated unit was a terminal soft-wrap line with no newline in
+the bytes, which only the renderer can produce. The prior hypothesis (token
+repetition under vLLM sampling) is withdrawn; no sampling change is needed.
+Closed in the [DeepSeek V4 runbook](runbooks/deepseek-v4.md), with the method
+in [diagnose duplicated output](runbooks/diagnose-duplicated-output.md).
+* **Feature**: Added opt-in stream capture (`CAPTURE_STREAM_DIR`,
+`CAPTURE_STREAM_MAX_BYTES`, `CAPTURE_STREAM_INCLUDE_REQUEST`), which records
+upstream SSE frames alongside the bytes sent to the client, plus
+`tools/analyze_capture.py`, which reconstructs both sides and attributes a
+duplicated span to a layer. Built to chase the above; kept because it turns any
+future output anomaly into an attribution without needing a reproduction. Off
+by default: it writes model output, and optionally prompts, to disk in the
+clear. See [diagnose duplicated output](runbooks/diagnose-duplicated-output.md).
+
+## 2026-08-03 (5)
+
+* **Todo**: Documented a known DeepSeek-V4-Flash output quirk — occasional
+duplicated sentence fragments (observed: a "One flag: ..." sentence emitted
+twice, first copy cut mid-word). Hypothesis is model-side token repetition
+under vLLM sampling, not proxy re-emission; confirmation steps and tracking
+are in the [DeepSeek V4 runbook](runbooks/deepseek-v4.md).
+
 ## 2026-08-03 (4)
 
 * **Fix**: A raw tool block whose close tag splits so `</` lands mid-frame is

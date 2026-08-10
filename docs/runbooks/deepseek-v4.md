@@ -123,3 +123,37 @@ Set `recover_orphan_invokes: false` only when all are true:
 If direct responses regress, re-enable the flag only for the affected model and
 retain the captured response shape privately; never put prompts, arguments,
 tool names, or model output into metric labels.
+
+## Resolved: duplicated sentence fragments were a client rendering artifact
+
+DeepSeek-V4-Flash occasionally emits a sentence or fragment twice in a row.
+Observed 2026-08-03 in a completed task review (first copy cut mid-word, second
+copy completed):
+
+> One flag: TRAEFIK_LEARNINGS.md and TRAEFIK_REVIEW.md were delet
+> One flag: TRAEFIK_LEARNINGS.md and TRAEFIK_REVIEW.md were deleted from the repo root, ...
+
+Second occurrence 2026-08-10, again in pi, again the closing sentence of the
+turn, again a prefix cut mid-word followed by the complete sentence:
+
+> Usage: codex-usage in any new shell. Single-quoted so tokens are rea
+> Usage: codex-usage in any new shell. Single-quoted so tokens are read at call time, ...
+
+Not a model fault. Confirmed on 2026-08-10 by capturing a third sighting with
+`CAPTURE_STREAM_DIR` enabled: both sides of the turn are byte-identical and
+contain the text exactly once, and the repeated unit was a terminal soft-wrap
+line that has no newline in the bytes — a unit only the renderer can produce.
+pi drew part of a wrapped line, then repainted it complete without clearing the
+partial draw. The earlier working hypothesis of model-side token repetition
+under vLLM sampling was wrong, and no sampling change is needed.
+
+Two details made this easy to misread. The cut lengths differ between
+occurrences (63 and 68 characters), which rules out any fixed-size buffer in
+the chain — `STREAM_GUARD_CHARS` is 192 and would not cut at either point. And
+searching the transcripts for the duplicated phrase matches a `role: user`
+record too, because pasting the screen text into pi to report the problem
+stores it verbatim; only the `role: assistant` record is evidence.
+
+Status: closed. The general procedure, including the proxy-side stream capture
+built while chasing this, is in
+[diagnose duplicated output](diagnose-duplicated-output.md).

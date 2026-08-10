@@ -65,6 +65,24 @@ can legitimately take minutes to produce a first token. Silence is bounded by
 `/healthz/config` reports whether `EMPTY_TURN_NOTICE` is enabled without
 exposing the configured message text.
 
+## Stream capture
+
+Off by default. When enabled, every streamed turn is written to its own JSONL
+file recording the SSE frames received from upstream alongside the bytes sent
+to the client, so an output anomaly can be attributed to a layer without
+reproducing it. See [diagnose duplicated output](/runbooks/diagnose-duplicated-output.md).
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CAPTURE_STREAM_DIR` | empty | Directory for per-turn capture files. Empty disables capture entirely. |
+| `CAPTURE_STREAM_MAX_BYTES` | `8388608` | Per-turn cap; a capture that reaches it records a `truncated` marker and stops. `0` disables the cap. |
+| `CAPTURE_STREAM_INCLUDE_REQUEST` | `false` | Also record the request body, which carries the prompt. Needed to replay a captured turn. |
+
+Capture writes model output to disk in the clear, and with
+`CAPTURE_STREAM_INCLUDE_REQUEST` it writes prompts too. Files are never rotated
+or pruned — the operator owns the directory's lifecycle. `/healthz/config`
+reports only whether capture is enabled, not the directory path.
+
 ## Tool-call repair
 
 | Variable | Default | Purpose |

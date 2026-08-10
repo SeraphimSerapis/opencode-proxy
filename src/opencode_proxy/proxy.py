@@ -17,6 +17,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
+from opencode_proxy.capture import StreamCapture, open_capture
 from opencode_proxy.compat import (
     JsonObject,
     RepairStats,
@@ -391,7 +392,20 @@ async def _proxy_streaming_chat_completion(
             media_type=content_type or None,
         )
 
-    generator = _rewrite_sse_stream(request, upstream_response, settings, repair_context)
+    capture = open_capture(
+        settings.capture_stream_dir,
+        max_bytes=settings.capture_stream_max_bytes,
+        model=str(parsed_body.get("model")) if parsed_body is not None else None,
+        upstream_url=_upstream_url(settings, CHAT_COMPLETIONS_PATH, "", target=target),
+    )
+    if capture is not None:
+        LOG.info("capturing streamed turn to %s", capture.path)
+        if settings.capture_stream_include_request:
+            capture.request_body(parsed_body if parsed_body is not None else _safe_text(raw_body))
+
+    generator = _rewrite_sse_stream(
+        request, upstream_response, settings, repair_context, capture=capture
+    )
     background = BackgroundTask(_aclose_upstream_and_release_slot, upstream_response, request)
     return StreamingResponse(
         generator,
@@ -461,6 +475,43 @@ async def _rewrite_sse_stream(
     upstream_response: httpx.Response,
     settings: Settings,
     repair_context: ToolRepairContext = DEFAULT_TOOL_REPAIR_CONTEXT,
+    *,
+    capture: StreamCapture | None = None,
+) -> AsyncIterator[bytes]:
+    """Rewrite an SSE stream, recording both sides when capture is enabled.
+
+    Capture wraps rather than threads through the rewrite so that every byte
+    leaving this proxy is recorded at exactly one point, including the ones
+    synthesized during error and truncation handling.
+    """
+    if capture is None:
+        async for chunk in _rewrite_sse_stream_inner(
+            request, upstream_response, settings, repair_context
+        ):
+            yield chunk
+        return
+
+    reason = "completed"
+    try:
+        async for chunk in _rewrite_sse_stream_inner(
+            request, upstream_response, settings, repair_context, capture=capture
+        ):
+            capture.client_bytes(chunk)
+            yield chunk
+    except BaseException as exc:  # recorded, then re-raised unchanged
+        reason = type(exc).__name__
+        raise
+    finally:
+        capture.close(reason=reason)
+
+
+async def _rewrite_sse_stream_inner(
+    request: Request,
+    upstream_response: httpx.Response,
+    settings: Settings,
+    repair_context: ToolRepairContext = DEFAULT_TOOL_REPAIR_CONTEXT,
+    *,
+    capture: StreamCapture | None = None,
 ) -> AsyncIterator[bytes]:
     """Rewrite an SSE chat-completion stream into OpenAI ``tool_calls`` deltas."""
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -479,11 +530,16 @@ async def _rewrite_sse_stream(
         ):
             if await request.is_disconnected():
                 LOG.info("client disconnected; stopping upstream SSE rewrite")
+                if capture is not None:
+                    capture.note("client disconnected")
                 return
 
             if frame is None:
                 yield SSE_KEEPALIVE_COMMENT
                 continue
+
+            if capture is not None:
+                capture.upstream_frame(frame.raw_lines)
 
             if frame.data is None:
                 yield _encode_sse_raw_frame(frame.raw_lines)
@@ -531,10 +587,14 @@ async def _rewrite_sse_stream(
                     metrics=_request_metrics(request),
                 ):
                     yield _encode_sse_json(payload)
+        if capture is not None:
+            capture.upstream_eof()
     except asyncio.CancelledError:
         LOG.info("SSE rewrite cancelled")
         raise
     except httpx.TransportError as exc:
+        if capture is not None:
+            capture.note("upstream transport error", detail=type(exc).__name__)
         _, error_type = classify_upstream_error(exc)
         LOG.warning(
             "upstream SSE stream interrupted type=%s chunk_id=%s model=%s",
@@ -544,7 +604,9 @@ async def _rewrite_sse_stream(
         )
         # The response is already 200/SSE, so it cannot become an HTTP error.
         # The default ``length`` finish truthfully marks the partial turn truncated.
-    except Exception:
+    except Exception as exc:
+        if capture is not None:
+            capture.note("rewrite failed", detail=type(exc).__name__)
         # Once SSE headers are out the status is committed, so re-raising cannot
         # produce an HTTP error - it only truncates the body and strands the
         # client on an unterminated turn. Close the turn and log loudly instead.
@@ -1480,6 +1542,10 @@ def _parse_json_object(body: bytes) -> JsonObject | None:
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _safe_text(body: bytes) -> str:
+    return body.decode("utf-8", errors="replace")
 
 
 def _tool_repair_context(body: JsonObject, settings: Settings) -> ToolRepairContext:
