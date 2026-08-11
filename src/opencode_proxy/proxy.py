@@ -526,6 +526,7 @@ async def _rewrite_sse_stream_inner(
             upstream_response,
             settings.upstream_stream_idle_timeout,
             settings.sse_keepalive_interval,
+            first_frame_timeout=settings.upstream_stream_first_frame_timeout,
             metrics=_request_metrics(request),
         ):
             if await request.is_disconnected():
@@ -632,6 +633,7 @@ async def _iter_sse_frames_with_idle_guard(
     idle_timeout: float,
     keepalive_interval: float = 0.0,
     *,
+    first_frame_timeout: float | None = None,
     metrics: ProxyMetrics | None = None,
 ) -> AsyncIterator[SseFrame | None]:
     """Yield upstream SSE frames, plus ``None`` whenever the upstream is quiet.
@@ -640,15 +642,23 @@ async def _iter_sse_frames_with_idle_guard(
     intermediaries do not drop an idle connection and the client keeps seeing
     signs of life during a long reasoning pause.
 
-    Iteration also ends once the upstream has been silent for ``idle_timeout``.
-    An upstream that stops sending without closing the connection would
-    otherwise strand the caller forever, because the read timeout is usually
-    disabled to allow slow local models. Ending iteration lets the caller flush
-    its buffers and terminate the client stream normally.
+    Iteration also ends once the upstream has gone quiet for too long. An
+    upstream that stops sending without closing the connection would otherwise
+    strand the caller forever, because the read timeout is usually disabled to
+    allow slow local models. Ending iteration lets the caller flush its buffers
+    and terminate the client stream normally.
+
+    The wait before the *first* frame is a different measurement from the waits
+    between later frames, so they get separate budgets. Nothing arrives during
+    prefill, which on a long prompt legitimately takes minutes; once tokens are
+    flowing, a gap of more than a few seconds means the turn has stalled. One
+    flat budget has to be loose enough for the former, which makes it far too
+    loose for the latter. ``first_frame_timeout`` defaults to ``idle_timeout``.
     """
     frames = _iter_sse_frames(upstream_response).__aiter__()
     pending: asyncio.Task[SseFrame] | None = None
     silence = 0.0
+    seen_frame = False
     try:
         while True:
             if pending is None:
@@ -656,17 +666,23 @@ async def _iter_sse_frames_with_idle_guard(
                 # partially received frame.
                 pending = asyncio.ensure_future(anext(frames))
 
-            wait_seconds = _next_wait_interval(idle_timeout, keepalive_interval, silence)
+            budget = idle_timeout
+            if not seen_frame and first_frame_timeout is not None:
+                budget = first_frame_timeout
+
+            wait_seconds = _next_wait_interval(budget, keepalive_interval, silence)
             done, _ = await asyncio.wait({pending}, timeout=wait_seconds)
             if not done:
                 silence += wait_seconds or 0.0
-                if idle_timeout > 0 and silence >= idle_timeout:
+                if budget > 0 and silence >= budget:
+                    phase = "mid_stream" if seen_frame else "first_frame"
                     LOG.warning(
-                        "upstream sent no SSE frame for %.1fs; terminating the client stream",
+                        "upstream sent no %s SSE frame for %.1fs; terminating the client stream",
+                        "further" if seen_frame else "first",
                         silence,
                     )
                     if metrics is not None:
-                        metrics.stream_idle_terminations.inc()
+                        metrics.stream_idle_terminations.labels(phase=phase).inc()
                     return
                 yield None
                 continue
@@ -677,6 +693,7 @@ async def _iter_sse_frames_with_idle_guard(
             except StopAsyncIteration:
                 return
             silence = 0.0
+            seen_frame = True
             yield frame
     finally:
         if pending is not None:

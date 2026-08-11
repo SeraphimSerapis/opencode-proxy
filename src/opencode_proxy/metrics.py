@@ -58,6 +58,7 @@ class ProxyMetrics:
             stream_idle_terminations=Counter(
                 "opencode_proxy_stream_idle_terminations",
                 "Streams terminated by the upstream idle guard.",
+                ("phase",),
                 registry=registry,
             ),
             empty_turns=Counter(

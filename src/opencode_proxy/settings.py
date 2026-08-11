@@ -79,10 +79,22 @@ class Settings(BaseSettings):
     # after the inference engine behind it has died. Point this at an endpoint
     # that actually exercises the engine (vLLM: /health) to catch that.
     upstream_health_path: str = Field(default="", validation_alias="UPSTREAM_HEALTH_PATH")
+    # Gap *between* SSE frames. Once tokens are flowing they arrive continuously
+    # (measured inter-token p99.9 is ~1.5s), so tens of seconds of mid-stream
+    # silence means the turn has stalled, not that the model is thinking.
     upstream_stream_idle_timeout: float = Field(
-        default=120.0,
+        default=30.0,
         ge=0,
         validation_alias="UPSTREAM_STREAM_IDLE_TIMEOUT",
+    )
+    # Wait for the *first* frame, which covers prefill. This is a much larger
+    # number than the between-frame gap: nothing is sent while the prompt is
+    # being processed, and a long prompt legitimately takes minutes (measured
+    # time-to-first-token p99.9 is ~160s). Use `0` to disable.
+    upstream_stream_first_frame_timeout: float = Field(
+        default=240.0,
+        ge=0,
+        validation_alias="UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT",
     )
     sse_keepalive_interval: float = Field(
         default=10.0,
@@ -278,6 +290,11 @@ class Settings(BaseSettings):
                         None
                         if self.upstream_stream_idle_timeout == 0
                         else self.upstream_stream_idle_timeout
+                    ),
+                    "stream_first_frame": (
+                        None
+                        if self.upstream_stream_first_frame_timeout == 0
+                        else self.upstream_stream_first_frame_timeout
                     ),
                 },
                 "max_concurrent": self.max_concurrent_upstream or None,

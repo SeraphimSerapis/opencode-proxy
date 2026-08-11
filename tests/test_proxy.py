@@ -3078,6 +3078,119 @@ async def test_streaming_idle_upstream_terminates_instead_of_hanging() -> None:
 
 
 @respx.mock
+async def test_slow_prefill_is_not_killed_by_the_between_frame_timeout() -> None:
+    """A long silence before the first frame is prefill, not a stall."""
+    chunk = {
+        "id": "chatcmpl-prefill",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-v4",
+        "choices": [{"index": 0, "delta": {"content": "answer text"}, "finish_reason": "stop"}],
+    }
+
+    async def slow_prefill_stream() -> AsyncIterator[bytes]:
+        # Longer than the between-frame budget, well inside the first-frame one.
+        await asyncio.sleep(0.5)
+        yield f"data: {json.dumps(chunk)}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=slow_prefill_stream(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        upstream_stream_idle_timeout=0.2,
+        upstream_stream_first_frame_timeout=10,
+    )
+    async with await _client(settings) as client:
+        response = await asyncio.wait_for(
+            client.post(
+                "/v1/chat/completions",
+                json={"model": "deepseek-v4", "stream": True, "messages": []},
+            ),
+            timeout=10,
+        )
+
+    assert _finish_reasons(response) == ["stop"]
+    assert "answer text" in response.text
+
+
+@respx.mock
+async def test_prefill_that_never_produces_a_frame_hits_the_first_frame_timeout() -> None:
+    async def silent_stream() -> AsyncIterator[bytes]:
+        await asyncio.sleep(30)
+        yield b"data: [DONE]\n\n"
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=silent_stream(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        upstream_stream_idle_timeout=10,
+        upstream_stream_first_frame_timeout=0.2,
+    )
+    async with await _client(settings) as client:
+        response = await asyncio.wait_for(
+            client.post(
+                "/v1/chat/completions",
+                json={"model": "deepseek-v4", "stream": True, "messages": []},
+            ),
+            timeout=10,
+        )
+
+    assert response.text.count("data: [DONE]") == 1
+
+
+@respx.mock
+async def test_idle_termination_records_the_phase_it_stalled_in() -> None:
+    chunk = {
+        "id": "chatcmpl-phase",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-v4",
+        "choices": [{"index": 0, "delta": {"content": "partial"}}],
+    }
+
+    async def stalling_stream() -> AsyncIterator[bytes]:
+        yield f"data: {json.dumps(chunk)}\n\n".encode()
+        await asyncio.sleep(30)
+        yield b"data: [DONE]\n\n"
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=stalling_stream(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        upstream_stream_idle_timeout=0.2,
+        upstream_stream_first_frame_timeout=10,
+    )
+    async with await _client(settings) as client:
+        await asyncio.wait_for(
+            client.post(
+                "/v1/chat/completions",
+                json={"model": "deepseek-v4", "stream": True, "messages": []},
+            ),
+            timeout=10,
+        )
+        metrics = (await client.get("/metrics")).text
+
+    assert 'opencode_proxy_stream_idle_terminations_total{phase="mid_stream"} 1.0' in metrics
+
+
+@respx.mock
 async def test_streaming_response_disables_intermediary_buffering() -> None:
     chunk = {
         "id": "chatcmpl-headers",

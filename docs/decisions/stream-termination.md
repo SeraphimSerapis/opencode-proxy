@@ -52,6 +52,29 @@ the terminal chunk, sends `[DONE]`, and closes. The client gets a complete,
 well-formed turn containing whatever text arrived, rather than a truncated body
 or an error.
 
+## Why two silence budgets rather than one
+
+The guard starts counting when body iteration begins, so a single budget has to
+cover both the wait for the first frame and the gaps between later ones. Those
+are different measurements. Nothing is sent during prefill, which on a long
+prompt legitimately takes minutes; once tokens are flowing they arrive
+continuously. Measured against the deployed vLLM over seven days:
+
+| | p99 | p99.9 |
+| --- | --- | --- |
+| Time to first token | 64s | 160s |
+| Inter-token latency | 0.15s | 1.5s |
+
+A single flat budget cannot serve both. The original `120` sat *below* the p99.9
+of prefill — killing legitimate slow starts — while being ~80× the p99.9 of a
+mid-stream gap, so a genuinely dead stream held the client for two minutes.
+
+`UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT` (default `240`) covers prefill with room
+above the observed p99.9. `UPSTREAM_STREAM_IDLE_TIMEOUT` (default `30`) covers
+the gaps after the first frame, which is still a 20× margin over the inter-token
+p99.9. Terminations record which budget expired in
+`opencode_proxy_stream_idle_terminations{phase}`.
+
 The observed case was upstream silence (defect 2), not a proven connection reset.
 For the separate transport-failure case, an `httpx.TransportError` after SSE
 headers have been sent now emits a terminal `finish_reason: "length"` and
