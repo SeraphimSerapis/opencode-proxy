@@ -69,9 +69,11 @@ port `9526`; do not bring up the retired standalone `ollama-proxy` service.
 - `LOG_LEVEL`: Python logging level. Default: `INFO`.
 - `MAX_CONCURRENT_UPSTREAM`: max concurrent chat/generate upstream requests. Default: `8`. Use `0` for unlimited.
 - `UPSTREAM_READY_TIMEOUT`: `/readyz` upstream probe timeout in seconds. Default: `2`.
+- `UPSTREAM_HEALTH_PATH`: optional extra `/readyz` probe that exercises the upstream engine, for example `/health` for vLLM. Unset by default. `/v1/models` alone is served from static config and stays `200` after the engine dies.
 - `SSE_KEEPALIVE_INTERVAL`: seconds of upstream silence before sending an SSE keepalive comment. Default: `10`. Use `0` to disable.
 - `UPSTREAM_MAX_RETRIES`: retries for chat/generate requests that fail before any response byte reaches the client. Default: `2`. Use `0` to disable. Never retries once a stream has started.
-- `UPSTREAM_STREAM_IDLE_TIMEOUT`: seconds to wait for the next upstream SSE frame before terminating the client stream. Default: `120`. Use `0` to disable.
+- `UPSTREAM_STREAM_IDLE_TIMEOUT`: seconds to wait for the next upstream SSE frame *after the first* before terminating the client stream. Default: `30`. Use `0` to disable.
+- `UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT`: seconds to wait for the *first* upstream SSE frame, covering prefill. Default: `240`. Use `0` to disable.
 - `STREAM_GUARD_CHARS`: amount of non-tool text to hold while checking for split tool tags. Default: `192`.
 - `TOOL_ARGUMENT_CHUNK_SIZE`: streamed function argument chunk size. Default: `64`.
 - `PROXY_CONFIG_FILE`: optional YAML file with `models:` (aliases) and `routes:` (modality routes). Environment variables win over the file; a missing or malformed file fails startup.

@@ -42,17 +42,23 @@ The container publishes host `9526` and `11434`, both to container `9526`.
 
 ## 3. Verify
 
-Health, which is also the container healthcheck:
+Liveness — proves only that the proxy process is serving:
 
 ```bash
-docker compose ps opencode-proxy && curl -sS http://127.0.0.1:9526/healthz
+curl -sS http://127.0.0.1:9526/healthz
 ```
 
-Readiness, which probes the backend:
+Readiness, which probes the backend and is what the container healthcheck runs.
+`docker compose ps` reporting `healthy` therefore means vLLM is serving too:
 
 ```bash
-curl -sS http://127.0.0.1:9526/readyz
+docker compose ps opencode-proxy && curl -sS http://127.0.0.1:9526/readyz
 ```
+
+A `503` names the reason in the `upstream` field — see
+[API surface](../reference/api-surface.md) for the full table. The same reasons
+are counted in `opencode_proxy_upstream_ready_failures{reason}`, so an alert can
+fire on the proxy losing its backend.
 
 Effective configuration — confirms the deployed build picked up the intended
 settings, with no credentials in the output:
@@ -93,11 +99,60 @@ cd /home/tim/docker && docker tag opencode-proxy:rollback-<date> opencode-proxy:
 Reverting source instead means checking out the previous commit and repeating
 step 2, since the image is built from the working tree.
 
+## Edge access
+
+`opencode-proxy.${DOMAIN_COFFEE}` is served by three Traefik routers on one
+host rule, highest priority first:
+
+| Router | Priority | Matches | Middleware |
+| --- | --- | --- | --- |
+| `opencode-proxy-local` | 200 | Client IP in the LAN/`LAN_BYPASS_CIDR` ranges | `chain-no-auth` |
+| `opencode-proxy-bypass` | 100 | `X-API-KEY: $OPENCODE_PROXY_X_API` | `chain-external-webhook` + header strip |
+| `opencode-proxy-rtr` | 1 | anything else | `chain-tinyauth` |
+
+Tinyauth is a browser SSO flow, so it can only be the catch-all: the clients
+that actually use this route are headless (OpenAI/JS, opencode, curl) and would
+be redirected to a login page. They match the LAN router instead, and off-LAN
+headless clients use the `X-API-KEY` header. That key is a Traefik-edge
+credential only — `opencode-proxy-strip-x-api-key` clears the header before the
+request reaches the proxy, which would otherwise forward it to vLLM.
+
+Direct LAN access on `:9526`/`:11434` bypasses Traefik entirely and is
+unaffected by any of this.
+
+## Alerting
+
+Prometheus scrapes `opencode-proxy:9526` and vLLM, and delivers through
+Alertmanager to mailrise, which fans `*@tme.coffee` out to Gmail and Discord.
+Rules live in `/home/tim/docker/appdata/prometheus/rules/opencode-proxy.yml`:
+
+| Alert | Fires on |
+| --- | --- |
+| `OpenCodeProxyDown` | Scrape of the proxy fails for 2m. |
+| `OpenCodeProxyUpstreamNotReady` | `/readyz` failing for 5m; the `reason` label names which check. |
+| `OpenCodeProxyStreamsStalling` | >3 mid-stream idle terminations in 15m. |
+| `OpenCodeProxyPrefillTimingOut` | >2 first-frame timeouts in 30m. |
+| `VllmDown` / `VllmNoModelServed` | vLLM unscrapeable, or scrapeable with no engine metrics. |
+
+Validate rule changes before reloading, then reload without a restart:
+
+```bash
+docker run --rm -v /home/tim/docker/appdata/prometheus/rules:/rules:ro \
+  --entrypoint promtool prom/prometheus:v3.13.2 check rules /rules/opencode-proxy.yml
+curl -X POST http://127.0.0.1:9090/-/reload
+```
+
+`prometheus.yml` is bind-mounted as a *single file*, so rewriting it on the host
+replaces the inode and the container keeps reading the old one. Editing it needs
+`docker compose up -d --force-recreate prometheus`, not a reload. Files under
+`rules/` are a directory mount and do pick up a plain reload.
+
 ## Notes
 
 * Clients hold connections to the proxy. Recreating the container drops
   in-flight streamed turns; expect one failed turn in any active session.
-* `depends_on: litellm` orders startup only. The proxy's upstream is vLLM — see
-  [request pipeline](/architecture/request-pipeline.md).
+* The proxy's upstream is vLLM, not LiteLLM, which calls *into* the proxy — see
+  [request pipeline](/architecture/request-pipeline.md). Do not reintroduce
+  `depends_on: litellm`; it gates startup on a downstream service.
 * Configuration lives in the Compose fragment's `environment:` block, not in the
   project's `.env`, which is for local development only.

@@ -157,8 +157,11 @@ curl -N http://127.0.0.1:9526/api/chat \
 ```
 
 On Prometheus, the compose stack should include only the unified service. Build
-it from `${PROJECTSDIR}/opencode-proxy`, set `UPSTREAM_URL=http://litellm:4000`,
-and map both `11434:9526` and `9526:9526` to that one container. The checked-in
+it from `${PROJECTSDIR}/opencode-proxy` and map both `11434:9526` and
+`9526:9526` to that one container. Set `UPSTREAM_URL` to the **vLLM** server:
+in that deployment the proxy sits behind LiteLLM (`pi -> LiteLLM -> proxy ->
+vLLM`), so pointing it back at `litellm:4000` would loop requests. See
+[request pipeline](docs/architecture/request-pipeline.md). The checked-in
 compose definition leaves `UPSTREAM_API_KEY` empty, so LiteLLM virtual keys
 gate callers through forwarded `Authorization` headers. Set
 `PROXY_UPSTREAM_FALLBACK_KEY` only for trusted clients that cannot send a key;
@@ -178,9 +181,11 @@ never use the LiteLLM master key as a general client fallback.
 | `UPSTREAM_WRITE_TIMEOUT` | `30` | Upstream write timeout in seconds. |
 | `UPSTREAM_POOL_TIMEOUT` | `30` | Upstream connection-pool timeout in seconds. |
 | `UPSTREAM_READY_TIMEOUT` | `2` | Timeout in seconds for the `/readyz` upstream probe. |
+| `UPSTREAM_HEALTH_PATH` | unset | Extra `/readyz` probe that exercises the upstream engine, for example `/health` for vLLM. A model listing alone is served from static config and stays `200` after the engine dies. |
 | `SSE_KEEPALIVE_INTERVAL` | `10` | Seconds of upstream silence before the proxy sends an SSE keepalive comment. `0` disables keepalives. |
 | `UPSTREAM_MAX_RETRIES` | `2` | Retries for chat/generate requests that fail before any response byte reaches the client. `0` disables retries. |
-| `UPSTREAM_STREAM_IDLE_TIMEOUT` | `120` | Seconds to wait for the next upstream SSE frame before flushing buffers, sending a terminal chunk, and closing the client stream. `0` disables the guard. |
+| `UPSTREAM_STREAM_IDLE_TIMEOUT` | `30` | Seconds to wait for the next upstream SSE frame *after the first one* before flushing buffers, sending a terminal chunk, and closing the client stream. `0` disables the guard. |
+| `UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT` | `240` | Seconds to wait for the *first* upstream SSE frame. Covers prefill, which sends nothing and legitimately takes minutes on a long prompt, so it is much larger than the between-frame gap. `0` disables. |
 | `MAX_CONCURRENT_UPSTREAM` | `8` | Max concurrent chat/generate requests to upstream. Extra requests get `429` with `Retry-After: 1`. `0` disables the limit. |
 | `STREAM_GUARD_CHARS` | `192` | Text held back while detecting split raw tool-call tags. |
 | `TOOL_ARGUMENT_CHUNK_SIZE` | `64` | Size for streamed function argument deltas. |
@@ -250,8 +255,11 @@ Two guards keep a streamed turn from stalling silently:
   connection during a long reasoning pause. Streamed responses also carry
   `Cache-Control: no-cache` and `X-Accel-Buffering: no` so intermediaries relay
   them token by token instead of buffering.
-- **Idle cutoff.** After `UPSTREAM_STREAM_IDLE_TIMEOUT` seconds of silence the
-  proxy flushes its buffers, sends a terminal chunk and `[DONE]`, and closes.
+- **Idle cutoff.** After `UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT` seconds waiting
+  for the first frame, or `UPSTREAM_STREAM_IDLE_TIMEOUT` seconds between later
+  frames, the proxy flushes its buffers, sends a terminal chunk and `[DONE]`,
+  and closes. The two budgets differ because prefill silence and a mid-stream
+  stall are different conditions.
 
 When the upstream closes a turn without content or tool calls, the proxy logs
 the empty turn and emits `EMPTY_TURN_NOTICE` (enabled by default) before the
@@ -325,8 +333,8 @@ Details worth knowing:
 
 ## API Surface
 
-- `GET /healthz`: local proxy liveness check.
-- `GET /readyz`: readiness check that probes upstream `GET /v1/models`. Connection failures and upstream `5xx` return `503`; auth errors still count as ready.
+- `GET /healthz`: local proxy liveness check. Says nothing about the upstream.
+- `GET /readyz`: readiness check, and the container healthcheck. Probes `UPSTREAM_HEALTH_PATH` when set, then upstream `GET /v1/models`. Returns `503` when the upstream is unreachable, times out, reports an unhealthy engine, answers `5xx`, answers a non-auth `4xx` (usually a wrong `UPSTREAM_URL`), or lists no models. Auth errors still count as ready.
 - `GET /healthz/config`: safe local config summary, with header values and URL credentials omitted.
 - `GET /metrics`: proxy-owned Prometheus counters. Scrape vLLM separately for
   cache, KV utilization, queueing, and model latency.
@@ -345,5 +353,5 @@ Details worth knowing:
 - If an upstream response already contains standard OpenAI `tool_calls`, it is passed through unchanged.
 - `reasoning_content` and `reasoning` fields (DeepSeek R1 / o1-style streaming) are scanned for raw tool-call blocks by default, but ordinary reasoning text remains in reasoning fields.
 - Because scanned text is buffered with `STREAM_GUARD_CHARS`, reasoning deltas from the same upstream event may be emitted before that event's content delta. Before any `content` is emitted, held reasoning/reasoning_content tails are flushed so thinking cannot trail the answer in streaming clients (for example Pi).
-- The Docker image runs as a non-root user and includes a `/healthz` healthcheck.
+- The Docker image runs as a non-root user and healthchecks against `/readyz`, so the container reports unhealthy when its upstream cannot serve.
 - SSE keepalives, the unbuffered streaming headers, and the pre-first-byte retry rule were adapted from [VisionBridge](https://github.com/thomasunise/visionbridge) (MIT).

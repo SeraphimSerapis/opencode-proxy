@@ -32,9 +32,10 @@ opencode-proxy  (:9526, also published on :11434)
 vLLM  http://192.168.10.221:8080
 ```
 
-`UPSTREAM_URL` is the vLLM server. The Compose fragment declares
-`depends_on: litellm`, which reads as if LiteLLM were upstream; it is not — that
-dependency only orders startup. When a streamed turn misbehaves, LiteLLM is a
+`UPSTREAM_URL` is the vLLM server. The Compose fragment used to declare
+`depends_on: litellm`, which read as if LiteLLM were upstream; it is not, and
+the dependency has been dropped — it gated proxy startup on a service that sits
+in front of the proxy. When a streamed turn misbehaves, LiteLLM is a
 suspect hop between the client and the proxy, and its logs are worth checking
 before concluding the proxy is at fault.
 

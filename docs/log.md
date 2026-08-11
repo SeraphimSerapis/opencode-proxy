@@ -1,5 +1,57 @@
 # Documentation Update Log
 
+## 2026-08-11
+
+* **Fix**: The container reported `healthy` with its model server down. The
+healthcheck ran `/healthz`, which returns `ok` from the moment uvicorn binds and
+never touches the upstream, so the one signal an operator reads said nothing
+about whether the proxy could serve. The healthcheck now runs `/readyz`, in the
+Dockerfile and in the compose unit.
+* **Fix**: `/readyz` itself was too lenient to catch a broken backend. It
+accepted any non-`5xx`, so a `404` from a wrong `UPSTREAM_URL` read as ready, as
+did a `200` listing no models. Non-auth `4xx`, unparseable bodies, and empty
+model lists are now `not_ready`, each with a named reason and a new
+`opencode_proxy_upstream_ready_failures{reason}` counter.
+* **Feature**: `UPSTREAM_HEALTH_PATH` (set to `/health` for the vLLM upstream).
+vLLM and LiteLLM both serve `/v1/models` from static configuration, so it keeps
+answering `200` after the engine behind it dies — a model listing can never
+detect that failure on its own. See [API surface](reference/api-surface.md).
+* **Fix**: The public Traefik route was unauthenticated (`chain-no-auth`), so
+anyone reaching `opencode-proxy.${DOMAIN_COFFEE}` could run inference on the GPU
+and read the internal upstream origin from `/healthz/config`. Replaced with the
+three-router pattern LiteLLM already uses: a LAN `ClientIP` router at priority
+200, an `X-API-KEY` header router at priority 100, and a `chain-tinyauth`
+catch-all at priority 1. Plain Tinyauth alone was not an option — the route
+carries 448 requests/14d from headless clients (OpenAI/JS, opencode, curl) that
+cannot complete a browser SSO flow, and they now match the LAN router unchanged.
+The edge credential is stripped by `opencode-proxy-strip-x-api-key` so it never
+reaches vLLM.
+* **Fix**: Nothing alerted on any of the above. Prometheus scraped the proxy and
+vLLM and loaded `rule_files`, but its Alertmanager target was commented out, so
+the existing rules notified nobody — the same class of defect as the healthcheck
+itself. Deployed Alertmanager with delivery through mailrise (`*@tme.coffee` →
+Gmail + Discord), added proxy and vLLM alert rules, and re-enabled the vLLM
+recording rules that were parked as `vllm.yml.disabled` "until scrape is
+restored" — the scrape has been healthy for some time. Rules and the reload
+procedure are in the [deploy runbook](runbooks/deploy.md).
+* **Fix**: The stream idle guard used one budget for two different silences.
+Because it starts counting at body iteration, the flat `120` had to cover both
+prefill and mid-stream gaps. Measured over seven days against the deployed vLLM,
+time-to-first-token p99.9 is 160s while inter-token p99.9 is 1.5s — so `120` was
+*below* the prefill p99.9, killing legitimate slow starts, and ~80× the
+mid-stream p99.9, leaving dead streams hanging for two minutes. Split into
+`UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT` (`240`) and a between-frame
+`UPSTREAM_STREAM_IDLE_TIMEOUT` (now `30`), with the expired budget recorded in
+`opencode_proxy_stream_idle_terminations{phase}`. Rationale and the latency
+table are in [stream termination](decisions/stream-termination.md).
+* **Fix**: `deploy/prometheus/opencode-proxy.yml` had drifted from the deployed
+unit and still described the retired `proxy -> LiteLLM` direction. Redeploying
+from it would have pointed `UPSTREAM_URL` at `litellm:4000` and looped requests
+back through LiteLLM. It now mirrors the live topology recorded in
+[request pipeline](architecture/request-pipeline.md): `pi -> LiteLLM -> proxy ->
+vLLM`. Its `depends_on: litellm` is dropped in the same pass — it coupled proxy
+startup to a service that is downstream of it, not upstream.
+
 ## 2026-08-10
 
 * **Resolved**: The DeepSeek-V4-Flash "duplicated fragment" quirk is a pi TUI

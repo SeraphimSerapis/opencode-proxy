@@ -5,47 +5,76 @@ services:
     build:
       context: ${PROJECTSDIR}/opencode-proxy
       dockerfile: Dockerfile
+      labels:
+        homelab.keep: "true"
     image: opencode-proxy:latest
     pull_policy: build
     container_name: opencode-proxy
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
-    depends_on:
-      litellm:
-        condition: service_healthy
+    # No depends_on litellm: LiteLLM calls this proxy, not the other way round.
     ports:
       - "${PORT_OPENCODE_PROXY:-9526}:9526"
       - "${PORT_OLLAMA_PROXY:-11434}:9526"
     environment:
       - TZ=${TZ}
-      - UPSTREAM_URL=http://litellm:4000
-      # Leave empty by default so LiteLLM virtual keys gate every caller.
-      # Set PROXY_UPSTREAM_FALLBACK_KEY only for trusted clients that cannot
-      # send Authorization themselves.
+      # The proxy sits *behind* LiteLLM: pi -> LiteLLM -> proxy -> vLLM. Never
+      # point this back at litellm:4000, which would loop requests.
+      - UPSTREAM_URL=http://192.168.10.221:8080
       - UPSTREAM_API_KEY=${PROXY_UPSTREAM_FALLBACK_KEY:-}
+      # vLLM's /health exercises the engine; /v1/models alone answers 200 even
+      # after the engine has died.
+      - UPSTREAM_HEALTH_PATH=/health
       - LOG_LEVEL=INFO
       - OLLAMA_VERSION=0.5.1
       - MAX_CONCURRENT_UPSTREAM=8
-      - MODEL_ALIASES=dsv4-flash=DeepSeek-V4-Flash,deepseek-ai/DeepSeek-V4-Flash-DSpark=DeepSeek-V4-Flash
+      - MODEL_ALIASES=dsv4-flash=deepseek-v4-flash,DeepSeek-V4-Flash=deepseek-v4-flash
     healthcheck:
+      # /readyz, not /healthz: /healthz never touches vLLM, so the container
+      # reported healthy through the 16:00-16:07 outage on 2026-08-11.
       test:
         - "CMD-SHELL"
-        - "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:9526/readyz', timeout=2).read()\""
+        - "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:9526/readyz', timeout=4).read()\""
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     networks:
       default:
       traefik_proxy:
     labels:
       - "traefik.enable=true"
-      - "traefik.docker.network=traefik_proxy"
+      - "traefik.docker.network=docker_traefik_proxy"
+      ## Auth Bypass
+      # X-API-KEY path: keep rate-limit/headers, skip CrowdSec. Auth is the API
+      # key, not IP reputation. The header is stripped before reaching the app.
+      - "traefik.http.routers.opencode-proxy-bypass.entrypoints=https"
+      # yamllint disable-line rule:line-length
+      - "traefik.http.routers.opencode-proxy-bypass.middlewares=chain-external-webhook@file,opencode-proxy-strip-x-api-key@file"
+      - "traefik.http.routers.opencode-proxy-bypass.priority=100"
+      # yamllint disable-line rule:line-length
+      - "traefik.http.routers.opencode-proxy-bypass.rule=(Header(`X-API-KEY`, `${OPENCODE_PROXY_X_API}`) && Host(`opencode-proxy.${DOMAIN_COFFEE}`))"
+      - "traefik.http.routers.opencode-proxy-bypass.service=opencode-proxy-svc"
+      - "traefik.http.routers.opencode-proxy-bypass.tls=true"
+      ## LAN Auth Bypass (keep in sync with LAN_BYPASS_CIDR)
+      # Headless OpenAI/opencode/curl clients on the LAN cannot complete a
+      # browser SSO flow, so they match here before the Tinyauth catch-all.
+      - "traefik.http.routers.opencode-proxy-local.entrypoints=https"
+      - "traefik.http.routers.opencode-proxy-local.middlewares=chain-no-auth@file"
+      - "traefik.http.routers.opencode-proxy-local.priority=200"
+      # yamllint disable-line rule:line-length
+      - "traefik.http.routers.opencode-proxy-local.rule=(Host(`opencode-proxy.${DOMAIN_COFFEE}`) && (ClientIP(`${LAN_BYPASS_CIDR_1:-192.168.10.0/24}`) || ClientIP(`${LAN_BYPASS_CIDR_2:-192.168.1.0/24}`)))"
+      - "traefik.http.routers.opencode-proxy-local.service=opencode-proxy-svc"
+      - "traefik.http.routers.opencode-proxy-local.tls=true"
+      ## HTTP Routers
       - "traefik.http.routers.opencode-proxy-rtr.entrypoints=https"
-      - "traefik.http.routers.opencode-proxy-rtr.middlewares=chain-no-auth@file"
+      - "traefik.http.routers.opencode-proxy-rtr.middlewares=chain-tinyauth@file"
+      - "traefik.http.routers.opencode-proxy-rtr.priority=1"
       - "traefik.http.routers.opencode-proxy-rtr.rule=Host(`opencode-proxy.${DOMAIN_COFFEE}`)"
       - "traefik.http.routers.opencode-proxy-rtr.tls=true"
+      ## HTTP Services
+      - "traefik.http.routers.opencode-proxy-rtr.service=opencode-proxy-svc"
       - "traefik.http.services.opencode-proxy-svc.loadbalancer.server.port=9526"
     logging:
       options:

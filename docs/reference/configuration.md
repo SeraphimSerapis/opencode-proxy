@@ -43,6 +43,7 @@ environment.
 | `UPSTREAM_WRITE_TIMEOUT` | `30` | Seconds. |
 | `UPSTREAM_POOL_TIMEOUT` | `30` | Seconds. |
 | `UPSTREAM_READY_TIMEOUT` | `2` | `/readyz` probe timeout. |
+| `UPSTREAM_HEALTH_PATH` | unset | Extra `/readyz` probe that exercises the engine, e.g. `/health` for vLLM. |
 | `UPSTREAM_MAX_RETRIES` | `2` | Retries before the first response byte. `0` disables. |
 | `MAX_CONCURRENT_UPSTREAM` | `8` | Concurrent chat/generate calls; over the limit returns `429`. `0` disables. |
 | `CUSTOM_HEADERS` / `UPSTREAM_HEADERS` | unset | Extra upstream headers. JSON object or newline-separated `Header: value`. |
@@ -56,7 +57,8 @@ can legitimately take minutes to produce a first token. Silence is bounded by
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `UPSTREAM_STREAM_IDLE_TIMEOUT` | `120` | Seconds of upstream silence before the client stream is terminated cleanly. `0` disables. |
+| `UPSTREAM_STREAM_IDLE_TIMEOUT` | `30` | Seconds of silence *between* SSE frames before the client stream is terminated cleanly. `0` disables. |
+| `UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT` | `240` | Seconds of silence before the *first* SSE frame, covering prefill. `0` disables. |
 | `SSE_KEEPALIVE_INTERVAL` | `10` | Seconds of silence between `: keepalive` comments. `0` disables. |
 | `STREAM_GUARD_CHARS` | `192` | Text held back while watching for a split tool-call marker. |
 | `TOOL_ARGUMENT_CHUNK_SIZE` | `64` | Size of streamed function-argument deltas. |
@@ -156,7 +158,8 @@ Template: [`/home/tim/projects/opencode-proxy/proxy.example.yaml`](/home/tim/pro
 
 ## Deployed values
 
-The homelab container currently sets only `UPSTREAM_URL`, `UPSTREAM_API_KEY`,
-`LOG_LEVEL`, `OLLAMA_VERSION`, `MODEL_ALIASES`, `TZ`, `PROXY_HOST`, and
+The homelab container sets `UPSTREAM_URL`, `UPSTREAM_API_KEY`,
+`UPSTREAM_HEALTH_PATH=/health`, `LOG_LEVEL`, `OLLAMA_VERSION`,
+`MAX_CONCURRENT_UPSTREAM`, `MODEL_ALIASES`, `TZ`, `PROXY_HOST`, and
 `PROXY_PORT`. Everything else runs on defaults. Aliases are still in the
 environment, not a config file.
