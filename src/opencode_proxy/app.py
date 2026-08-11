@@ -22,6 +22,10 @@ if TYPE_CHECKING:
 
 LOG = logging.getLogger(__name__)
 
+# An upstream that rejects the proxy's credentials is still serving; readiness
+# asks whether the upstream is up, not whether this caller is authorized.
+AUTH_STATUSES = frozenset({401, 403})
+
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
@@ -84,14 +88,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
+def _not_ready(metrics: ProxyMetrics | None, reason: str, **extra: object) -> JSONResponse:
+    if isinstance(metrics, ProxyMetrics):
+        metrics.upstream_ready_failures.labels(reason=reason).inc()
+    return JSONResponse(
+        status_code=503,
+        content={"status": "not_ready", "upstream": reason, **extra},
+    )
+
+
 async def check_upstream_ready(request: Request, settings: Settings) -> JSONResponse:
-    """Probe upstream model discovery; any non-5xx response means ready."""
+    """Probe the upstream and report whether it can actually serve a completion.
+
+    Reachability alone is not readiness. ``/v1/models`` is a static registry on
+    both vLLM and LiteLLM, so it answers ``200`` long after the engine behind it
+    has died; the optional ``UPSTREAM_HEALTH_PATH`` probe is what catches that.
+    An auth rejection still counts as ready — the upstream is serving, the
+    caller's credentials are the caller's problem — but any other non-2xx does
+    not, because a ``404`` means the configured base URL is wrong.
+    """
     client = request.app.state.upstream_client
+    metrics = getattr(request.app.state, "metrics", None)
     if not isinstance(client, httpx.AsyncClient):
-        return JSONResponse(
-            status_code=503,
-            content={"status": "not_ready", "upstream": "client_uninitialized"},
-        )
+        return _not_ready(metrics, "client_uninitialized")
 
     timeout = httpx.Timeout(settings.upstream_ready_timeout)
     headers: dict[str, str] = {}
@@ -100,34 +119,65 @@ async def check_upstream_ready(request: Request, settings: Settings) -> JSONResp
     for key, value in settings.parsed_custom_headers.items():
         headers[key] = value
 
+    health_url = settings.upstream_health_url
+    if health_url:
+        try:
+            health = await client.get(health_url, headers=headers, timeout=timeout)
+        except httpx.TimeoutException:
+            LOG.warning("readiness probe timed out on upstream health path")
+            return _not_ready(metrics, "engine_timeout")
+        except httpx.HTTPError:
+            LOG.warning("readiness probe failed to reach upstream health path")
+            return _not_ready(metrics, "unreachable")
+        if health.status_code >= 400 and health.status_code not in AUTH_STATUSES:
+            LOG.warning("readiness probe saw upstream health status %s", health.status_code)
+            return _not_ready(metrics, "engine_unhealthy", upstream_status=health.status_code)
+
     url = f"{settings.upstream_base_url}{MODELS_PATH}"
     try:
         response = await client.get(url, headers=headers, timeout=timeout)
     except httpx.TimeoutException:
         LOG.warning("readiness probe timed out contacting upstream")
-        return JSONResponse(
-            status_code=503,
-            content={"status": "not_ready", "upstream": "timeout"},
-        )
+        return _not_ready(metrics, "timeout")
     except httpx.HTTPError:
         LOG.warning("readiness probe failed to reach upstream")
+        return _not_ready(metrics, "unreachable")
+
+    if response.status_code in AUTH_STATUSES:
         return JSONResponse(
-            status_code=503,
-            content={"status": "not_ready", "upstream": "unreachable"},
+            status_code=200,
+            content={"status": "ok", "upstream_status": response.status_code},
         )
 
     if response.status_code >= 500:
         LOG.warning("readiness probe saw upstream status %s", response.status_code)
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "not_ready",
-                "upstream": "error",
-                "upstream_status": response.status_code,
-            },
+        return _not_ready(metrics, "error", upstream_status=response.status_code)
+
+    if response.status_code >= 400:
+        LOG.warning(
+            "readiness probe saw upstream status %s for %s; check UPSTREAM_URL",
+            response.status_code,
+            MODELS_PATH,
         )
+        return _not_ready(metrics, "unexpected_status", upstream_status=response.status_code)
+
+    if not _lists_any_model(response):
+        LOG.warning("readiness probe saw an upstream model list with no servable models")
+        return _not_ready(metrics, "no_models", upstream_status=response.status_code)
 
     return JSONResponse(
         status_code=200,
         content={"status": "ok", "upstream_status": response.status_code},
     )
+
+
+def _lists_any_model(response: httpx.Response) -> bool:
+    """True when the probe body is an OpenAI model list holding at least one model."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    data = payload.get("data")
+    return isinstance(data, list) and bool(data)

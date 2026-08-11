@@ -67,10 +67,13 @@ def test_app_lifespan_closes_shared_upstream_client() -> None:
     assert upstream_client.is_closed is True
 
 
+MODEL_LIST = {"data": [{"id": "deepseek-v4-flash", "object": "model"}]}
+
+
 @respx.mock
 async def test_readyz_ok_when_upstream_reachable() -> None:
     respx.get("http://upstream.test/v1/models").mock(
-        return_value=httpx.Response(200, json={"data": []})
+        return_value=httpx.Response(200, json=MODEL_LIST)
     )
     app = create_app(Settings(upstream_url="http://upstream.test"))
     transport = ASGITransport(app=app)
@@ -79,6 +82,85 @@ async def test_readyz_ok_when_upstream_reachable() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "upstream_status": 200}
+
+
+@respx.mock
+async def test_readyz_not_ready_when_upstream_serves_no_models() -> None:
+    respx.get("http://upstream.test/v1/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    app = create_app(Settings(upstream_url="http://upstream.test"))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://proxy.test") as client:
+        response = await client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["upstream"] == "no_models"
+
+
+@respx.mock
+async def test_readyz_not_ready_on_upstream_4xx_that_is_not_auth() -> None:
+    respx.get("http://upstream.test/v1/models").mock(
+        return_value=httpx.Response(404, json={"error": "not found"})
+    )
+    app = create_app(Settings(upstream_url="http://upstream.test"))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://proxy.test") as client:
+        response = await client.get("/readyz")
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["upstream"] == "unexpected_status"
+    assert body["upstream_status"] == 404
+
+
+@respx.mock
+async def test_readyz_not_ready_when_engine_health_path_fails() -> None:
+    health = respx.get("http://upstream.test/health").mock(
+        return_value=httpx.Response(503, text="engine dead")
+    )
+    models = respx.get("http://upstream.test/v1/models").mock(
+        return_value=httpx.Response(200, json=MODEL_LIST)
+    )
+    app = create_app(Settings(upstream_url="http://upstream.test", upstream_health_path="/health"))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://proxy.test") as client:
+        response = await client.get("/readyz")
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["upstream"] == "engine_unhealthy"
+    assert body["upstream_status"] == 503
+    assert health.called
+    # A dead engine short-circuits: the static model list proves nothing here.
+    assert not models.called
+
+
+@respx.mock
+async def test_readyz_ok_when_engine_health_path_passes() -> None:
+    respx.get("http://upstream.test/health").mock(return_value=httpx.Response(200))
+    respx.get("http://upstream.test/v1/models").mock(
+        return_value=httpx.Response(200, json=MODEL_LIST)
+    )
+    app = create_app(Settings(upstream_url="http://upstream.test", upstream_health_path="/health"))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://proxy.test") as client:
+        response = await client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "upstream_status": 200}
+
+
+@respx.mock
+async def test_readyz_failure_is_counted_in_metrics() -> None:
+    respx.get("http://upstream.test/v1/models").mock(side_effect=httpx.ConnectError("refused"))
+    app = create_app(Settings(upstream_url="http://upstream.test"))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://proxy.test") as client:
+        assert (await client.get("/readyz")).status_code == 503
+        metrics = (await client.get("/metrics")).text
+
+    assert 'opencode_proxy_upstream_ready_failures_total{reason="unreachable"} 1.0' in metrics
 
 
 @respx.mock

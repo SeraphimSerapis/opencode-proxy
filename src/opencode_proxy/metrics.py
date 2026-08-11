@@ -18,6 +18,7 @@ class ProxyMetrics:
     upstream_retries: Counter
     stream_idle_terminations: Counter
     empty_turns: Counter
+    upstream_ready_failures: Counter
 
     @classmethod
     def create(cls) -> ProxyMetrics:
@@ -62,6 +63,12 @@ class ProxyMetrics:
             empty_turns=Counter(
                 "opencode_proxy_empty_turns",
                 "Completed upstream turns with no content or tool calls.",
+                registry=registry,
+            ),
+            upstream_ready_failures=Counter(
+                "opencode_proxy_upstream_ready_failures",
+                "Readiness probes that judged the upstream unable to serve.",
+                ("reason",),
                 registry=registry,
             ),
         )

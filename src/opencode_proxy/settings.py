@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     upstream_write_timeout: float = Field(default=30.0, ge=0)
     upstream_pool_timeout: float = Field(default=30.0, ge=0)
     upstream_ready_timeout: float = Field(default=2.0, ge=0.1)
+    # A model-listing probe only proves the upstream HTTP router is up: vLLM and
+    # LiteLLM both serve /v1/models from static config, so it still answers 200
+    # after the inference engine behind it has died. Point this at an endpoint
+    # that actually exercises the engine (vLLM: /health) to catch that.
+    upstream_health_path: str = Field(default="", validation_alias="UPSTREAM_HEALTH_PATH")
     upstream_stream_idle_timeout: float = Field(
         default=120.0,
         ge=0,
@@ -220,6 +225,14 @@ class Settings(BaseSettings):
         return str(self.upstream_url).rstrip("/")
 
     @property
+    def upstream_health_url(self) -> str:
+        """Absolute URL of the optional engine-liveness probe, or empty if unset."""
+        path = self.upstream_health_path.strip()
+        if not path:
+            return ""
+        return f"{self.upstream_base_url}/{path.lstrip('/')}"
+
+    @property
     def upstream_safe_origin(self) -> str:
         return safe_origin(self.upstream_base_url)
 
@@ -269,6 +282,7 @@ class Settings(BaseSettings):
                 },
                 "max_concurrent": self.max_concurrent_upstream or None,
                 "max_retries": self.upstream_max_retries,
+                "health_path": self.upstream_health_path or None,
             },
             "streaming": {
                 "guard_chars": self.stream_guard_chars,

@@ -21,7 +21,9 @@ USER appuser
 
 EXPOSE 9526
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9526/healthz', timeout=2).read()"
+# /readyz, not /healthz: /healthz never touches the upstream, so a container
+# whose model server is dead would still report healthy.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9526/readyz', timeout=4).read()"
 
 CMD ["opencode-proxy"]
