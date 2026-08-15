@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import email.utils
 import json
 import logging
 import random
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote
 
@@ -21,6 +23,7 @@ from opencode_proxy.capture import StreamCapture, open_capture
 from opencode_proxy.compat import (
     JsonObject,
     RepairStats,
+    annotate_empty_completion,
     build_tool_call_chunks,
     complete_truncated_json,
     convert_chat_completion_response,
@@ -29,6 +32,7 @@ from opencode_proxy.compat import (
     find_complete_raw_tool_block_span,
     find_orphan_dsml_invoke_start,
     find_raw_tool_start,
+    is_empty_completion,
     make_content_chunk,
     make_finish_chunk,
     make_tool_argument_repair_chunk,
@@ -38,6 +42,7 @@ from opencode_proxy.compat import (
 )
 from opencode_proxy.concurrency import UpstreamConcurrencyLimiter
 from opencode_proxy.metrics import ProxyMetrics
+from opencode_proxy.request_compat import normalize_request
 from opencode_proxy.routing import (
     UpstreamTarget,
     default_upstream_target,
@@ -77,9 +82,37 @@ SSE_KEEPALIVE_COMMENT = b": keepalive\n\n"
 # the model most likely never ran.
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
+# A server may ask for a longer wait than our own backoff would pick. Honour it,
+# but never let one header park a caller's request for minutes.
+MAX_RETRY_AFTER_SECONDS = 30.0
+
 CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
 MODELS_PATH = "/v1/models"
 REASONING_SCAN_FIELDS = ("reasoning", "reasoning_content")
+
+# Terminators an OpenAI-compatible client knows how to handle. Anything else
+# (content_filter, vLLM's insufficient_system_resource, future additions) ended
+# the turn abnormally and is worth surfacing rather than passing off as a stop.
+KNOWN_FINISH_REASONS = frozenset({"stop", "length", "tool_calls", "function_call"})
+
+# Emitted instead of the token-budget notice when the upstream itself reported
+# an abnormal terminator, so the annotation never misattributes the cause.
+ABNORMAL_FINISH_NOTICE = (
+    "[proxy: the upstream ended this turn with finish_reason={reason} and produced "
+    "no output or tool call.]"
+)
+
+# Markers that identify a specific class of upstream rejection. Matched against
+# the error body because OpenAI-compatible servers overload the status codes.
+QUOTA_MARKERS = ("quota", "insufficient balance", "insufficient_quota", "credit")
+CONTEXT_WINDOW_MARKERS = (
+    "context length",
+    "context_length",
+    "context window",
+    "maximum context",
+    "too many tokens",
+    "reduce the length",
+)
 
 
 @dataclass
@@ -162,6 +195,15 @@ async def proxy_chat_completions(request: Request, settings: Settings) -> Respon
         target = resolve_upstream_target(settings, parsed_body)
         apply_target_model(parsed_body, target)
         repair_context = _tool_repair_context(parsed_body, settings)
+        if settings.normalize_requests:
+            stats = normalize_request(
+                parsed_body,
+                deepseek_profile=_has_deepseek_profile(parsed_body, settings),
+            )
+            metrics = _request_metrics(request)
+            if metrics is not None:
+                for kind, count in stats.as_labels().items():
+                    metrics.request_normalizations.labels(kind=kind).inc(count)
 
     stream = bool(parsed_body.get("stream")) if parsed_body is not None else False
     overload = await _acquire_upstream_slot(request)
@@ -268,46 +310,58 @@ async def _proxy_buffered_chat_completion(
 ) -> Response:
     headers = _forward_request_headers(request, settings=settings, stream=False, target=target)
     client = _upstream_client(request)
+    metrics = _request_metrics(request)
     try:
-        try:
-            upstream_response = await send_upstream_with_retries(
-                client,
-                lambda: client.build_request(
-                    request.method,
-                    _upstream_url(
-                        settings, CHAT_COMPLETIONS_PATH, request.url.query, target=target
+        empty_retries_left = settings.empty_response_retries
+        while True:
+            try:
+                upstream_response = await send_upstream_with_retries(
+                    client,
+                    lambda: client.build_request(
+                        request.method,
+                        _upstream_url(
+                            settings, CHAT_COMPLETIONS_PATH, request.url.query, target=target
+                        ),
+                        headers=headers,
+                        **_body_kwargs(parsed_body, raw_body),
                     ),
-                    headers=headers,
-                    **_body_kwargs(parsed_body, raw_body),
-                ),
-                settings=settings,
-                stream=False,
-                metrics=_request_metrics(request),
-            )
-        except httpx.HTTPError as exc:
-            return _proxy_error(exc)
+                    settings=settings,
+                    stream=False,
+                    metrics=metrics,
+                )
+            except httpx.HTTPError as exc:
+                return _proxy_error(exc)
 
-        response_headers = _forward_response_headers(upstream_response.headers)
-        content_type = upstream_response.headers.get("content-type", "")
-        if "application/json" not in content_type.lower():
-            return Response(
-                content=upstream_response.content,
-                status_code=upstream_response.status_code,
-                headers=response_headers,
-                media_type=content_type or None,
-            )
+            response_headers = _forward_response_headers(upstream_response.headers)
+            content_type = upstream_response.headers.get("content-type", "")
+            if upstream_response.status_code >= 400:
+                _note_upstream_error(upstream_response, metrics=metrics)
 
-        try:
-            response_body = upstream_response.json()
-        except json.JSONDecodeError:
-            return Response(
-                content=upstream_response.content,
-                status_code=upstream_response.status_code,
-                headers=response_headers,
-                media_type=content_type,
-            )
+            if "application/json" not in content_type.lower():
+                return Response(
+                    content=upstream_response.content,
+                    status_code=upstream_response.status_code,
+                    headers=response_headers,
+                    media_type=content_type or None,
+                )
 
-        if isinstance(response_body, dict):
+            try:
+                response_body = upstream_response.json()
+            except json.JSONDecodeError:
+                return Response(
+                    content=upstream_response.content,
+                    status_code=upstream_response.status_code,
+                    headers=response_headers,
+                    media_type=content_type,
+                )
+
+            if not isinstance(response_body, dict):
+                return JSONResponse(
+                    content=response_body,
+                    status_code=upstream_response.status_code,
+                    headers=response_headers,
+                )
+
             stats = RepairStats()
             converted, changed = convert_chat_completion_response(
                 response_body,
@@ -319,20 +373,35 @@ async def _proxy_buffered_chat_completion(
                 declared_tool_names=repair_context.declared_tool_names,
                 stats=stats,
             )
-            _record_repair_stats(_request_metrics(request), stats, transport="buffered")
+            _record_repair_stats(metrics, stats, transport="buffered")
             if changed:
                 LOG.info("converted raw tool call in non-streaming chat completion")
+            _record_usage(converted.get("usage"), metrics)
+            _note_finish_reasons(converted, metrics=metrics, transport="buffered")
+
+            # Emptiness is judged after repair: a raw tool-call block only
+            # becomes a tool call once converted.
+            if is_empty_completion(converted):
+                if empty_retries_left > 0:
+                    empty_retries_left -= 1
+                    if metrics is not None:
+                        metrics.upstream_retries.labels(reason="empty_response").inc()
+                    LOG.warning(
+                        "upstream returned a completed turn with no output; retrying "
+                        "(%d attempt(s) left)",
+                        empty_retries_left,
+                    )
+                    continue
+                if metrics is not None:
+                    metrics.empty_turns.inc()
+                LOG.warning("upstream returned a completed turn with no output; giving up")
+                annotate_empty_completion(converted, settings.empty_turn_notice)
+
             return JSONResponse(
                 content=converted,
                 status_code=upstream_response.status_code,
                 headers=response_headers,
             )
-
-        return JSONResponse(
-            content=response_body,
-            status_code=upstream_response.status_code,
-            headers=response_headers,
-        )
     finally:
         await _release_upstream_slot(request)
 
@@ -371,6 +440,7 @@ async def _proxy_streaming_chat_completion(
     response_headers = _forward_response_headers(upstream_response.headers)
     if upstream_response.status_code >= 400:
         content = await upstream_response.aread()
+        _note_upstream_error(upstream_response, metrics=_request_metrics(request))
         await upstream_response.aclose()
         await _release_upstream_slot(request)
         return Response(
@@ -455,15 +525,59 @@ async def send_upstream_with_retries(
         if response.status_code not in RETRYABLE_STATUS or attempt >= settings.upstream_max_retries:
             return response
 
+        retry_after = retry_after_seconds(response.headers.get("retry-after"))
         await response.aread()
         await response.aclose()
         attempt += 1
         if metrics is not None:
             metrics.upstream_retries.labels(reason=f"http_{response.status_code}").inc()
-        await _retry_backoff(attempt, reason=f"HTTP {response.status_code}")
+        await _retry_backoff(
+            attempt,
+            reason=f"HTTP {response.status_code}",
+            retry_after=retry_after,
+        )
 
 
-async def _retry_backoff(attempt: int, *, reason: str) -> None:
+def retry_after_seconds(header_value: str | None, *, now: datetime | None = None) -> float | None:
+    """Parse a ``Retry-After`` header into seconds, clamped to a sane bound.
+
+    Accepts both header forms (delay seconds and HTTP-date). A malformed,
+    negative, or absurdly distant value is ignored so a hostile or broken
+    upstream cannot park a caller's request.
+    """
+    if header_value is None:
+        return None
+    value = header_value.strip()
+    if not value:
+        return None
+
+    try:
+        delay = float(value)
+    except ValueError:
+        try:
+            when = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        delay = (when - (now or datetime.now(UTC))).total_seconds()
+
+    if delay <= 0:
+        return None
+    return min(delay, MAX_RETRY_AFTER_SECONDS)
+
+
+async def _retry_backoff(attempt: int, *, reason: str, retry_after: float | None = None) -> None:
+    if retry_after is not None:
+        LOG.warning(
+            "retrying upstream request (attempt %d) after %s in %.1fs (Retry-After)",
+            attempt,
+            reason,
+            retry_after,
+        )
+        await asyncio.sleep(retry_after)
+        return
+
     jitter = random.uniform(0, 0.25)  # noqa: S311 - retry jitter, not security
     delay = min(0.5 * (2**attempt), 8.0) + jitter
     LOG.warning("retrying upstream request (attempt %d) after %s in %.1fs", attempt, reason, delay)
@@ -517,6 +631,9 @@ async def _rewrite_sse_stream_inner(
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     model = "unknown"
     choice_states: dict[int, StreamChoiceState] = {}
+    # Usage rides either on the finish chunk or on a trailing usage-only chunk,
+    # and some upstreams send both. Keep the last one and count it once.
+    last_usage: object = None
 
     # Only an explicit upstream [DONE] proves a turn completed normally.
     fallback_finish_reason = "length"
@@ -565,6 +682,8 @@ async def _rewrite_sse_stream_inner(
 
             chunk_id = str(event.get("id") or chunk_id)
             model = str(event.get("model") or model)
+            if isinstance(event.get("usage"), dict):
+                last_usage = event["usage"]
             choices = event.get("choices")
             if not isinstance(choices, list) or not choices:
                 yield _encode_sse_json(event)
@@ -616,6 +735,8 @@ async def _rewrite_sse_stream_inner(
             chunk_id,
             model,
         )
+    finally:
+        _record_usage(last_usage, _request_metrics(request))
 
     async for done_payload in _finish_sse_stream(
         choice_states,
@@ -811,11 +932,20 @@ async def _finish_sse_stream(
             # A stream that ends without a finish_reason leaves agent clients
             # waiting on a turn the model already completed; always close the
             # choice out.
+            synthesized_reason = _finish_reason_for_state(fallback_finish_reason, state)
+            _note_finish_reason(
+                synthesized_reason,
+                chunk_id=chunk_id,
+                model=model,
+                choice_index=choice_index,
+                transport="synthesized",
+                metrics=metrics,
+            )
             yield _encode_sse_json(
                 make_finish_chunk(
                     chunk_id=chunk_id,
                     model=model,
-                    finish_reason=_finish_reason_for_state(fallback_finish_reason, state),
+                    finish_reason=synthesized_reason,
                     choice_index=choice_index,
                 ),
             )
@@ -866,6 +996,14 @@ def _rewrite_stream_choice(
                 finish_reason,
                 state,
             )
+            _note_finish_reason(
+                finish_reason,
+                chunk_id=chunk_id,
+                model=model,
+                choice_index=choice_index,
+                transport="streaming",
+                metrics=metrics,
+            )
             outputs.extend(
                 _repair_tool_call_arguments(
                     state,
@@ -883,6 +1021,7 @@ def _rewrite_stream_choice(
                     choice_index=choice_index,
                     notice=settings.empty_turn_notice,
                     upstream_completed=True,
+                    finish_reason=finish_reason,
                     metrics=metrics,
                 ),
             )
@@ -923,6 +1062,14 @@ def _rewrite_stream_choice(
         # it has to be split: fragments, then the repair, then the terminator.
         open_choice = {**choice, "finish_reason": None}
         outputs.append({**event, "choices": [open_choice]})
+        _note_finish_reason(
+            finish_reason,
+            chunk_id=chunk_id,
+            model=model,
+            choice_index=choice_index,
+            transport="streaming",
+            metrics=metrics,
+        )
         outputs.extend(
             _repair_tool_call_arguments(
                 state,
@@ -940,6 +1087,7 @@ def _rewrite_stream_choice(
                 choice_index=choice_index,
                 notice=settings.empty_turn_notice,
                 upstream_completed=True,
+                finish_reason=finish_reason,
                 metrics=metrics,
             ),
         )
@@ -1015,6 +1163,14 @@ def _rewrite_stream_choice(
         emitted_any_delta = True
 
     if finish_reason is not None:
+        _note_finish_reason(
+            finish_reason,
+            chunk_id=chunk_id,
+            model=model,
+            choice_index=choice_index,
+            transport="streaming",
+            metrics=metrics,
+        )
         outputs.extend(
             _flush_choice_buffers(
                 state,
@@ -1040,6 +1196,7 @@ def _rewrite_stream_choice(
                 choice_index=choice_index,
                 notice=settings.empty_turn_notice,
                 upstream_completed=True,
+                finish_reason=finish_reason,
                 metrics=metrics,
             ),
         )
@@ -1099,6 +1256,7 @@ def _annotate_empty_turn(
     choice_index: int,
     notice: str,
     upstream_completed: bool,
+    finish_reason: object = None,
     metrics: ProxyMetrics | None = None,
 ) -> list[JsonObject]:
     """Give the client something to act on when a turn produced nothing.
@@ -1128,6 +1286,11 @@ def _annotate_empty_turn(
     # wrong; the synthetic finish_reason already says it was truncated.
     if not notice or not (state.finish_sent or upstream_completed):
         return []
+    # An abnormal terminator (content_filter, insufficient_system_resource) is
+    # the upstream stopping the turn itself, so blaming the token budget would
+    # misattribute it. Say what actually happened instead.
+    if isinstance(finish_reason, str) and finish_reason not in KNOWN_FINISH_REASONS:
+        notice = ABNORMAL_FINISH_NOTICE.format(reason=finish_reason)
     state.emitted_content = True
     return [
         cast(
@@ -1565,6 +1728,15 @@ def _safe_text(body: bytes) -> str:
     return body.decode("utf-8", errors="replace")
 
 
+def _has_deepseek_profile(body: JsonObject, settings: Settings) -> bool:
+    """True when this request's model is configured as a DeepSeek V4 model."""
+    model = body.get("model")
+    if not isinstance(model, str):
+        return False
+    profile = settings.parsed_model_compatibility.get(model)
+    return profile is not None and profile.profile == "deepseek_v4"
+
+
 def _tool_repair_context(body: JsonObject, settings: Settings) -> ToolRepairContext:
     model = body.get("model")
     profile = settings.parsed_model_compatibility.get(model) if isinstance(model, str) else None
@@ -1652,6 +1824,138 @@ def _record_repair_stats(
         metrics.orphan_recovery.labels(outcome="rejected", reason=reason).inc(count)
     if stats.synthesized_ids:
         metrics.synthesized_tool_call_ids.labels(transport=transport).inc(stats.synthesized_ids)
+
+
+def _record_usage(usage: object, metrics: ProxyMetrics | None) -> None:
+    """Count upstream-reported tokens disjointly.
+
+    DeepSeek's ``prompt_tokens`` *includes* cache hits
+    (``prompt_tokens = prompt_cache_hit_tokens + prompt_cache_miss_tokens``), so
+    the cached share is subtracted out before ``input`` is counted. Summing the
+    kinds then reproduces the billed prompt without double counting.
+    """
+    if metrics is None or not isinstance(usage, dict):
+        return
+
+    prompt_tokens = _non_negative_int(usage.get("prompt_tokens"))
+    completion_tokens = _non_negative_int(usage.get("completion_tokens"))
+    prompt_details = usage.get("prompt_tokens_details")
+    cache_read = _non_negative_int(
+        prompt_details.get("cached_tokens") if isinstance(prompt_details, dict) else None,
+    )
+    if cache_read is None:
+        cache_read = _non_negative_int(usage.get("prompt_cache_hit_tokens"))
+    completion_details = usage.get("completion_tokens_details")
+    reasoning = _non_negative_int(
+        completion_details.get("reasoning_tokens") if isinstance(completion_details, dict) else None
+    )
+
+    if prompt_tokens is not None:
+        metrics.usage_tokens.labels(kind="input").inc(max(prompt_tokens - (cache_read or 0), 0))
+    if cache_read is not None:
+        metrics.usage_tokens.labels(kind="cache_read").inc(cache_read)
+    if completion_tokens is not None:
+        metrics.usage_tokens.labels(kind="output").inc(completion_tokens)
+    if reasoning is not None:
+        metrics.usage_tokens.labels(kind="reasoning").inc(reasoning)
+
+
+def _non_negative_int(value: object) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def finish_reason_label(reason: object) -> str:
+    """Bounded metric label for an upstream-controlled ``finish_reason``."""
+    if isinstance(reason, str) and reason in KNOWN_FINISH_REASONS:
+        return reason
+    if reason is None:
+        return "absent"
+    return "other"
+
+
+def _note_finish_reason(
+    reason: object,
+    *,
+    chunk_id: str,
+    model: str,
+    choice_index: int,
+    transport: str,
+    metrics: ProxyMetrics | None,
+) -> None:
+    if metrics is not None:
+        metrics.finish_reasons.labels(
+            reason=finish_reason_label(reason),
+            transport=transport,
+        ).inc()
+    if isinstance(reason, str) and reason not in KNOWN_FINISH_REASONS:
+        LOG.warning(
+            "upstream closed a turn with an abnormal finish_reason=%r; "
+            "chunk_id=%s model=%s choice=%d",
+            reason,
+            chunk_id,
+            model,
+            choice_index,
+        )
+
+
+def _note_finish_reasons(body: JsonObject, *, metrics: ProxyMetrics | None, transport: str) -> None:
+    """Record the terminator of every choice in a buffered completion."""
+    choices = body.get("choices")
+    if not isinstance(choices, list):
+        return
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        _note_finish_reason(
+            choice.get("finish_reason"),
+            chunk_id=str(body.get("id") or ""),
+            model=str(body.get("model") or ""),
+            choice_index=_choice_index(choice),
+            transport=transport,
+            metrics=metrics,
+        )
+
+
+def classify_upstream_status(status_code: int, body_text: str) -> str:
+    """Name the failure class behind an upstream error status.
+
+    OpenAI-compatible servers overload their status codes, so the body decides
+    between the cases that call for different operator action: an exhausted
+    balance is not a rate limit, and an over-long prompt is not a bad request.
+    """
+    detail = body_text.lower()
+    if status_code in {401, 403}:
+        return "auth"
+    if status_code == 429:
+        if any(marker in detail for marker in QUOTA_MARKERS):
+            return "quota"
+        return "rate_limit"
+    if status_code == 400:
+        if any(marker in detail for marker in CONTEXT_WINDOW_MARKERS):
+            return "context_window_exceeded"
+        return "invalid_request"
+    if 500 <= status_code < 600:
+        return "server"
+    if 400 <= status_code < 500:
+        return "http_4xx"
+    return "http_other"
+
+
+def _note_upstream_error(response: httpx.Response, *, metrics: ProxyMetrics | None) -> None:
+    """Classify, count, and log an upstream error without leaking its body."""
+    error_type = classify_upstream_status(response.status_code, _safe_text(response.content))
+    if metrics is not None:
+        metrics.upstream_errors.labels(type=error_type).inc()
+    request_id = response.headers.get("x-request-id") or response.headers.get(
+        "x-deepseek-request-id"
+    )
+    LOG.warning(
+        "upstream chat completion failed status=%d type=%s request_id=%s retry_after=%s",
+        response.status_code,
+        error_type,
+        request_id or "-",
+        response.headers.get("retry-after") or "-",
+    )
 
 
 def _earliest_span(
