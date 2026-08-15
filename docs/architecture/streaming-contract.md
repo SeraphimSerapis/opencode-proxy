@@ -7,8 +7,7 @@ tags: [sse, streaming, keepalive, timeouts, retries, termination, tool-calls]
 status: active
 generated:
   by: claude-code/opus-5
-  at: 2026-08-03T09:40:00+02:00
-verified: 2026-08-03
+  at: 2026-08-15T16:40:00+02:00
 ---
 
 # Streaming contract
@@ -117,10 +116,22 @@ Transparent passthrough routes are excluded: they forward
   comment is forwarded immediately and can appear before buffered content that
   logically preceded it. Flushing on every raw frame would defeat the guard
   buffer, which is the worse trade.
+* **That an upstream `finish_reason` is one the client recognises.** An unknown
+  terminator (`content_filter`, vLLM's `insufficient_system_resource`) is
+  forwarded unchanged, because rewriting a terminator is worse than reporting an
+  unfamiliar one. It is logged and counted under
+  `opencode_proxy_finish_reasons{reason="other"}`, and if the turn was also
+  empty its notice names the terminator rather than the token budget.
 * **An unambiguous signal on mid-stream upstream failure.** The synthesised
   `"length"` finish reason means "the proxy closed this, not the upstream," but
   it is indistinguishable from a real `max_tokens` truncation on the wire — see
   above. The client is not told *why* the turn was cut short, only that it was.
+
+Two upstream shapes are absorbed rather than forwarded. A `reasoning_content`
+delta that is the empty string -- the first thinking chunk of every DeepSeek
+turn -- opens no reasoning block in the client. A trailing usage-only chunk is
+passed through untouched, and its counts are recorded once per turn, keeping the
+last usage seen if the upstream reports it both on the finish chunk and after.
 
 ## Client disconnect
 

@@ -14,8 +14,9 @@ Build a small, production-ready FastAPI proxy between OpenCode/Ollama clients an
 - Add focused tests for every supported tool-call format before changing parser behavior.
 - Keep commits atomic: scaffold, parser behavior, proxy routing/streaming, tests/docs, and validation fixes should be separate commits.
 
-`routing.py` holds modality detection and upstream selection and `config_file.py`
-holds YAML loading; both stay free of FastAPI imports so they can be unit tested
+`request_compat.py` holds outgoing message normalization, `routing.py` holds
+modality detection and upstream selection, and `config_file.py`
+holds YAML loading; all three stay free of FastAPI imports so they can be unit tested
 directly. The Ollama adapter is separated into `ollama_models.py`, `ollama_translate.py`,
 `ollama_streaming.py`, and `ollama.py`; keep translation logic independent from
 FastAPI route wiring. `tools/mock_openai.py` is the dependency-free upstream for
@@ -71,7 +72,9 @@ port `9526`; do not bring up the retired standalone `ollama-proxy` service.
 - `UPSTREAM_READY_TIMEOUT`: `/readyz` upstream probe timeout in seconds. Default: `2`.
 - `UPSTREAM_HEALTH_PATH`: optional extra `/readyz` probe that exercises the upstream engine, for example `/health` for vLLM. Unset by default. `/v1/models` alone is served from static config and stays `200` after the engine dies.
 - `SSE_KEEPALIVE_INTERVAL`: seconds of upstream silence before sending an SSE keepalive comment. Default: `10`. Use `0` to disable.
-- `UPSTREAM_MAX_RETRIES`: retries for chat/generate requests that fail before any response byte reaches the client. Default: `2`. Use `0` to disable. Never retries once a stream has started.
+- `UPSTREAM_MAX_RETRIES`: retries for chat/generate requests that fail before any response byte reaches the client. Default: `2`. Use `0` to disable. Never retries once a stream has started. A `Retry-After` header on a retryable status paces the retry, clamped to 30s.
+- `EMPTY_RESPONSE_RETRIES`: re-sends a buffered chat request whose turn completed with no content and no tool call. Default: `1`. Use `0` to disable. Streamed turns are never re-sent.
+- `NORMALIZE_REQUESTS`: repair outgoing message shapes a DeepSeek-compatible upstream rejects (`null` assistant content, reasoning replayed on non-tool turns, empty tool results). Default: `true`.
 - `UPSTREAM_STREAM_IDLE_TIMEOUT`: seconds to wait for the next upstream SSE frame *after the first* before terminating the client stream. Default: `30`. Use `0` to disable.
 - `UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT`: seconds to wait for the *first* upstream SSE frame, covering prefill. Default: `240`. Use `0` to disable.
 - `STREAM_GUARD_CHARS`: amount of non-tool text to hold while checking for split tool tags. Default: `192`.

@@ -1,5 +1,14 @@
 # Documentation Update Log
 
+## 2026-08-15
+
+* **Feature**: The proxy now repairs outgoing message shapes before forwarding (`NORMALIZE_REQUESTS`, default on): `null` assistant content becomes `""`, `reasoning_content` is replayed only on tool-call turns and dropped elsewhere, empty tool results carry `(no output)`, and for `deepseek_v4` models `reasoning_effort: off` becomes `thinking: {"type": "disabled"}`. Each of these is a shape the DeepSeek API rejects outright, and because a rejected message sits durably in the caller's session log, one bad turn was enough to break every later turn of that session. Rules taken from [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness), the vendor's own client. See [conform to DeepSeek's own client](decisions/deepseek-wire-contract.md).
+* **Feature**: A buffered turn that completes with no content and no tool call is re-sent once (`EMPTY_RESPONSE_RETRIES`) before being annotated, and the buffered transport now gets the same `[proxy: ...]` notice streamed turns already had. A `length` truncation is excluded from the retry. See [retry only before the first byte](decisions/retry-policy.md).
+* **Fix**: An abnormal upstream terminator (`content_filter`, vLLM's `insufficient_system_resource`) no longer gets the token-budget notice, which was misattributing every one of them. The notice now names the terminator. The value itself is still forwarded unchanged.
+* **Reliability**: A `Retry-After` header on a retryable status now paces the retry instead of the proxy's own backoff curve, clamped to 30s. Both header forms are parsed; malformed or absurd values fall back to the curve.
+* **Observability**: Four new counters -- `opencode_proxy_request_normalizations{kind}`, `opencode_proxy_upstream_errors{type}` (auth, quota, rate_limit, context_window_exceeded, invalid_request, server), `opencode_proxy_finish_reasons{reason,transport}`, and `opencode_proxy_usage_tokens{kind}`. Token usage is counted disjointly: DeepSeek reports `prompt_tokens` with cache hits included, so the cached share is subtracted out of `input`. All counters are documented in the [API surface](reference/api-surface.md).
+* **Review**: Read DeepSeek's `deepseek-harness` against this proxy. `DSML` appears nowhere in it -- the vendor client assumes native `tool_calls` -- confirming that every raw-text repair here compensates for the self-hosted chat template rather than for the model contract. Recorded the V4 Flash serving facts (1M context, 256k default output cap) in the [DeepSeek V4 runbook](runbooks/deepseek-v4.md), and the deliberate divergences (SSE tail flushing, reasoning-only turns counted as empty) in the decision.
+
 ## 2026-08-11
 
 * **Fix**: The container reported `healthy` with its model server down. The

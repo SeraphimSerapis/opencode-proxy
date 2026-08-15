@@ -7,8 +7,7 @@ tags: [proxy, fastapi, streaming, ollama, litellm, vllm, topology]
 status: active
 generated:
   by: claude-code/opus-5
-  at: 2026-08-01T16:20:00+02:00
-verified: 2026-08-01
+  at: 2026-08-15T16:40:00+02:00
 ---
 
 # Request pipeline
@@ -68,6 +67,7 @@ fixtures:
 | Sanitize tools | Drop non-`function` tools; drop `tools` entirely if none remain | `SANITIZE_TOOLS=false` |
 | Drop fields | Remove `REQUEST_DROP_FIELDS` entries | No fields configured |
 | Model alias | Rewrite a client-facing alias to the upstream model name | No alias matches |
+| Normalize messages | Repair shapes a DeepSeek-compatible upstream rejects: `null` assistant content, reasoning replayed on the wrong turns, empty tool results. Maps `reasoning_effort: off` to `thinking` for `deepseek_v4` models | `NORMALIZE_REQUESTS=false` |
 | Modality routing | Pick an alternate upstream and model for image/audio requests | No matching route |
 | Concurrency slot | Acquire one of `MAX_CONCURRENT_UPSTREAM`; `429` if full | Limit disabled |
 | Upstream send | Retried before the first response byte | `UPSTREAM_MAX_RETRIES=0` |
@@ -76,8 +76,13 @@ A body the proxy cannot parse is forwarded verbatim. None of the rewriting
 stages run in that case, by design: an unparseable body is not something to
 guess at.
 
+Message normalization follows the rules in DeepSeek's own client; see
+[conform to DeepSeek's own client](../decisions/deepseek-wire-contract.md).
+
 Streaming and non-streaming diverge after the upstream call. Non-streaming
-responses are repaired in one pass by `convert_chat_completion_response`.
+responses are repaired in one pass by `convert_chat_completion_response`, then
+checked for emptiness: a completed turn carrying no content and no tool call is
+retried up to `EMPTY_RESPONSE_RETRIES` times before it is annotated.
 Streaming responses go through the SSE rewriter — see
 [tool-call repair](tool-call-repair.md) and the
 [streaming contract](streaming-contract.md).

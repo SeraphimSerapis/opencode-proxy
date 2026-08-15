@@ -7,8 +7,7 @@ tags: [configuration, environment, yaml, aliases, routing]
 status: active
 generated:
   by: claude-code/opus-5
-  at: 2026-08-03T09:40:00+02:00
-verified: 2026-08-03
+  at: 2026-08-15T16:40:00+02:00
 ---
 
 # Configuration
@@ -44,7 +43,8 @@ environment.
 | `UPSTREAM_POOL_TIMEOUT` | `30` | Seconds. |
 | `UPSTREAM_READY_TIMEOUT` | `2` | `/readyz` probe timeout. |
 | `UPSTREAM_HEALTH_PATH` | unset | Extra `/readyz` probe that exercises the engine, e.g. `/health` for vLLM. |
-| `UPSTREAM_MAX_RETRIES` | `2` | Retries before the first response byte. `0` disables. |
+| `UPSTREAM_MAX_RETRIES` | `2` | Retries before the first response byte. `0` disables. A `Retry-After` header on a retryable status wins over the backoff curve, clamped to 30s. |
+| `EMPTY_RESPONSE_RETRIES` | `1` | Re-sends a buffered request whose turn completed with no content and no tool call. `0` disables. Streamed turns are never retried. |
 | `MAX_CONCURRENT_UPSTREAM` | `8` | Concurrent chat/generate calls; over the limit returns `429`. `0` disables. |
 | `CUSTOM_HEADERS` / `UPSTREAM_HEADERS` | unset | Extra upstream headers. JSON object or newline-separated `Header: value`. |
 
@@ -94,6 +94,7 @@ reports only whether capture is enabled, not the directory path.
 | `MAX_TOOL_CALLS` | `32` | More raw calls in one block pass through as text; standard streamed repair tracks at most this many indexes. |
 | `MAX_TOOL_ARGUMENT_CHARS` | `262144` | Larger raw arguments pass through as text; standard streamed tool-call repair stops accumulating at this bound. |
 | `SANITIZE_TOOLS` | `true` | Drop non-`function` tools from requests. |
+| `NORMALIZE_REQUESTS` | `true` | Repair outgoing message shapes a DeepSeek-compatible upstream rejects. See [conform to DeepSeek's own client](/decisions/deepseek-wire-contract.md). |
 | `REQUEST_DROP_FIELDS` | unset | Comma-separated request fields removed before forwarding. |
 
 Every limit degrades to passthrough-as-text. None of them drop content.

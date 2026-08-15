@@ -7,8 +7,7 @@ tags: [sse, streaming, tool-calls, agents, reliability]
 status: active
 generated:
   by: claude-code/opus-5
-  at: 2026-08-03T06:20:00+02:00
-verified: 2026-08-03
+  at: 2026-08-15T16:40:00+02:00
 ---
 
 # A terminated turn must also be a usable turn
@@ -78,6 +77,17 @@ chunk so the notice remains valid streamed content. When the proxy is
 synthesising a terminator after a transport failure or idle timeout, the turn is
 empty because the stream broke; blaming the token budget would be wrong, and the
 synthetic `finish_reason` already reports the truncation.
+
+The same annotation now covers buffered replies, which previously returned an
+empty message with no explanation, and it tells the truth about *why* the turn
+was empty. When the upstream closed the turn with a terminator outside
+`stop`/`length`/`tool_calls` -- `content_filter`, vLLM's
+`insufficient_system_resource` -- the notice names that terminator instead of
+blaming the token budget, which was misattributing every such case. The
+terminator itself is forwarded unchanged and counted under
+`opencode_proxy_finish_reasons`. See
+[conform to DeepSeek's own client](deepseek-wire-contract.md), which also adds a
+retry for the buffered case.
 
 ## Consequences
 

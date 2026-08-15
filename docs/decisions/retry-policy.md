@@ -7,8 +7,7 @@ tags: [retries, reliability, streaming, idempotency]
 status: active
 generated:
   by: claude-code/opus-5
-  at: 2026-08-01T16:20:00+02:00
-verified: 2026-08-01
+  at: 2026-08-15T16:40:00+02:00
 sources:
   - id: visionbridge
     title: VisionBridge backend client — retry rule adapted from its `started` flag
@@ -29,7 +28,22 @@ Retry chat and generate requests up to `UPSTREAM_MAX_RETRIES` (default 2) on
 transport errors and upstream `429`, `500`, `502`, `503`, `504`, with exponential
 backoff (`min(0.5 · 2ⁿ, 8)` seconds) plus up to 250 ms of jitter.
 
+A `Retry-After` header on a retryable status replaces that curve, clamped to 30
+seconds so a broken or hostile upstream cannot park a caller's request. Both
+header forms are accepted; a malformed, negative, or absurd value is ignored and
+the normal backoff applies.
+
 **Retries happen only before any response byte has reached the client.**
+
+One narrow exception is judged after the response, not before it: a *buffered*
+turn that completes with no content and no tool call is re-sent up to
+`EMPTY_RESPONSE_RETRIES` times (default 1). That is a failed generation rather
+than an answer, and nothing has been shown to the client yet, so the reasoning
+below does not apply to it. A turn cut short by `length` is excluded -- it is
+truthfully reported, and a replay burns the same budget again. Streamed turns
+are never re-sent for this: their emptiness is only knowable once the bytes have
+already reached the client. See
+[conform to DeepSeek's own client](deepseek-wire-contract.md).
 
 ## Why that boundary
 
@@ -75,3 +89,6 @@ upstream call and is unaffected.
   seconds in backoff. Three existing tests were updated for this.
 * A retried request occupies its concurrency slot for the whole sequence,
   including backoff.
+* An empty buffered turn costs one extra generation by default. It is counted as
+  `opencode_proxy_upstream_retries{reason="empty_response"}`; set
+  `EMPTY_RESPONSE_RETRIES=0` to disable.
