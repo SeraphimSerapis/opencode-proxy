@@ -1,3 +1,5 @@
+FROM ghcr.io/astral-sh/uv:0.10.8 AS uv
+
 FROM python:3.13-slim AS runtime
 
 LABEL org.opencontainers.image.title="opencode-proxy" \
@@ -11,10 +13,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY pyproject.toml README.md /app/
+COPY --from=uv /uv /uvx /bin/
+COPY pyproject.toml uv.lock README.md /app/
 COPY src /app/src
 
-RUN pip install --no-cache-dir .
+RUN uv sync --locked --no-dev --no-editable
+
+ENV PATH="/app/.venv/bin:$PATH"
 
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser
 USER appuser

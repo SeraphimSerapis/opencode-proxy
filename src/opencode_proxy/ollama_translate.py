@@ -78,7 +78,7 @@ def ollama_chat_to_openai(request: OllamaChatRequest) -> dict[str, Any]:
     messages, thinking_enabled = rewrite_openclaw_messages(request.messages, request.model)
     payload: dict[str, Any] = {
         "model": request.model,
-        "messages": [_message_to_openai(message) for message in messages],
+        "messages": _messages_to_openai(messages),
         "stream": request.stream,
     }
 
@@ -119,7 +119,50 @@ def ollama_chat_to_openai(request: OllamaChatRequest) -> dict[str, Any]:
     return payload
 
 
-def _message_to_openai(message: OllamaMessage) -> dict[str, Any]:
+def _messages_to_openai(messages: list[OllamaMessage]) -> list[dict[str, Any]]:
+    """Translate history while correlating Ollama's name-only tool results."""
+    translated: list[dict[str, Any]] = []
+    pending_calls: list[tuple[str, str]] = []
+    next_call_index = 0
+
+    for message in messages:
+        tool_call_ids: list[str] | None = None
+        tool_result_id: str | None = None
+        if message.role == "assistant" and message.tool_calls:
+            tool_call_ids = []
+            for tool_call in message.tool_calls:
+                call_id = f"call_{next_call_index}"
+                next_call_index += 1
+                tool_call_ids.append(call_id)
+                pending_calls.append((tool_call.function.name, call_id))
+        elif message.role == "tool":
+            match_index = next(
+                (
+                    index
+                    for index, (name, _) in enumerate(pending_calls)
+                    if message.tool_name is None or name == message.tool_name
+                ),
+                None,
+            )
+            if match_index is not None:
+                _, tool_result_id = pending_calls.pop(match_index)
+
+        translated.append(
+            _message_to_openai(
+                message,
+                tool_call_ids=tool_call_ids,
+                tool_result_id=tool_result_id,
+            )
+        )
+    return translated
+
+
+def _message_to_openai(
+    message: OllamaMessage,
+    *,
+    tool_call_ids: list[str] | None = None,
+    tool_result_id: str | None = None,
+) -> dict[str, Any]:
     result: dict[str, Any] = {"role": message.role}
     if message.images:
         parts: list[dict[str, Any]] = []
@@ -133,9 +176,10 @@ def _message_to_openai(message: OllamaMessage) -> dict[str, Any]:
         result["content"] = message.content
 
     if message.role == "assistant" and message.tool_calls:
+        call_ids = tool_call_ids or [f"call_{index}" for index in range(len(message.tool_calls))]
         result["tool_calls"] = [
             {
-                "id": f"call_{index}",
+                "id": call_id,
                 "type": "function",
                 "function": {
                     "name": tool_call.function.name,
@@ -144,13 +188,19 @@ def _message_to_openai(message: OllamaMessage) -> dict[str, Any]:
                     ),
                 },
             }
-            for index, tool_call in enumerate(message.tool_calls)
+            for tool_call, call_id in zip(message.tool_calls, call_ids, strict=True)
         ]
         if not message.content:
             result["content"] = None
 
+    if message.role == "assistant" and message.thinking:
+        # Ollama calls this field ``thinking``; DeepSeek's tool replay contract
+        # calls it ``reasoning_content``. The shared request normalizer decides
+        # whether it is valid to replay on this turn.
+        result["reasoning_content"] = message.thinking
+
     if message.role == "tool":
-        result["tool_call_id"] = f"call_{message.tool_name or 'unknown'}"
+        result["tool_call_id"] = tool_result_id or f"call_{message.tool_name or 'unknown'}"
     return result
 
 

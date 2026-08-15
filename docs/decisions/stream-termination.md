@@ -6,9 +6,8 @@ resource: /home/tim/projects/opencode-proxy/src/opencode_proxy/proxy.py
 tags: [sse, streaming, termination, timeouts, reliability]
 status: active
 generated:
-  by: claude-code/opus-5
-  at: 2026-08-01T16:20:00+02:00
-verified: 2026-08-01
+  by: codex/gpt-5
+  at: 2026-08-15T16:21:21+02:00
 ---
 
 # Always terminate a streamed turn
@@ -69,8 +68,8 @@ A single flat budget cannot serve both. The original `120` sat *below* the p99.9
 of prefill — killing legitimate slow starts — while being ~80× the p99.9 of a
 mid-stream gap, so a genuinely dead stream held the client for two minutes.
 
-`UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT` (default `240`) covers prefill with room
-above the observed p99.9. `UPSTREAM_STREAM_IDLE_TIMEOUT` (default `30`) covers
+`UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT` (default `480`) covers prefill with room
+above the histogram-estimated p99 tail. `UPSTREAM_STREAM_IDLE_TIMEOUT` (default `30`) covers
 the gaps after the first frame, which is still a 20× margin over the inter-token
 p99.9. Terminations record which budget expired in
 `opencode_proxy_stream_idle_terminations{phase}`.

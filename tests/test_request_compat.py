@@ -95,6 +95,34 @@ def test_empty_tool_results_get_placeholder_content() -> None:
     assert stats.empty_tool_results == 2
 
 
+def test_deepseek_message_and_token_aliases_are_normalized() -> None:
+    body: dict[str, Any] = {
+        "messages": [{"role": "developer", "content": "Be concise"}],
+        "max_completion_tokens": 123,
+    }
+
+    stats = normalize_request(body, thinking_transport="api")
+
+    assert body["messages"] == [{"role": "system", "content": "Be concise"}]
+    assert body["max_tokens"] == 123
+    assert "max_completion_tokens" not in body
+    assert stats.developer_roles == 1
+    assert stats.max_completion_tokens == 1
+
+
+def test_legacy_max_tokens_wins_when_both_limits_are_present() -> None:
+    body: dict[str, Any] = {
+        "messages": [],
+        "max_tokens": 50,
+        "max_completion_tokens": 123,
+    }
+
+    normalize_request(body, thinking_transport="api")
+
+    assert body["max_tokens"] == 50
+    assert "max_completion_tokens" not in body
+
+
 def test_disabled_reasoning_effort_becomes_the_thinking_field() -> None:
     body: dict[str, Any] = {"model": "deepseek-v4", "reasoning_effort": "off", "messages": []}
 
@@ -113,6 +141,19 @@ def test_accepted_reasoning_effort_is_forwarded_untouched() -> None:
     assert body["reasoning_effort"] == "max"
     assert "thinking" not in body
     assert not stats.changed
+
+
+def test_reasoning_effort_aliases_are_canonicalized_for_the_api() -> None:
+    body: dict[str, Any] = {
+        "model": "deepseek-v4",
+        "reasoning_effort": " XHIGH ",
+        "messages": [],
+    }
+
+    stats = normalize_request(body, thinking_transport="api")
+
+    assert body["reasoning_effort"] == "high"
+    assert stats.reasoning_effort_aliases == 1
 
 
 def test_chat_template_transport_uses_the_vllm_argument() -> None:
@@ -150,6 +191,106 @@ def test_chat_template_transport_keeps_the_callers_other_kwargs() -> None:
     normalize_request(body, thinking_transport="chat_template_kwargs")
 
     assert body["chat_template_kwargs"] == {"add_generation_prompt": True, "thinking": False}
+
+
+def test_api_transport_accepts_the_explicit_deepseek_thinking_object() -> None:
+    body: dict[str, Any] = {
+        "model": "deepseek-v4",
+        "thinking": {"type": "disabled"},
+        "messages": [],
+    }
+
+    stats = normalize_request(body, thinking_transport="api")
+
+    assert body["thinking"] == {"type": "disabled"}
+    assert not stats.changed
+
+
+def test_api_transport_canonicalizes_an_ollama_boolean_thinking_field() -> None:
+    body: dict[str, Any] = {
+        "model": "deepseek-v4",
+        "thinking": False,
+        "messages": [],
+    }
+
+    stats = normalize_request(body, thinking_transport="api")
+
+    assert body["thinking"] == {"type": "disabled"}
+    assert stats.thinking_disabled == 1
+
+
+def test_chat_template_transport_converts_the_explicit_deepseek_thinking_object() -> None:
+    body: dict[str, Any] = {
+        "model": "deepseek-v4-flash",
+        "thinking": {"type": "disabled"},
+        "messages": [],
+    }
+
+    stats = normalize_request(body, thinking_transport="chat_template_kwargs")
+
+    assert body["chat_template_kwargs"] == {"thinking": False}
+    assert "thinking" not in body
+    assert stats.thinking_disabled == 1
+
+
+def test_explicit_thinking_wins_over_a_conflicting_effort() -> None:
+    body: dict[str, Any] = {
+        "model": "deepseek-v4-flash",
+        "thinking": {"type": "disabled"},
+        "reasoning_effort": "max",
+        "messages": [],
+    }
+
+    normalize_request(body, thinking_transport="chat_template_kwargs")
+
+    assert body["chat_template_kwargs"] == {"thinking": False}
+    assert "reasoning_effort" not in body
+
+
+def test_api_transport_keeps_effort_with_explicit_enabled_thinking() -> None:
+    body: dict[str, Any] = {
+        "model": "deepseek-v4",
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "max",
+        "messages": [],
+    }
+
+    normalize_request(body, thinking_transport="api")
+
+    assert body["thinking"] == {"type": "enabled"}
+    assert body["reasoning_effort"] == "max"
+
+
+def test_api_transport_drops_effort_that_conflicts_with_explicit_thinking() -> None:
+    disabled: dict[str, Any] = {
+        "thinking": {"type": "disabled"},
+        "reasoning_effort": "max",
+        "messages": [],
+    }
+    enabled: dict[str, Any] = {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "off",
+        "messages": [],
+    }
+
+    normalize_request(disabled, thinking_transport="api")
+    normalize_request(enabled, thinking_transport="api")
+
+    assert disabled == {"thinking": {"type": "disabled"}, "messages": []}
+    assert enabled == {"thinking": {"type": "enabled"}, "messages": []}
+
+
+def test_api_transport_canonicalizes_recognized_thinking_object_values() -> None:
+    body: dict[str, Any] = {
+        "model": "deepseek-v4",
+        "thinking": {"type": " DISABLED "},
+        "messages": [],
+    }
+
+    stats = normalize_request(body, thinking_transport="api")
+
+    assert body["thinking"] == {"type": "disabled"}
+    assert stats.thinking_disabled == 1
 
 
 def test_thinking_mapping_is_deepseek_only() -> None:
@@ -228,6 +369,8 @@ def test_retry_after_accepts_both_header_forms() -> None:
     assert retry_after_seconds("") is None
     assert retry_after_seconds("soon") is None
     assert retry_after_seconds("-5") is None
+    assert retry_after_seconds("nan") is None
+    assert retry_after_seconds("inf") is None
     # A distant date cannot park the caller for longer than the clamp.
     assert retry_after_seconds("Sat, 15 Aug 2026 18:00:00 GMT", now=now) == 30.0
     assert retry_after_seconds("600") == 30.0

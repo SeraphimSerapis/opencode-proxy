@@ -1,17 +1,32 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import httpx
 import respx
 
 from opencode_proxy.app import create_app
+from opencode_proxy.compat import (
+    DSML_INVOKE_CLOSE,
+    DSML_INVOKE_OPEN,
+    DSML_PARAMETER_CLOSE,
+    DSML_PARAMETER_OPEN,
+)
 from opencode_proxy.settings import Settings
 
 
 async def _client(settings: Settings | None = None) -> httpx.AsyncClient:
     app = create_app(settings or Settings(upstream_url="http://upstream.test"))
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy.test")
+
+
+def _orphan_tool_call() -> str:
+    return (
+        f'{DSML_INVOKE_OPEN} name="read">'
+        f'{DSML_PARAMETER_OPEN} name="path">README.md{DSML_PARAMETER_CLOSE}'
+        f"{DSML_INVOKE_CLOSE}"
+    )
 
 
 @respx.mock
@@ -197,6 +212,264 @@ async def test_ollama_generate_and_embed_translate_upstream_requests() -> None:
     assert embed.called
     assert generate.json()["response"] == "world"
     assert embeddings.json()["embeddings"] == [[0.1, 0.2]]
+
+
+@respx.mock
+async def test_ollama_deepseek_profile_normalizes_thinking_history_and_retries_empty_turn() -> None:
+    forwarded: list[dict[str, Any]] = []
+
+    def chat_handler(request: httpx.Request) -> httpx.Response:
+        forwarded.append(json.loads(request.content))
+        if len(forwarded) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "model": "deepseek-v4-flash",
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": ""},
+                            "finish_reason": "stop",
+                        },
+                    ],
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "model": "deepseek-v4-flash",
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    },
+                ],
+            },
+        )
+
+    upstream = respx.post("http://upstream.test/v1/chat/completions").mock(
+        side_effect=chat_handler,
+    )
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        model_compatibility=json.dumps(
+            {
+                "deepseek-v4-flash": {
+                    "compatibility": "deepseek_v4",
+                    "thinking_transport": "chat_template_kwargs",
+                },
+            },
+        ),
+    )
+
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/api/chat",
+            json={
+                "model": "deepseek-v4-flash",
+                "think": False,
+                "stream": False,
+                "messages": [
+                    {"role": "user", "content": "call the tool"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "thinking": "I should call it",
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "echo",
+                                    "arguments": {"value": "x"},
+                                },
+                            },
+                        ],
+                    },
+                    {"role": "tool", "tool_name": "echo", "content": ""},
+                ],
+            },
+        )
+        metrics = (await client.get("/metrics")).text
+
+    assert upstream.call_count == 2
+    assert response.json()["message"]["content"] == "ok"
+    first = forwarded[0]
+    assert first["chat_template_kwargs"] == {"thinking": False}
+    assert "reasoning_effort" not in first
+    assistant, tool = first["messages"][1:]
+    assert assistant["content"] == ""
+    assert assistant["reasoning_content"] == "I should call it"
+    assert assistant["tool_calls"][0]["id"] == tool["tool_call_id"]
+    assert tool["content"] == "(no output)"
+    assert 'opencode_proxy_request_normalizations_total{kind="thinking_disabled"} 1.0' in metrics
+    assert 'opencode_proxy_upstream_retries_total{reason="empty_response"} 1.0' in metrics
+
+
+@respx.mock
+async def test_ollama_streaming_upstream_error_is_forwarded_and_counted() -> None:
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            400,
+            json={"error": {"message": "invalid request"}},
+            headers={"content-type": "application/json"},
+        )
+    )
+    settings = Settings(upstream_url="http://upstream.test", upstream_max_retries=0)
+
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/api/chat",
+            json={"model": "qwen", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        metrics = (await client.get("/metrics")).text
+
+    assert response.status_code == 400
+    assert response.json() == {"error": {"message": "invalid request"}}
+    assert 'opencode_proxy_upstream_errors_total{type="invalid_request"} 1.0' in metrics
+
+
+@respx.mock
+async def test_ollama_think_translation_survives_message_normalization_opt_out() -> None:
+    upstream = respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]},
+        )
+    )
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        normalize_requests=False,
+        model_compatibility=json.dumps(
+            {
+                "deepseek-v4-flash": {
+                    "compatibility": "deepseek_v4",
+                    "thinking_transport": "chat_template_kwargs",
+                },
+            },
+        ),
+    )
+
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/api/chat",
+            json={
+                "model": "deepseek-v4-flash",
+                "think": False,
+                "stream": False,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert response.status_code == 200
+    forwarded = json.loads(upstream.calls[0].request.content)
+    assert forwarded["chat_template_kwargs"] == {"thinking": False}
+    assert "reasoning_effort" not in forwarded
+
+
+@respx.mock
+async def test_ollama_buffered_deepseek_profile_recovers_declared_orphan_call() -> None:
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": _orphan_tool_call()},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+    )
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        model_compatibility=json.dumps(
+            {
+                "deepseek-v4-flash": {
+                    "compatibility": "deepseek_v4",
+                    "recover_orphan_invokes": True,
+                },
+            },
+        ),
+    )
+
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/api/chat",
+            json={
+                "model": "deepseek-v4-flash",
+                "stream": False,
+                "messages": [{"role": "user", "content": "read"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            },
+        )
+        metrics = (await client.get("/metrics")).text
+
+    assert response.json()["message"]["tool_calls"][0]["function"]["name"] == "read"
+    assert 'opencode_proxy_orphan_recovery_total{outcome="accepted",reason="valid"} 1.0' in metrics
+
+
+@respx.mock
+async def test_ollama_streaming_deepseek_profile_recovers_declared_orphan_call() -> None:
+    frame = {
+        "id": "chatcmpl-orphan",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-v4-flash",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": _orphan_tool_call()},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    sse = f"data: {json.dumps(frame, ensure_ascii=False)}\n\ndata: [DONE]\n\n"
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=sse.encode(),
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        model_compatibility=json.dumps(
+            {
+                "deepseek-v4-flash": {
+                    "compatibility": "deepseek_v4",
+                    "recover_orphan_invokes": True,
+                },
+            },
+        ),
+    )
+
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/api/chat",
+            json={
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "read"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            },
+        )
+
+    lines = [json.loads(line) for line in response.text.splitlines() if line]
+    calls = [call for line in lines for call in line.get("message", {}).get("tool_calls", [])]
+    assert calls[0]["function"]["name"] == "read"
 
 
 @respx.mock

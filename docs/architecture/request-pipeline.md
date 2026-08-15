@@ -6,8 +6,8 @@ resource: /home/tim/projects/opencode-proxy/src/opencode_proxy/proxy.py
 tags: [proxy, fastapi, streaming, ollama, litellm, vllm, topology]
 status: active
 generated:
-  by: claude-code/opus-5
-  at: 2026-08-15T16:40:00+02:00
+  by: codex/gpt-5
+  at: 2026-08-15T16:21:21+02:00
 ---
 
 # Request pipeline
@@ -67,8 +67,8 @@ fixtures:
 | Sanitize tools | Drop non-`function` tools; drop `tools` entirely if none remain | `SANITIZE_TOOLS=false` |
 | Drop fields | Remove `REQUEST_DROP_FIELDS` entries | No fields configured |
 | Model alias | Rewrite a client-facing alias to the upstream model name | No alias matches |
-| Normalize messages | Repair shapes a DeepSeek-compatible upstream rejects: `null` assistant content, reasoning replayed on the wrong turns, empty tool results. Maps `reasoning_effort: off` to `thinking` for `deepseek_v4` models | `NORMALIZE_REQUESTS=false` |
 | Modality routing | Pick an alternate upstream and model for image/audio requests | No matching route |
+| Normalize messages | For `deepseek_v4` profiles only, repair `null` assistant content, replay reasoning on tool turns, empty tool results, unsupported `developer` roles, `max_completion_tokens`, and map `reasoning_effort`/`thinking` to the configured transport | `NORMALIZE_REQUESTS=false` |
 | Concurrency slot | Acquire one of `MAX_CONCURRENT_UPSTREAM`; `429` if full | Limit disabled |
 | Upstream send | Retried before the first response byte | `UPSTREAM_MAX_RETRIES=0` |
 
@@ -81,8 +81,9 @@ Message normalization follows the rules in DeepSeek's own client; see
 
 Streaming and non-streaming diverge after the upstream call. Non-streaming
 responses are repaired in one pass by `convert_chat_completion_response`, then
-checked for emptiness: a completed turn carrying no content and no tool call is
-retried up to `EMPTY_RESPONSE_RETRIES` times before it is annotated.
+checked for emptiness: for `deepseek_v4` profiles, a completed turn carrying no
+content and no tool call is retried up to `EMPTY_RESPONSE_RETRIES` times before
+it is annotated.
 Streaming responses go through the SSE rewriter — see
 [tool-call repair](tool-call-repair.md) and the
 [streaming contract](streaming-contract.md).
@@ -93,6 +94,13 @@ Streaming responses go through the SSE rewriter — see
 completion, send it through the same upstream client, and translate the response
 back to Ollama NDJSON. They reuse the same alias map, the same modality routing,
 the same tool-call repair, and the same concurrency limiter.
+
+Ollama tool results carry a function name but no OpenAI call ID. Translation
+assigns IDs to assistant tool calls in history and consumes them by name and
+order as matching results arrive. The request-aware DeepSeek orphan-repair
+context is also passed through both buffered and streaming Ollama responses.
+Ollama `think` is always translated as protocol behavior; `NORMALIZE_REQUESTS`
+controls the additional DeepSeek message and token cleanup.
 
 Notably, `_message_to_openai` converts Ollama `images` into OpenAI `image_url`
 parts *before* routing runs, so modality detection covers Ollama clients without

@@ -46,8 +46,11 @@ flushed and the proxy emits a single final `[DONE]`.
 
 ## Request Repairs
 
-Requests are forwarded as sent except for the shapes a DeepSeek-compatible
-upstream rejects outright (`NORMALIZE_REQUESTS=false` disables all of them):
+Requests are forwarded as sent except for the shapes a configured
+DeepSeek-compatible upstream rejects outright. `NORMALIZE_REQUESTS=false`
+disables this message and token cleanup. Ollama `think` remains translated
+because it is part of the Ollama protocol. Other model profiles remain
+transparent:
 
 - Assistant `content: null` becomes `""`. A reasoning-only turn otherwise fails
   with "content or tool_calls must be set", and because the message stays in the
@@ -58,14 +61,17 @@ upstream rejects outright (`NORMALIZE_REQUESTS=false` disables all of them):
   `reasoning_content` when that is the only copy present.
 - An empty tool result is sent as `(no output)`.
 - For models configured with the `deepseek_v4` compatibility profile,
-  `reasoning_effort: "off"` is translated to whichever field the upstream
-  actually reads (`thinking_transport`): the DeepSeek API's
-  `thinking: {"type": "disabled"}` by default, or vLLM's
-  `chat_template_kwargs: {"thinking": false}`. Only `high` and `max` are valid
-  efforts on the wire.
+  `reasoning_effort: "off"` or the official `thinking: {"type": "disabled"}`
+  is translated to whichever field the upstream actually reads
+  (`thinking_transport`): the DeepSeek API's top-level `thinking` object by
+  default, or vLLM's `chat_template_kwargs: {"thinking": false}`. The wire
+  levels are `low`, `high`, and `max`; common `medium`/`xhigh` client values are
+  canonicalized to `high`. An explicit enabled API toggle keeps a compatible
+  effort level; a disabled toggle drops it. Ollama `think` values use the same
+  profile mapping.
 
-These rules come from [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness),
-DeepSeek's own client for this wire format.
+These rules come from [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)
+and the current [DeepSeek Chat Completions API](https://api-docs.deepseek.com/api/create-chat-completion/).
 
 ## Local Development
 
@@ -114,6 +120,12 @@ The unified service implements the commonly used Ollama endpoints:
 - `POST /api/embed` and the deprecated `POST /api/embeddings`.
 - Model-management and blob endpoints are safe no-ops because model lifecycle remains upstream.
 
+Ollama tool results identify calls by name rather than by OpenAI call ID. The
+adapter assigns stable IDs to assistant calls and reuses them on the matching
+tool-result messages, including parallel calls with the same function name.
+DeepSeek orphan-invoke recovery uses the same request-aware profile on buffered
+and streaming Ollama responses as it does on the native OpenAI route.
+
 Ollama clients normally target `http://127.0.0.1:9526` when running the container
 directly. In Docker Compose, map both host ports (`11434:9526` and
 `9526:9526`) to keep the standard Ollama port and the OpenCode port on one
@@ -136,6 +148,9 @@ shape while LiteLLM continues to own authentication, routing, budgets, and
 spend tracking.
 
 ## Docker
+
+The image installs the exact production dependency set from `uv.lock`; a stale
+lock file fails the build instead of silently resolving newer packages.
 
 ```bash
 docker build -t opencode-proxy:local .
@@ -207,9 +222,9 @@ never use the LiteLLM master key as a general client fallback.
 | `UPSTREAM_HEALTH_PATH` | unset | Extra `/readyz` probe that exercises the upstream engine, for example `/health` for vLLM. A model listing alone is served from static config and stays `200` after the engine dies. |
 | `SSE_KEEPALIVE_INTERVAL` | `10` | Seconds of upstream silence before the proxy sends an SSE keepalive comment. `0` disables keepalives. |
 | `UPSTREAM_MAX_RETRIES` | `2` | Retries for chat/generate requests that fail before any response byte reaches the client. `0` disables retries. A `Retry-After` header on a retryable status paces the retry instead of the backoff curve, clamped to 30s. |
-| `EMPTY_RESPONSE_RETRIES` | `1` | Re-sends a buffered chat request whose turn completed with no content and no tool call. `0` disables. Streamed turns are never re-sent. |
+| `EMPTY_RESPONSE_RETRIES` | `1` | Re-sends a buffered request for a `deepseek_v4` profile whose turn completed with no content and no tool call. `0` disables. Streamed turns are never re-sent. |
 | `UPSTREAM_STREAM_IDLE_TIMEOUT` | `30` | Seconds to wait for the next upstream SSE frame *after the first one* before flushing buffers, sending a terminal chunk, and closing the client stream. `0` disables the guard. |
-| `UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT` | `240` | Seconds to wait for the *first* upstream SSE frame. Covers prefill, which sends nothing and legitimately takes minutes on a long prompt, so it is much larger than the between-frame gap. `0` disables. |
+| `UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT` | `480` | Seconds to wait for the *first* upstream SSE frame. Covers prefill, which sends nothing and legitimately takes minutes on a long prompt, so it is much larger than the between-frame gap. `0` disables. |
 | `MAX_CONCURRENT_UPSTREAM` | `8` | Max concurrent chat/generate requests to upstream. Extra requests get `429` with `Retry-After: 1`. `0` disables the limit. |
 | `STREAM_GUARD_CHARS` | `192` | Text held back while detecting split raw tool-call tags. |
 | `TOOL_ARGUMENT_CHUNK_SIZE` | `64` | Size for streamed function argument deltas. |
@@ -219,7 +234,7 @@ never use the LiteLLM master key as a general client fallback.
 | `MAX_TOOL_ARGUMENT_CHARS` | `262144` | Maximum serialized argument size per converted call and streamed repair buffer. Larger raw blocks pass through as text; standard calls are not repaired past the bound. |
 | `TOOL_CALL_SCAN_FIELDS` | `content,reasoning,reasoning_content` | Comma-separated response fields scanned for raw tool-call blocks. Use `all` for all supported fields. |
 | `SANITIZE_TOOLS` | `true` | Drop non-function tools from chat completion requests for OpenCode/upstream compatibility. |
-| `NORMALIZE_REQUESTS` | `true` | Repair outgoing message shapes a DeepSeek-compatible upstream rejects: `null` assistant content, reasoning replayed on the wrong turns, empty tool results. |
+| `NORMALIZE_REQUESTS` | `true` | Repair outgoing message shapes for `deepseek_v4` profiles: `null` assistant content, reasoning replayed on the wrong turns, empty tool results, role/token aliases, and thinking transport. Other profiles stay transparent. |
 | `REQUEST_DROP_FIELDS` | unset | Comma-separated request body fields to remove before forwarding, for backend-specific quirks. |
 | `CUSTOM_HEADERS` | unset | Extra headers added to upstream requests. Overrides forwarded client headers. |
 | `UPSTREAM_HEADERS` | unset | Alias for `CUSTOM_HEADERS`. |
@@ -289,11 +304,12 @@ Two guards keep a streamed turn from stalling silently:
 When the upstream closes a turn without content or tool calls, the proxy logs
 the empty turn and emits `EMPTY_TURN_NOTICE` (enabled by default) before the
 terminal chunk so an agent client has something actionable to display. Set it
-empty to keep the turn unannotated. A buffered request is re-sent
-`EMPTY_RESPONSE_RETRIES` times first, since nothing has reached the client yet
-and an empty completed turn is a failed generation rather than an answer. If the
-upstream reported a terminator outside `stop`, `length`, and `tool_calls`, the
-notice names that terminator instead of blaming the token budget.
+empty to keep the turn unannotated. For a configured `deepseek_v4` profile, a
+buffered request is re-sent `EMPTY_RESPONSE_RETRIES` times first, since nothing
+has reached the client yet and an empty completed turn is a failed generation
+rather than an answer. If the upstream reported a terminator outside `stop`,
+`length`, and `tool_calls`, the notice names that terminator instead of blaming
+the token budget.
 
 Chat and generate requests are retried up to `UPSTREAM_MAX_RETRIES` times on
 transport errors and on upstream `429`, `500`, `502`, `503`, and `504`, with
@@ -365,8 +381,9 @@ Details worth knowing:
 - `GET /healthz`: local proxy liveness check. Says nothing about the upstream.
 - `GET /readyz`: readiness check, and the container healthcheck. Probes `UPSTREAM_HEALTH_PATH` when set, then upstream `GET /v1/models`. Returns `503` when the upstream is unreachable, times out, reports an unhealthy engine, answers `5xx`, answers a non-auth `4xx` (usually a wrong `UPSTREAM_URL`), or lists no models. Auth errors still count as ready.
 - `GET /healthz/config`: safe local config summary, with header values and URL credentials omitted.
-- `GET /metrics`: proxy-owned Prometheus counters. Scrape vLLM separately for
-  cache, KV utilization, queueing, and model latency.
+- `GET /metrics`: proxy-owned Prometheus metrics, including compatibility
+  counters and concurrency overload/active-slot signals. Scrape vLLM separately
+  for cache, KV utilization, queueing, and model latency.
 - `/v1/chat/completions`: proxied to the upstream with request tool sanitization and response tool-call repair.
 - `/v1/models` and `/models`: upstream model discovery with configured alias entries added.
 - `/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`: Ollama-compatible translations backed by the same upstream client and tool-call repair pipeline.

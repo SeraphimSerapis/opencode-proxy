@@ -11,7 +11,12 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
-from opencode_proxy.compat import convert_chat_completion_response
+from opencode_proxy.compat import (
+    RepairStats,
+    annotate_empty_completion,
+    convert_chat_completion_response,
+    is_empty_completion,
+)
 from opencode_proxy.ollama_models import (
     OllamaChatRequest,
     OllamaChatResponse,
@@ -41,27 +46,42 @@ from opencode_proxy.ollama_translate import (
     openai_models_to_running,
 )
 from opencode_proxy.proxy import (
+    DEFAULT_TOOL_REPAIR_CONTEXT,
     MODELS_PATH,
+    ToolRepairContext,
     _aclose_upstream_and_release_slot,
     _acquire_upstream_slot,
     _add_model_aliases,
     _apply_model_alias,
     _forward_request_headers,
     _forward_response_headers,
+    _note_finish_reasons,
+    _note_upstream_error,
     _proxy_error,
+    _record_repair_stats,
+    _record_request_normalizations,
+    _record_usage,
     _release_upstream_slot,
     _request_metrics,
     _set_header,
+    _thinking_transport,
+    _tool_repair_context,
     _upstream_client,
     _upstream_url,
     apply_stream_response_headers,
     apply_target_model,
     send_upstream_with_retries,
 )
+from opencode_proxy.request_compat import (
+    RequestNormalizationStats,
+    normalize_reasoning_effort,
+    normalize_request,
+)
 from opencode_proxy.routing import UpstreamTarget, resolve_upstream_target
 
 if TYPE_CHECKING:
     from opencode_proxy.compat import JsonObject
+    from opencode_proxy.metrics import ProxyMetrics
     from opencode_proxy.settings import Settings
 
 LOG = logging.getLogger(__name__)
@@ -99,18 +119,22 @@ def build_ollama_router(settings: Settings) -> APIRouter:
         _apply_model_alias(openai_payload, settings.parsed_model_aliases)
         target = resolve_upstream_target(settings, openai_payload)
         apply_target_model(openai_payload, target)
+        _normalize_ollama_payload(openai_payload, payload.think, settings, request)
+        repair_context = _tool_repair_context(openai_payload, settings)
         overload = await _acquire_upstream_slot(request)
         if overload is not None:
             return overload
         if payload.stream:
-            return await _stream_chat(request, settings, openai_payload, payload.model, target)
-        try:
-            response = await _request_upstream(
-                request, settings, "/v1/chat/completions", openai_payload, target=target
+            return await _stream_chat(
+                request, settings, openai_payload, payload.model, target, repair_context
             )
-            if isinstance(response, Response):
+        try:
+            response, repaired = await _request_ollama_completion(
+                request, settings, openai_payload, target=target, repair_context=repair_context
+            )
+            if not isinstance(response, httpx.Response):
                 return response
-            repaired = _repair_response(_json_response(response), settings)
+            assert repaired is not None
             return JSONResponse(
                 openai_chat_to_ollama(repaired, payload.model).model_dump(exclude_none=True),
                 status_code=response.status_code,
@@ -132,18 +156,22 @@ def build_ollama_router(settings: Settings) -> APIRouter:
         _apply_model_alias(openai_payload, settings.parsed_model_aliases)
         target = resolve_upstream_target(settings, openai_payload)
         apply_target_model(openai_payload, target)
+        _normalize_ollama_payload(openai_payload, payload.think, settings, request)
+        repair_context = _tool_repair_context(openai_payload, settings)
         overload = await _acquire_upstream_slot(request)
         if overload is not None:
             return overload
         if payload.stream:
-            return await _stream_generate(request, settings, openai_payload, payload.model, target)
-        try:
-            response = await _request_upstream(
-                request, settings, "/v1/chat/completions", openai_payload, target=target
+            return await _stream_generate(
+                request, settings, openai_payload, payload.model, target, repair_context
             )
-            if isinstance(response, Response):
+        try:
+            response, repaired = await _request_ollama_completion(
+                request, settings, openai_payload, target=target, repair_context=repair_context
+            )
+            if not isinstance(response, httpx.Response):
                 return response
-            repaired = _repair_response(_json_response(response), settings)
+            assert repaired is not None
             return JSONResponse(
                 openai_chat_to_ollama_generate(repaired, payload.model).model_dump(
                     exclude_none=True
@@ -253,6 +281,7 @@ async def _stream_chat(
     payload: JsonObject,
     model: str,
     target: UpstreamTarget | None = None,
+    repair_context: ToolRepairContext = DEFAULT_TOOL_REPAIR_CONTEXT,
 ) -> Response:
     try:
         response = await _send_streaming(
@@ -265,7 +294,7 @@ async def _stream_chat(
         await _release_upstream_slot(request)
         return response
     return StreamingResponse(
-        stream_chat_to_ollama(request, response, settings, model),
+        stream_chat_to_ollama(request, response, settings, model, repair_context),
         status_code=response.status_code,
         headers=apply_stream_response_headers({}),
         media_type="application/x-ndjson",
@@ -279,6 +308,7 @@ async def _stream_generate(
     payload: JsonObject,
     model: str,
     target: UpstreamTarget | None = None,
+    repair_context: ToolRepairContext = DEFAULT_TOOL_REPAIR_CONTEXT,
 ) -> Response:
     try:
         response = await _send_streaming(
@@ -291,12 +321,94 @@ async def _stream_generate(
         await _release_upstream_slot(request)
         return response
     return StreamingResponse(
-        stream_generate_to_ollama(request, response, settings, model),
+        stream_generate_to_ollama(request, response, settings, model, repair_context),
         status_code=response.status_code,
         headers=apply_stream_response_headers({}),
         media_type="application/x-ndjson",
         background=BackgroundTask(_aclose_upstream_and_release_slot, response, request),
     )
+
+
+def _normalize_ollama_payload(
+    payload: JsonObject,
+    think: bool | str | None,
+    settings: Settings,
+    request: Request,
+) -> None:
+    """Apply the same DeepSeek contract used by the native OpenAI route."""
+    thinking_transport = _thinking_transport(payload, settings)
+    if thinking_transport is None:
+        return
+    if think is not None:
+        payload["reasoning_effort"] = _ollama_reasoning_effort(think)
+    if settings.normalize_requests:
+        stats = normalize_request(payload, thinking_transport=thinking_transport)
+    else:
+        # ``think`` is part of the Ollama protocol, so translating it is adapter
+        # behavior rather than optional message hygiene.
+        stats = RequestNormalizationStats()
+        if think is not None:
+            normalize_reasoning_effort(payload, stats, transport=thinking_transport)
+    _record_request_normalizations(_request_metrics(request), stats)
+
+
+def _ollama_reasoning_effort(think: bool | str) -> str:
+    """Translate Ollama's boolean/string ``think`` control to the shared wire field."""
+    if isinstance(think, bool):
+        return "high" if think else "off"
+    normalized = think.strip().lower()
+    if normalized in {"", "on", "true", "enabled"}:
+        return "high"
+    if normalized in {"off", "false", "none", "disabled"}:
+        return "off"
+    return normalized
+
+
+async def _request_ollama_completion(
+    request: Request,
+    settings: Settings,
+    payload: JsonObject,
+    *,
+    target: UpstreamTarget,
+    repair_context: ToolRepairContext,
+) -> tuple[httpx.Response | Response, JsonObject | None]:
+    """Fetch, repair, and retry a buffered Ollama chat/generate completion."""
+    deepseek_profile = _thinking_transport(payload, settings) is not None
+    empty_retries_left = settings.empty_response_retries if deepseek_profile else 0
+    while True:
+        response = await _request_upstream(
+            request, settings, "/v1/chat/completions", payload, target=target
+        )
+        if isinstance(response, Response):
+            return response, None
+
+        metrics = _request_metrics(request)
+        repaired = _repair_response(
+            _json_response(response),
+            settings,
+            metrics=metrics,
+            repair_context=repair_context,
+        )
+        _record_usage(repaired.get("usage"), metrics)
+        _note_finish_reasons(repaired, metrics=metrics, transport="ollama")
+
+        if is_empty_completion(repaired):
+            if empty_retries_left > 0:
+                empty_retries_left -= 1
+                if metrics is not None:
+                    metrics.upstream_retries.labels(reason="empty_response").inc()
+                LOG.warning(
+                    "Ollama upstream returned a completed turn with no output; retrying "
+                    "(%d attempt(s) left)",
+                    empty_retries_left,
+                )
+                await response.aclose()
+                continue
+            if metrics is not None:
+                metrics.empty_turns.inc()
+            annotate_empty_completion(repaired, settings.empty_turn_notice)
+
+        return response, repaired
 
 
 async def _send_streaming(
@@ -327,6 +439,7 @@ async def _send_streaming(
         return _proxy_error(exc)
     if response.status_code >= 400:
         body = await response.aread()
+        _note_upstream_error(response, metrics=_request_metrics(request))
         await response.aclose()
         return Response(
             body,
@@ -390,6 +503,8 @@ async def _request_upstream_raw(
     except httpx.HTTPError as exc:
         return _proxy_error(exc)
     if response.status_code >= 400:
+        if path == "/v1/chat/completions":
+            _note_upstream_error(response, metrics=_request_metrics(request))
         return Response(
             response.content,
             status_code=response.status_code,
@@ -407,12 +522,23 @@ def _json_response(response: httpx.Response) -> JsonObject:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _repair_response(body: JsonObject, settings: Settings) -> JsonObject:
+def _repair_response(
+    body: JsonObject,
+    settings: Settings,
+    *,
+    metrics: ProxyMetrics | None = None,
+    repair_context: ToolRepairContext = DEFAULT_TOOL_REPAIR_CONTEXT,
+) -> JsonObject:
+    stats = RepairStats()
     repaired, _ = convert_chat_completion_response(
         body,
         tool_call_scan_fields=settings.parsed_tool_call_scan_fields,
         max_raw_tool_block_chars=settings.max_raw_tool_block_chars,
         max_tool_calls=settings.max_tool_calls,
         max_tool_argument_chars=settings.max_tool_argument_chars,
+        recover_orphan_invokes=repair_context.recover_orphan_invokes,
+        declared_tool_names=repair_context.declared_tool_names,
+        stats=stats,
     )
+    _record_repair_stats(metrics, stats, transport="ollama")
     return repaired

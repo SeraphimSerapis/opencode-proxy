@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     import httpx
     from fastapi import Request
 
+    from opencode_proxy.proxy import ToolRepairContext
     from opencode_proxy.settings import Settings
 
 
@@ -76,11 +77,12 @@ async def stream_chat_to_ollama(
     response: httpx.Response,
     settings: Settings,
     model: str,
+    repair_context: ToolRepairContext,
 ) -> AsyncIterator[bytes]:
     tools = _ToolAccumulator(max_argument_chars=settings.max_tool_argument_chars)
     usage: dict[str, Any] = {}
     terminal: dict[int, tuple[OllamaMessage, str]] = {}
-    async for raw_frame in _rewrite_sse_stream(request, response, settings):
+    async for raw_frame in _rewrite_sse_stream(request, response, settings, repair_context):
         for event in _json_events(raw_frame):
             if event == "[DONE]":
                 async for line in _terminal_chat_lines(terminal, tools, model, usage):
@@ -130,11 +132,12 @@ async def stream_generate_to_ollama(
     response: httpx.Response,
     settings: Settings,
     model: str,
+    repair_context: ToolRepairContext,
 ) -> AsyncIterator[bytes]:
     terminal: tuple[str, str | None, str] | None = None
     usage: dict[str, Any] = {}
     stream_complete = False
-    async for raw_frame in _rewrite_sse_stream(request, response, settings):
+    async for raw_frame in _rewrite_sse_stream(request, response, settings, repair_context):
         for event in _json_events(raw_frame):
             if event == "[DONE]":
                 stream_complete = True

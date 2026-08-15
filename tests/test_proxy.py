@@ -3448,6 +3448,35 @@ async def test_request_normalization_can_be_disabled() -> None:
     assert forwarded["reasoning_effort"] == "off"
 
 
+@respx.mock
+async def test_request_normalization_is_scoped_to_compatibility_profiles() -> None:
+    route = respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json={"choices": [], "model": "qwen"}),
+    )
+
+    async with await _client() as client:
+        await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen",
+                "max_completion_tokens": 123,
+                "messages": [
+                    {"role": "developer", "content": "provider-owned instructions"},
+                    {
+                        "role": "assistant",
+                        "content": "provider-owned history",
+                        "reasoning_content": "keep this field for qwen",
+                    },
+                ],
+            },
+        )
+
+    forwarded = json.loads(route.calls[0].request.content)
+    assert forwarded["max_completion_tokens"] == 123
+    assert forwarded["messages"][0]["role"] == "developer"
+    assert forwarded["messages"][1]["reasoning_content"] == "keep this field for qwen"
+
+
 def _buffered_completion(content: str, finish_reason: str = "stop") -> dict[str, Any]:
     return {
         "id": "chatcmpl-empty",
@@ -3472,7 +3501,7 @@ async def test_empty_buffered_completion_is_retried() -> None:
         ],
     )
 
-    async with await _client() as client:
+    async with await _client(_deepseek_settings()) as client:
         response = await client.post(
             "/v1/chat/completions",
             json={"model": "deepseek-v4", "messages": []},
@@ -3490,7 +3519,7 @@ async def test_exhausted_empty_completion_retries_annotate_the_turn() -> None:
         return_value=httpx.Response(200, json=_buffered_completion("")),
     )
 
-    async with await _client() as client:
+    async with await _client(_deepseek_settings()) as client:
         response = await client.post(
             "/v1/chat/completions",
             json={"model": "deepseek-v4", "messages": []},
@@ -3508,11 +3537,27 @@ async def test_empty_completion_retry_can_be_disabled() -> None:
         return_value=httpx.Response(200, json=_buffered_completion("")),
     )
 
-    settings = Settings(upstream_url="http://upstream.test", empty_response_retries=0)
+    settings = _deepseek_settings(empty_response_retries=0)
     async with await _client(settings) as client:
         response = await client.post(
             "/v1/chat/completions",
             json={"model": "deepseek-v4", "messages": []},
+        )
+
+    assert route.call_count == 1
+    assert "[proxy:" in response.json()["choices"][0]["message"]["content"]
+
+
+@respx.mock
+async def test_empty_completion_retry_is_scoped_to_deepseek_profiles() -> None:
+    route = respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=_buffered_completion("")),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen", "messages": []},
         )
 
     assert route.call_count == 1
@@ -3751,3 +3796,36 @@ async def test_chat_template_transport_forwards_the_vllm_thinking_argument() -> 
     assert "thinking" not in forwarded
     assert "reasoning_effort" not in forwarded
     assert 'opencode_proxy_request_normalizations_total{kind="thinking_disabled"} 1.0' in metrics
+
+
+@respx.mock
+async def test_chat_template_transport_converts_official_thinking_field() -> None:
+    route = respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=_buffered_completion("ok")),
+    )
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        model_compatibility=json.dumps(
+            {
+                "deepseek-v4-flash": {
+                    "compatibility": "deepseek_v4",
+                    "thinking_transport": "chat_template_kwargs",
+                },
+            },
+        ),
+    )
+
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "deepseek-v4-flash",
+                "thinking": {"type": "disabled"},
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    assert forwarded["chat_template_kwargs"] == {"thinking": False}
+    assert "thinking" not in forwarded

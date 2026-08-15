@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from prometheus_client import CollectorRegistry, Counter, generate_latest
+from prometheus_client import CollectorRegistry, Counter, Gauge, generate_latest
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
 
@@ -23,6 +23,8 @@ class ProxyMetrics:
     upstream_errors: Counter
     finish_reasons: Counter
     usage_tokens: Counter
+    upstream_overloads: Counter
+    upstream_active: Gauge
 
     @classmethod
     def create(cls) -> ProxyMetrics:
@@ -98,6 +100,16 @@ class ProxyMetrics:
                 "opencode_proxy_usage_tokens",
                 "Upstream-reported token usage, counted disjointly per kind.",
                 ("kind",),
+                registry=registry,
+            ),
+            upstream_overloads=Counter(
+                "opencode_proxy_upstream_overloads",
+                "Requests rejected because the proxy concurrency limit was full.",
+                registry=registry,
+            ),
+            upstream_active=Gauge(
+                "opencode_proxy_upstream_active",
+                "Currently active chat/generate slots held by the proxy.",
                 registry=registry,
             ),
         )

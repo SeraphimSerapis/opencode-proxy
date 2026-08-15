@@ -67,11 +67,19 @@ def _first_message(response: httpx.Response) -> dict[str, Any]:
     return message
 
 
+def _reasoning_text(message: dict[str, Any]) -> str:
+    """Read either reasoning spelling used by the deployed OpenAI shim."""
+    value = message.get("reasoning_content") or message.get("reasoning")
+    return value if isinstance(value, str) else ""
+
+
 @pytest.mark.asyncio
 async def test_live_deepseek_v4_serving_contract() -> None:
     assert DIRECT_URL is not None
     assert PROXY_URL is not None
-    timeout = httpx.Timeout(180)
+    # Keep the client budget above the proxy's 480s first-frame guard so a
+    # failure is attributed to the proxy instead of racing HTTPX's read timer.
+    timeout = httpx.Timeout(600)
 
     async with (
         httpx.AsyncClient(base_url=DIRECT_URL, timeout=timeout) as direct,
@@ -104,8 +112,50 @@ async def test_live_deepseek_v4_serving_contract() -> None:
                 "content": '{"value":"stable-prefix"}',
             },
         ]
-        replay_response = await direct.post("/v1/chat/completions", json=replay)
-        replay_response.raise_for_status()
+        replay_direct = await direct.post("/v1/chat/completions", json=replay)
+        replay_direct.raise_for_status()
+
+        proxy_replay_message = dict(proxy_message)
+        proxy_call = proxy_replay_message["tool_calls"][0]
+        proxy_replay = _request()
+        proxy_replay["tool_choice"] = "auto"
+        proxy_replay["messages"] = [
+            *_request()["messages"],
+            proxy_replay_message,
+            {
+                "role": "tool",
+                "tool_call_id": proxy_call["id"],
+                "content": '{"value":"stable-prefix"}',
+            },
+        ]
+        replay_proxy = await proxy.post("/v1/chat/completions", json=proxy_replay)
+        replay_proxy.raise_for_status()
+
+        # The deployed vLLM reads the template argument rather than the
+        # vendor's top-level field. This catches regressions where the proxy
+        # accepts the official field but silently leaves thinking enabled.
+        thinking_probe = {
+            "model": MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Compute (12345 * 6789) - 42. Reply with only the integer.",
+                }
+            ],
+            "thinking": {"type": "enabled"},
+            "max_tokens": 128,
+        }
+        enabled_message = _first_message(
+            await proxy.post("/v1/chat/completions", json=thinking_probe)
+        )
+        assert _reasoning_text(enabled_message)
+
+        disabled = {
+            **thinking_probe,
+            "thinking": {"type": "disabled"},
+        }
+        disabled_message = _first_message(await proxy.post("/v1/chat/completions", json=disabled))
+        assert not _reasoning_text(disabled_message)
 
         # Interrupt one client-side stream, then prove the server still accepts
         # a fresh request. The proxy's synthetic interruption handling remains

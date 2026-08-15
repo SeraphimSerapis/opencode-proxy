@@ -92,9 +92,9 @@ class Settings(BaseSettings):
     # Wait for the *first* frame, which covers prefill. This is a much larger
     # number than the between-frame gap: nothing is sent while the prompt is
     # being processed, and a long prompt legitimately takes minutes (measured
-    # time-to-first-token p99.9 is ~160s). Use `0` to disable.
+    # histogram-estimated time-to-first-token p99 tail is ~351s). Use `0` to disable.
     upstream_stream_first_frame_timeout: float = Field(
-        default=240.0,
+        default=480.0,
         ge=0,
         validation_alias="UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT",
     )

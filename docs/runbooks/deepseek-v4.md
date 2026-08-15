@@ -6,8 +6,8 @@ resource: /home/tim/projects/opencode-proxy/tests/test_live_vllm.py
 tags: [deepseek-v4, vllm, dsml, prefix-cache, prometheus, deployment]
 status: active
 generated:
-  by: claude-code/opus-5
-  at: 2026-08-15T16:40:00+02:00
+  by: codex/gpt-5
+  at: 2026-08-15T16:21:21+02:00
 sources:
   - id: llm-deepseek
     title: "@deepseek-ai/dsh-llm-deepseek — the vendor's reference client and its model catalog"
@@ -60,15 +60,16 @@ proxy can enforce on its own:
 | Context window advertised for V4 Flash and V4 Pro | 1,000,000 tokens |
 | Default per-request output cap | 256,000 tokens |
 | Default stream idle budget | 300s per outstanding read |
-| Accepted `reasoning_effort` values | `high`, `max` (default `high`) |
+| Accepted `reasoning_effort` values | `low`, `high`, `max` (default `high`); `medium`/`xhigh` map to `high` |
 | Disabling thinking (vendor API) | `thinking: {"type": "disabled"}`, never `reasoning_effort: "off"` |
 | Disabling thinking (our vLLM) | `chat_template_kwargs: {"thinking": false}`; thinking is on by default in the generation config, and the vendor field is ignored |
+| Tool selection | `tool_choice` is preserved for the deployed vLLM path; direct vendor API deployments that reject it should drop it with `REQUEST_DROP_FIELDS=tool_choice` |
 | Cache accounting | `prompt_tokens` *includes* `prompt_cache_hit_tokens`; no cache-write metric exists |
 
 Two consequences for this deployment. The proxy's
-`UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT` (240s) is tighter than the vendor's 300s
-idle budget, which is intentional: ours covers prefill on a single local GPU,
-not a hosted fleet. And `DSML` appears nowhere in that repository -- the vendor
+`UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT` (480s) is intentionally above the observed
+histogram-estimated prefill p99 tail on a single local GPU, while the separate
+mid-stream guard stays tight. And `DSML` appears nowhere in that repository -- the vendor
 client assumes native `tool_calls` -- so every raw-text repair in this proxy is
 compensating for the self-hosted chat template and should disappear once vLLM's
 parser is correct.
@@ -100,7 +101,9 @@ Scrape both services:
   `opencode_proxy_tool_argument_repair_total`,
   `opencode_proxy_upstream_retries_total`,
   `opencode_proxy_stream_idle_terminations_total`, and
-  `opencode_proxy_empty_turns_total`.
+  `opencode_proxy_empty_turns_total`. Admission pressure is exposed through
+  `opencode_proxy_upstream_overloads_total` and
+  `opencode_proxy_upstream_active`.
 * vLLM `/metrics` reports model-serving behavior. Track
   `vllm:prefix_cache_queries` and `vllm:prefix_cache_hits` (both token
   counters), KV-cache utilization, waiting requests/queue time, time to first

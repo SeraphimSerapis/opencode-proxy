@@ -7,6 +7,7 @@ import contextlib
 import email.utils
 import json
 import logging
+import math
 import random
 import uuid
 from dataclasses import dataclass, field
@@ -42,7 +43,7 @@ from opencode_proxy.compat import (
 )
 from opencode_proxy.concurrency import UpstreamConcurrencyLimiter
 from opencode_proxy.metrics import ProxyMetrics
-from opencode_proxy.request_compat import normalize_request
+from opencode_proxy.request_compat import RequestNormalizationStats, normalize_request
 from opencode_proxy.routing import (
     UpstreamTarget,
     default_upstream_target,
@@ -196,14 +197,16 @@ async def proxy_chat_completions(request: Request, settings: Settings) -> Respon
         apply_target_model(parsed_body, target)
         repair_context = _tool_repair_context(parsed_body, settings)
         if settings.normalize_requests:
-            stats = normalize_request(
-                parsed_body,
-                thinking_transport=_thinking_transport(parsed_body, settings),
-            )
-            metrics = _request_metrics(request)
-            if metrics is not None:
-                for kind, count in stats.as_labels().items():
-                    metrics.request_normalizations.labels(kind=kind).inc(count)
+            thinking_transport = _thinking_transport(parsed_body, settings)
+            # The message rules are DeepSeek-specific wire repairs. Keep the
+            # proxy transparent for other providers, even when normalization is
+            # enabled globally.
+            if thinking_transport is not None:
+                stats = normalize_request(
+                    parsed_body,
+                    thinking_transport=thinking_transport,
+                )
+                _record_request_normalizations(_request_metrics(request), stats)
 
     stream = bool(parsed_body.get("stream")) if parsed_body is not None else False
     overload = await _acquire_upstream_slot(request)
@@ -312,7 +315,10 @@ async def _proxy_buffered_chat_completion(
     client = _upstream_client(request)
     metrics = _request_metrics(request)
     try:
-        empty_retries_left = settings.empty_response_retries
+        deepseek_profile = (
+            parsed_body is not None and _thinking_transport(parsed_body, settings) is not None
+        )
+        empty_retries_left = settings.empty_response_retries if deepseek_profile else 0
         while True:
             try:
                 upstream_response = await send_upstream_with_retries(
@@ -542,7 +548,7 @@ def retry_after_seconds(header_value: str | None, *, now: datetime | None = None
     """Parse a ``Retry-After`` header into seconds, clamped to a sane bound.
 
     Accepts both header forms (delay seconds and HTTP-date). A malformed,
-    negative, or absurdly distant value is ignored so a hostile or broken
+    non-finite, negative, or absurdly distant value is ignored so a hostile or broken
     upstream cannot park a caller's request.
     """
     if header_value is None:
@@ -562,7 +568,7 @@ def retry_after_seconds(header_value: str | None, *, now: datetime | None = None
             when = when.replace(tzinfo=UTC)
         delay = (when - (now or datetime.now(UTC))).total_seconds()
 
-    if delay <= 0:
+    if not math.isfinite(delay) or delay <= 0:
         return None
     return min(delay, MAX_RETRY_AFTER_SECONDS)
 
@@ -1828,6 +1834,18 @@ def _record_repair_stats(
         metrics.synthesized_tool_call_ids.labels(transport=transport).inc(stats.synthesized_ids)
 
 
+def _record_request_normalizations(
+    metrics: ProxyMetrics | None,
+    stats: RequestNormalizationStats,
+) -> None:
+    """Record bounded request-repair labels for any ingress adapter."""
+    if metrics is None:
+        return
+    labels = stats.as_labels()
+    for kind, count in labels.items():
+        metrics.request_normalizations.labels(kind=kind).inc(count)
+
+
 def _record_usage(usage: object, metrics: ProxyMetrics | None) -> None:
     """Count upstream-reported tokens disjointly.
 
@@ -2254,11 +2272,17 @@ async def _acquire_upstream_slot(request: Request) -> JSONResponse | None:
     if limiter is None:
         return None
     if await limiter.try_acquire():
+        metrics = _request_metrics(request)
+        if metrics is not None:
+            metrics.upstream_active.set(limiter.active)
         return None
     LOG.warning(
         "rejecting request; upstream concurrency limit reached (%d)",
         limiter.limit,
     )
+    metrics = _request_metrics(request)
+    if metrics is not None:
+        metrics.upstream_overloads.inc()
     return JSONResponse(
         status_code=429,
         content={
@@ -2275,6 +2299,9 @@ async def _release_upstream_slot(request: Request) -> None:
     limiter = _upstream_limiter(request)
     if limiter is not None:
         await limiter.release()
+        metrics = _request_metrics(request)
+        if metrics is not None:
+            metrics.upstream_active.set(limiter.active)
 
 
 async def _aclose_upstream_and_release_slot(

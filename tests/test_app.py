@@ -254,10 +254,15 @@ async def test_chat_completions_returns_429_when_concurrency_exhausted() -> None
             "/v1/chat/completions",
             json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
         )
+        metrics_while_active = (await client.get("/metrics")).text
         release.set()
         first_response = await first
+        metrics = (await client.get("/metrics")).text
 
     assert first_response.status_code == 200
     assert second.status_code == 429
     assert second.json()["error"]["type"] == "proxy_overload"
+    assert "opencode_proxy_upstream_active 1.0" in metrics_while_active
+    assert "opencode_proxy_upstream_overloads_total 1.0" in metrics
+    assert "opencode_proxy_upstream_active 0.0" in metrics
     assert second.headers["retry-after"] == "1"

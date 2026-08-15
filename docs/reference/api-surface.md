@@ -6,8 +6,8 @@ resource: /home/tim/projects/opencode-proxy/src/opencode_proxy/app.py
 tags: [api, endpoints, openai, ollama, health]
 status: active
 generated:
-  by: claude-code/opus-5
-  at: 2026-08-15T16:40:00+02:00
+  by: codex/gpt-5
+  at: 2026-08-15T16:21:21+02:00
 ---
 
 # API surface
@@ -19,7 +19,7 @@ generated:
 | `GET /healthz` | Liveness only. Never touches the upstream. Says nothing about whether the model server is up. |
 | `GET /readyz` | Upstream readiness, and the container healthcheck. Probes `UPSTREAM_HEALTH_PATH` (when set) and then `GET /v1/models`. |
 | `GET /healthz/config` | Effective configuration with credentials and header values omitted — header and alias *names* only. |
-| `GET /metrics` | Prometheus counters for proxy-owned repair and transport behavior. vLLM must be scraped separately for model-serving metrics. |
+| `GET /metrics` | Prometheus metrics for proxy-owned repair, transport, and concurrency behavior. vLLM must be scraped separately for model-serving metrics. |
 
 The container healthcheck targets `/readyz`, not `/healthz`. `/healthz` returns
 `ok` from the moment uvicorn binds, so a container using it reports healthy with
@@ -51,22 +51,25 @@ Two deliberate choices:
 
 ## Metrics
 
-`GET /metrics` exposes proxy-owned counters only, all with bounded label sets:
+`GET /metrics` exposes proxy-owned counters and a bounded-cardinality active-slot
+gauge:
 
 | Counter | Labels | Records |
 | --- | --- | --- |
 | `opencode_proxy_raw_tool_repair` | `format`, `field` | Raw text tool-call blocks converted to OpenAI tool calls. |
 | `opencode_proxy_orphan_recovery` | `outcome`, `reason` | DeepSeek V4 orphan invoke recovery attempts. |
-| `opencode_proxy_synthesized_tool_call_ids` | `transport` | Native tool calls that arrived without an `id`. |
+| `opencode_proxy_synthesized_tool_call_ids` | `transport` | Native tool calls that arrived without an `id`; transport is `streaming`, `buffered`, or `ollama`. |
 | `opencode_proxy_tool_argument_repair` | `outcome` | Truncated streamed `arguments` completed, or refused. |
-| `opencode_proxy_request_normalizations` | `kind` | Outgoing message shapes repaired before forwarding. |
+| `opencode_proxy_request_normalizations` | `kind` | DeepSeek-profile request shapes repaired before forwarding, including `developer_roles`, `max_completion_tokens`, and thinking aliases. |
 | `opencode_proxy_upstream_retries` | `reason` | Requests re-sent, including `empty_response`. |
-| `opencode_proxy_upstream_errors` | `type` | Error statuses classified as `auth`, `quota`, `rate_limit`, `context_window_exceeded`, `invalid_request`, `server`. |
-| `opencode_proxy_finish_reasons` | `reason`, `transport` | Turn terminators. Unknown values fold into `other`, absent ones into `absent`; `transport` is `streaming`, `buffered`, or `synthesized`. |
+| `opencode_proxy_upstream_errors` | `type` | Error statuses classified as `auth`, `quota`, `rate_limit`, `context_window_exceeded`, `invalid_request`, `server`, `http_4xx`, or `http_other`. |
+| `opencode_proxy_finish_reasons` | `reason`, `transport` | Turn terminators. Unknown values fold into `other`, absent ones into `absent`; `transport` is `streaming`, `buffered`, `ollama`, or `synthesized`. |
 | `opencode_proxy_usage_tokens` | `kind` | Upstream-reported tokens as disjoint counts: `input`, `cache_read`, `output`, `reasoning`. |
 | `opencode_proxy_empty_turns` | none | Completed turns with no content and no tool call. |
 | `opencode_proxy_stream_idle_terminations` | `phase` | Streams terminated by the idle guard. |
 | `opencode_proxy_upstream_ready_failures` | `reason` | Readiness probes that judged the upstream unable to serve. |
+| `opencode_proxy_upstream_overloads` | none | Requests rejected because `MAX_CONCURRENT_UPSTREAM` was full. |
+| `opencode_proxy_upstream_active` | none | Current chat/generate slots held by the proxy. |
 
 `usage_tokens` is disjoint on purpose. DeepSeek reports `prompt_tokens` with the
 cache hits *included*, so `input` is the miss share and `input + cache_read`
@@ -94,7 +97,7 @@ Translated to OpenAI chat completions and back:
 
 | Endpoint | Notes |
 | --- | --- |
-| `POST /api/chat` | Full translation including `images` to `image_url` parts. Streams NDJSON. |
+| `POST /api/chat` | Full translation including `images` to `image_url` parts, correlated tool-result IDs, and request-aware DeepSeek repair. Streams NDJSON. |
 | `POST /api/generate` | Prompt-shaped variant of the same path. |
 | `POST /api/embed`, `POST /api/embeddings` | Translated to `/v1/embeddings`. |
 | `GET /api/tags`, `GET /api/ps` | Upstream model discovery reshaped to Ollama form, with aliases. |

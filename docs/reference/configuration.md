@@ -6,8 +6,8 @@ resource: /home/tim/projects/opencode-proxy/src/opencode_proxy/settings.py
 tags: [configuration, environment, yaml, aliases, routing]
 status: active
 generated:
-  by: claude-code/opus-5
-  at: 2026-08-15T16:40:00+02:00
+  by: codex/gpt-5
+  at: 2026-08-15T16:21:21+02:00
 ---
 
 # Configuration
@@ -44,7 +44,7 @@ environment.
 | `UPSTREAM_READY_TIMEOUT` | `2` | `/readyz` probe timeout. |
 | `UPSTREAM_HEALTH_PATH` | unset | Extra `/readyz` probe that exercises the engine, e.g. `/health` for vLLM. |
 | `UPSTREAM_MAX_RETRIES` | `2` | Retries before the first response byte. `0` disables. A `Retry-After` header on a retryable status wins over the backoff curve, clamped to 30s. |
-| `EMPTY_RESPONSE_RETRIES` | `1` | Re-sends a buffered request whose turn completed with no content and no tool call. `0` disables. Streamed turns are never retried. |
+| `EMPTY_RESPONSE_RETRIES` | `1` | Re-sends a buffered request for a `deepseek_v4` profile whose turn completed with no content and no tool call. `0` disables. Streamed turns are never retried. |
 | `MAX_CONCURRENT_UPSTREAM` | `8` | Concurrent chat/generate calls; over the limit returns `429`. `0` disables. |
 | `CUSTOM_HEADERS` / `UPSTREAM_HEADERS` | unset | Extra upstream headers. JSON object or newline-separated `Header: value`. |
 
@@ -58,7 +58,7 @@ can legitimately take minutes to produce a first token. Silence is bounded by
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `UPSTREAM_STREAM_IDLE_TIMEOUT` | `30` | Seconds of silence *between* SSE frames before the client stream is terminated cleanly. `0` disables. |
-| `UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT` | `240` | Seconds of silence before the *first* SSE frame, covering prefill. `0` disables. |
+| `UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT` | `480` | Seconds of silence before the *first* SSE frame, covering prefill. `0` disables. |
 | `SSE_KEEPALIVE_INTERVAL` | `10` | Seconds of silence between `: keepalive` comments. `0` disables. |
 | `STREAM_GUARD_CHARS` | `192` | Text held back while watching for a split tool-call marker. |
 | `TOOL_ARGUMENT_CHUNK_SIZE` | `64` | Size of streamed function-argument deltas. |
@@ -94,7 +94,7 @@ reports only whether capture is enabled, not the directory path.
 | `MAX_TOOL_CALLS` | `32` | More raw calls in one block pass through as text; standard streamed repair tracks at most this many indexes. |
 | `MAX_TOOL_ARGUMENT_CHARS` | `262144` | Larger raw arguments pass through as text; standard streamed tool-call repair stops accumulating at this bound. |
 | `SANITIZE_TOOLS` | `true` | Drop non-`function` tools from requests. |
-| `NORMALIZE_REQUESTS` | `true` | Repair outgoing message shapes a DeepSeek-compatible upstream rejects. See [conform to DeepSeek's own client](/decisions/deepseek-wire-contract.md). |
+| `NORMALIZE_REQUESTS` | `true` | Repair outgoing message and token shapes for models with the `deepseek_v4` compatibility profile. Other models stay transparent. Ollama `think` translation remains active because it is protocol translation. See [conform to DeepSeek's own client](/decisions/deepseek-wire-contract.md). |
 | `REQUEST_DROP_FIELDS` | unset | Comma-separated request fields removed before forwarding. |
 
 Every limit degrades to passthrough-as-text. None of them drop content.
@@ -102,7 +102,8 @@ Every limit degrades to passthrough-as-text. None of them drop content.
 The `deepseek_v4` compatibility profile is configured per canonical upstream
 model in YAML. Its optional `thinking_transport` picks how "no thinking" is
 expressed: `api` (default) sends the DeepSeek API's top-level
-`thinking: {"type": "disabled"}`, and `chat_template_kwargs` sends
+`thinking` object, preserving a compatible effort when thinking is enabled;
+`chat_template_kwargs` sends
 `chat_template_kwargs: {"thinking": false}`, which is what vLLM reads -- it
 ignores the API form. Under the vLLM form `reasoning_effort` is translated to a
 boolean and dropped, since a chat-template argument cannot carry a level. `recover_orphan_invokes: true` repairs the narrow vLLM #49117
@@ -111,6 +112,13 @@ failure only when the request declares function tools, `tool_choice` is not
 completed name exactly matches a declared tool. Rejected blocks remain
 byte-for-byte text. This fallback is temporary; see the
 [DeepSeek V4 runbook](../runbooks/deepseek-v4.md).
+
+`tool_choice` is intentionally preserved for the deployed vLLM path, where the
+live tool-call contract uses it to force a call. A direct vendor API deployment
+that rejects `tool_choice` should set `REQUEST_DROP_FIELDS=tool_choice` for that
+instance rather than changing the shared profile. Do not drop it when callers
+depend on `none`, `required`, or a forced function: removing the field changes
+that request's semantics.
 
 ## Models and routing
 

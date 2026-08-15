@@ -76,7 +76,7 @@ port `9526`; do not bring up the retired standalone `ollama-proxy` service.
 - `EMPTY_RESPONSE_RETRIES`: re-sends a buffered chat request whose turn completed with no content and no tool call. Default: `1`. Use `0` to disable. Streamed turns are never re-sent.
 - `NORMALIZE_REQUESTS`: repair outgoing message shapes a DeepSeek-compatible upstream rejects (`null` assistant content, reasoning replayed on non-tool turns, empty tool results). Default: `true`.
 - `UPSTREAM_STREAM_IDLE_TIMEOUT`: seconds to wait for the next upstream SSE frame *after the first* before terminating the client stream. Default: `30`. Use `0` to disable.
-- `UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT`: seconds to wait for the *first* upstream SSE frame, covering prefill. Default: `240`. Use `0` to disable.
+- `UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT`: seconds to wait for the *first* upstream SSE frame, covering prefill. Default: `480`. Use `0` to disable.
 - `STREAM_GUARD_CHARS`: amount of non-tool text to hold while checking for split tool tags. Default: `192`.
 - `TOOL_ARGUMENT_CHUNK_SIZE`: streamed function argument chunk size. Default: `64`.
 - `PROXY_CONFIG_FILE`: optional YAML file with `models:` (aliases) and `routes:` (modality routes). Environment variables win over the file; a missing or malformed file fails startup.

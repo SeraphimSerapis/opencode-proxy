@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from opencode_proxy.ollama_models import (
     OllamaChatRequest,
+    OllamaFunction,
     OllamaMessage,
     OllamaTool,
+    OllamaToolCall,
     OllamaToolFunction,
 )
 from opencode_proxy.ollama_translate import (
@@ -110,3 +112,56 @@ def test_current_ollama_aliases_and_thinking_levels_are_forwarded() -> None:
     assert translated["chat_template_kwargs"] == {"enable_thinking": "high"}
     assert translated["logprobs"] is True
     assert translated["top_logprobs"] == 3
+
+
+def test_ollama_assistant_thinking_is_replayed_for_tool_turns() -> None:
+    translated = ollama_chat_to_openai(
+        OllamaChatRequest(
+            model="deepseek-v4-flash",
+            messages=[
+                OllamaMessage(
+                    role="assistant",
+                    content=None,
+                    thinking="I should call the tool",
+                    tool_calls=[
+                        OllamaToolCall(
+                            function=OllamaFunction(name="inspect", arguments={"path": "README.md"})
+                        )
+                    ],
+                )
+            ],
+            stream=False,
+        )
+    )
+
+    assert translated["messages"][0]["reasoning_content"] == "I should call the tool"
+
+
+def test_ollama_tool_results_reuse_the_matching_assistant_call_ids() -> None:
+    translated = ollama_chat_to_openai(
+        OllamaChatRequest(
+            model="deepseek-v4-flash",
+            messages=[
+                OllamaMessage(
+                    role="assistant",
+                    tool_calls=[
+                        OllamaToolCall(
+                            function=OllamaFunction(name="inspect", arguments={"path": "a"})
+                        ),
+                        OllamaToolCall(
+                            function=OllamaFunction(name="inspect", arguments={"path": "b"})
+                        ),
+                    ],
+                ),
+                OllamaMessage(role="tool", tool_name="inspect", content="a-result"),
+                OllamaMessage(role="tool", tool_name="inspect", content="b-result"),
+            ],
+            stream=False,
+        )
+    )
+
+    assistant, first_result, second_result = translated["messages"]
+    call_ids = [call["id"] for call in assistant["tool_calls"]]
+    assert call_ids == ["call_0", "call_1"]
+    assert first_result["tool_call_id"] == call_ids[0]
+    assert second_result["tool_call_id"] == call_ids[1]

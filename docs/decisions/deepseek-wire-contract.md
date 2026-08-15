@@ -6,8 +6,8 @@ resource: /home/tim/projects/opencode-proxy/src/opencode_proxy/request_compat.py
 tags: [deepseek, requests, wire-format, reasoning, reliability]
 status: active
 generated:
-  by: claude-code/opus-5
-  at: 2026-08-15T17:30:00+02:00
+  by: codex/gpt-5
+  at: 2026-08-15T16:21:21+02:00
 sources:
   - id: deepseek-harness
     title: DeepSeek Harness — the vendor's own agent client for V4
@@ -15,6 +15,9 @@ sources:
   - id: llm-deepseek
     title: "@deepseek-ai/dsh-llm-deepseek — chat-completions adapter (serialize.ts, translate.ts, sse.ts)"
     url: https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/llm/llm-deepseek
+  - id: deepseek-chat-completions
+    title: DeepSeek Chat Completions API
+    url: https://api-docs.deepseek.com/api/create-chat-completion/
 ---
 
 # Conform to DeepSeek's own client on the way upstream
@@ -47,13 +50,12 @@ reference client does.
 
 ### Assistant `content` is never `null`
 
-`serialize.ts` carries an unusually blunt comment about this. A reasoning-only
-assistant turn -- which V4 Flash produces for short prompts, answering entirely
-in the reasoning channel -- serializes as `content: null` with no `tool_calls`,
-and the API rejects it with "content or tool_calls must be set". Because that
-message sits durably in the caller's session log, it is replayed on every
-subsequent request: one bad turn bricks the rest of the session. The proxy
-coerces `null` to `""`.
+`serialize.ts` carries an unusually blunt comment about this: text-less
+assistant turns serialize as `content: ""`, never `null`. The live API rejected
+a reasoning-only `content: null` replay with "content or tool_calls must be
+set". Because that message sits durably in the caller's session log, it is
+replayed on every subsequent request: one bad turn bricks the rest of the
+session. The proxy coerces `null` to `""`.
 
 ### Reasoning is replayed on tool-call turns and dropped everywhere else
 
@@ -74,9 +76,14 @@ prints nothing is common in an agent loop.
 
 ### `off` is `thinking`, not an effort -- but which `thinking` depends on the server
 
-`reasoning_effort` accepts only `high` and `max`. Disabling thinking is a
+`reasoning_effort` accepts `low`, `high`, and `max`; common `medium` and `xhigh`
+client values are canonicalized to `high`. Disabling thinking is a
 different field, and *which* field depends on who is serving the model. Measured
 against the deployed vLLM on 2026-08-15:
+
+The reviewed harness narrows its own input type to `off`, `high`, and `max`.
+The public Chat Completions API is broader, so the proxy accepts its documented
+`low` level and compatibility aliases for clients that do not use the harness.
 
 | Request shape | Result |
 | --- | --- |
@@ -87,28 +94,40 @@ against the deployed vLLM on 2026-08-15:
 So the profile carries a `thinking_transport`, defaulting to `api`:
 
 * `api` -- the vendor form. `off` becomes `thinking: {"type": "disabled"}` with
-  no effort field; enabled is the provider default, so an accepted effort is
-  forwarded alone.
+  no effort field. An explicit enabled toggle may accompany `low`, `high`, or
+  `max`, matching the vendor API. Recognized toggle spellings are canonicalized.
 * `chat_template_kwargs` -- the vLLM form. The template argument is a boolean,
-  so it cannot carry a *level*: `off` becomes `false`, `high`/`max` become
-  `true`, and `reasoning_effort` is dropped rather than forwarded to be silently
-  ignored. Any other `chat_template_kwargs` the caller sent are preserved.
+  so it cannot carry a *level*: `off` becomes `false`, every enabled level
+  becomes `true`, and `reasoning_effort` is dropped rather than forwarded to be
+  silently ignored. Any other `chat_template_kwargs` the caller sent are
+  preserved.
 
 Both mappings are DeepSeek-specific -- neither field is an OpenAI one -- so they
 run only for a model configured with the `deepseek_v4` compatibility profile.
-Message hygiene above is valid for any OpenAI-compatible upstream and is not
-gated.
+The message hygiene above is likewise applied only inside that profile at the
+HTTP boundary; direct callers of the pure helper can still exercise it without
+constructing a settings object.
 
 Guessing one form would have been wrong half the time, and wrong silently: both
 servers accept the other's field without complaint.
+
+### Ollama tool replay needs correlated IDs
+
+Ollama tool results identify the function by name but do not carry the OpenAI
+`tool_call_id` that DeepSeek requires. The adapter assigns ordered IDs to
+assistant calls and reuses the matching pending ID on each tool result. This
+also handles repeated calls to the same function in one assistant turn. Both
+buffered and streaming Ollama responses receive the same request-aware orphan
+repair context as `/v1/chat/completions`.
 
 ### An empty completed turn is a failure, not an answer
 
 `translate.ts` maps a `stop` finish that opened no blocks to `EMPTY_RESPONSE`
 and retries it under the default policy. The proxy already
 [detected and annotated](turn-usability.md) this shape but still handed the
-caller a successful empty turn. Buffered requests now retry it
-(`EMPTY_RESPONSE_RETRIES`, default 1) before annotating. A turn cut short by
+caller a successful empty turn. Buffered requests for a configured
+`deepseek_v4` profile now retry it (`EMPTY_RESPONSE_RETRIES`, default 1) before
+annotating. A turn cut short by
 `length` is excluded: that one is truthfully reported, and retrying it unchanged
 burns the same budget again.
 
