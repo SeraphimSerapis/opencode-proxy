@@ -7,7 +7,7 @@ OpenCode CLI -> opencode-proxy -> OpenAI-compatible upstream -> model backend
 Ollama clients -> opencode-proxy -> OpenAI-compatible upstream -> model backend
 ```
 
-The proxy passes normal OpenAI-compatible traffic through unchanged and repairs known malformed assistant tool-call formats in `/v1/chat/completions` responses. The same process also exposes an Ollama-compatible REST adapter, so OpenCode, Home Assistant, and Ollama clients can share one gateway.
+The proxy passes normal OpenAI-compatible traffic through unchanged, repairs known malformed assistant tool-call formats in `/v1/chat/completions` responses, and repairs the outgoing message shapes a DeepSeek-compatible upstream rejects. The same process also exposes an Ollama-compatible REST adapter, so OpenCode, Home Assistant, and Ollama clients can share one gateway.
 
 ## Documentation
 
@@ -43,6 +43,26 @@ converted; surrounding reasoning text stays in the original reasoning field.
 Streaming responses are parsed as SSE frames, including comments and multiline
 `data:` events. If an upstream stream ends without `[DONE]`, pending text is
 flushed and the proxy emits a single final `[DONE]`.
+
+## Request Repairs
+
+Requests are forwarded as sent except for the shapes a DeepSeek-compatible
+upstream rejects outright (`NORMALIZE_REQUESTS=false` disables all of them):
+
+- Assistant `content: null` becomes `""`. A reasoning-only turn otherwise fails
+  with "content or tool_calls must be set", and because the message stays in the
+  caller's session log it keeps failing on every later turn.
+- `reasoning_content` is kept on assistant turns that carried tool calls, where
+  the API requires it, and dropped on turns that did not, where it is ignored
+  and only costs tokens. A caller's `reasoning` is moved into
+  `reasoning_content` when that is the only copy present.
+- An empty tool result is sent as `(no output)`.
+- For models configured with the `deepseek_v4` compatibility profile,
+  `reasoning_effort: "off"` becomes `thinking: {"type": "disabled"}`; only
+  `high` and `max` are valid on the wire.
+
+These rules come from [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness),
+DeepSeek's own client for this wire format.
 
 ## Local Development
 
@@ -183,7 +203,8 @@ never use the LiteLLM master key as a general client fallback.
 | `UPSTREAM_READY_TIMEOUT` | `2` | Timeout in seconds for the `/readyz` upstream probe. |
 | `UPSTREAM_HEALTH_PATH` | unset | Extra `/readyz` probe that exercises the upstream engine, for example `/health` for vLLM. A model listing alone is served from static config and stays `200` after the engine dies. |
 | `SSE_KEEPALIVE_INTERVAL` | `10` | Seconds of upstream silence before the proxy sends an SSE keepalive comment. `0` disables keepalives. |
-| `UPSTREAM_MAX_RETRIES` | `2` | Retries for chat/generate requests that fail before any response byte reaches the client. `0` disables retries. |
+| `UPSTREAM_MAX_RETRIES` | `2` | Retries for chat/generate requests that fail before any response byte reaches the client. `0` disables retries. A `Retry-After` header on a retryable status paces the retry instead of the backoff curve, clamped to 30s. |
+| `EMPTY_RESPONSE_RETRIES` | `1` | Re-sends a buffered chat request whose turn completed with no content and no tool call. `0` disables. Streamed turns are never re-sent. |
 | `UPSTREAM_STREAM_IDLE_TIMEOUT` | `30` | Seconds to wait for the next upstream SSE frame *after the first one* before flushing buffers, sending a terminal chunk, and closing the client stream. `0` disables the guard. |
 | `UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT` | `240` | Seconds to wait for the *first* upstream SSE frame. Covers prefill, which sends nothing and legitimately takes minutes on a long prompt, so it is much larger than the between-frame gap. `0` disables. |
 | `MAX_CONCURRENT_UPSTREAM` | `8` | Max concurrent chat/generate requests to upstream. Extra requests get `429` with `Retry-After: 1`. `0` disables the limit. |
@@ -195,6 +216,7 @@ never use the LiteLLM master key as a general client fallback.
 | `MAX_TOOL_ARGUMENT_CHARS` | `262144` | Maximum serialized argument size per converted call and streamed repair buffer. Larger raw blocks pass through as text; standard calls are not repaired past the bound. |
 | `TOOL_CALL_SCAN_FIELDS` | `content,reasoning,reasoning_content` | Comma-separated response fields scanned for raw tool-call blocks. Use `all` for all supported fields. |
 | `SANITIZE_TOOLS` | `true` | Drop non-function tools from chat completion requests for OpenCode/upstream compatibility. |
+| `NORMALIZE_REQUESTS` | `true` | Repair outgoing message shapes a DeepSeek-compatible upstream rejects: `null` assistant content, reasoning replayed on the wrong turns, empty tool results. |
 | `REQUEST_DROP_FIELDS` | unset | Comma-separated request body fields to remove before forwarding, for backend-specific quirks. |
 | `CUSTOM_HEADERS` | unset | Extra headers added to upstream requests. Overrides forwarded client headers. |
 | `UPSTREAM_HEADERS` | unset | Alias for `CUSTOM_HEADERS`. |
@@ -264,7 +286,11 @@ Two guards keep a streamed turn from stalling silently:
 When the upstream closes a turn without content or tool calls, the proxy logs
 the empty turn and emits `EMPTY_TURN_NOTICE` (enabled by default) before the
 terminal chunk so an agent client has something actionable to display. Set it
-empty to keep the turn unannotated.
+empty to keep the turn unannotated. A buffered request is re-sent
+`EMPTY_RESPONSE_RETRIES` times first, since nothing has reached the client yet
+and an empty completed turn is a failed generation rather than an answer. If the
+upstream reported a terminator outside `stop`, `length`, and `tool_calls`, the
+notice names that terminator instead of blaming the token budget.
 
 Chat and generate requests are retried up to `UPSTREAM_MAX_RETRIES` times on
 transport errors and on upstream `429`, `500`, `502`, `503`, and `504`, with

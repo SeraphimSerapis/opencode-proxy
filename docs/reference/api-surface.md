@@ -7,8 +7,7 @@ tags: [api, endpoints, openai, ollama, health]
 status: active
 generated:
   by: claude-code/opus-5
-  at: 2026-08-01T16:20:00+02:00
-verified: 2026-08-01
+  at: 2026-08-15T16:40:00+02:00
 ---
 
 # API surface
@@ -49,6 +48,30 @@ Two deliberate choices:
   vLLM is what actually exercises the engine; leave it unset for upstreams whose
   health route is expensive or authenticated (LiteLLM's fans out to every
   configured deployment).
+
+## Metrics
+
+`GET /metrics` exposes proxy-owned counters only, all with bounded label sets:
+
+| Counter | Labels | Records |
+| --- | --- | --- |
+| `opencode_proxy_raw_tool_repair` | `format`, `field` | Raw text tool-call blocks converted to OpenAI tool calls. |
+| `opencode_proxy_orphan_recovery` | `outcome`, `reason` | DeepSeek V4 orphan invoke recovery attempts. |
+| `opencode_proxy_synthesized_tool_call_ids` | `transport` | Native tool calls that arrived without an `id`. |
+| `opencode_proxy_tool_argument_repair` | `outcome` | Truncated streamed `arguments` completed, or refused. |
+| `opencode_proxy_request_normalizations` | `kind` | Outgoing message shapes repaired before forwarding. |
+| `opencode_proxy_upstream_retries` | `reason` | Requests re-sent, including `empty_response`. |
+| `opencode_proxy_upstream_errors` | `type` | Error statuses classified as `auth`, `quota`, `rate_limit`, `context_window_exceeded`, `invalid_request`, `server`. |
+| `opencode_proxy_finish_reasons` | `reason`, `transport` | Turn terminators. Unknown values fold into `other`, absent ones into `absent`; `transport` is `streaming`, `buffered`, or `synthesized`. |
+| `opencode_proxy_usage_tokens` | `kind` | Upstream-reported tokens as disjoint counts: `input`, `cache_read`, `output`, `reasoning`. |
+| `opencode_proxy_empty_turns` | none | Completed turns with no content and no tool call. |
+| `opencode_proxy_stream_idle_terminations` | `phase` | Streams terminated by the idle guard. |
+| `opencode_proxy_upstream_ready_failures` | `reason` | Readiness probes that judged the upstream unable to serve. |
+
+`usage_tokens` is disjoint on purpose. DeepSeek reports `prompt_tokens` with the
+cache hits *included*, so `input` is the miss share and `input + cache_read`
+reproduces the billed prompt. Summing every kind therefore never double counts.
+DeepSeek reports no cache-write metric, so there is no counter for one.
 
 ## OpenAI-compatible
 

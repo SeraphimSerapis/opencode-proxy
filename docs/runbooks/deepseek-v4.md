@@ -5,7 +5,13 @@ description: Pin vLLM, launch DeepSeek V4 with the matching parsers, observe cac
 resource: /home/tim/projects/opencode-proxy/tests/test_live_vllm.py
 tags: [deepseek-v4, vllm, dsml, prefix-cache, prometheus, deployment]
 status: active
-verified: 2026-08-03
+generated:
+  by: claude-code/opus-5
+  at: 2026-08-15T16:40:00+02:00
+sources:
+  - id: llm-deepseek
+    title: "@deepseek-ai/dsh-llm-deepseek — the vendor's reference client and its model catalog"
+    url: https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/llm/llm-deepseek
 ---
 
 # Serve DeepSeek V4 safely
@@ -37,8 +43,34 @@ The V4 server command must include:
 ```
 
 Keep vLLM authoritative for tokenization, chat templates, reasoning/tool
-parsing, and GPU execution. The proxy does not reshape prompts, replay sessions,
-execute tools, compact history, or retry after response bytes reach a client.
+parsing, and GPU execution. The proxy does not author prompt text, replay
+sessions, execute tools, compact history, or retry after response bytes reach a
+client. It does repair message *shapes* the DeepSeek wire format rejects, which
+is a different thing and is bounded by
+[conform to DeepSeek's own client](../decisions/deepseek-wire-contract.md).
+
+## Wire-format facts from the vendor's own client
+
+`deepseek-harness` ships `packages/llm/llm-deepseek`, DeepSeek's reference
+adapter for this wire format. Useful facts to serve against, none of which the
+proxy can enforce on its own:
+
+| Fact | Value |
+| --- | --- |
+| Context window advertised for V4 Flash and V4 Pro | 1,000,000 tokens |
+| Default per-request output cap | 256,000 tokens |
+| Default stream idle budget | 300s per outstanding read |
+| Accepted `reasoning_effort` values | `high`, `max` (default `high`) |
+| Disabling thinking | `thinking: {"type": "disabled"}`, never `reasoning_effort: "off"` |
+| Cache accounting | `prompt_tokens` *includes* `prompt_cache_hit_tokens`; no cache-write metric exists |
+
+Two consequences for this deployment. The proxy's
+`UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT` (240s) is tighter than the vendor's 300s
+idle budget, which is intentional: ours covers prefill on a single local GPU,
+not a hosted fleet. And `DSML` appears nowhere in that repository -- the vendor
+client assumes native `tool_calls` -- so every raw-text repair in this proxy is
+compensating for the self-hosted chat template and should disappear once vLLM's
+parser is correct.
 
 ## Temporary proxy fallback
 
