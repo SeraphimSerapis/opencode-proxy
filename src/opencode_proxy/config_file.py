@@ -14,6 +14,8 @@ from typing import Any
 
 import yaml
 
+from opencode_proxy.request_compat import DEFAULT_THINKING_TRANSPORT, THINKING_TRANSPORTS
+
 LOG = logging.getLogger(__name__)
 
 SUPPORTED_SECTIONS = frozenset({"models", "routes"})
@@ -93,6 +95,7 @@ def _parse_models_section(
                 "aliases",
                 "compatibility",
                 "recover_orphan_invokes",
+                "thinking_transport",
             }
             if unknown:
                 msg = f"{config_path}: unsupported keys for model {target!r}: {sorted(unknown)}"
@@ -103,7 +106,12 @@ def _parse_models_section(
                 raise ValueError(msg)
             raw_profile = entry.get("compatibility")
             recover_orphans = entry.get("recover_orphan_invokes", False)
-            if raw_profile is not None or "recover_orphan_invokes" in entry:
+            transport = entry.get("thinking_transport", DEFAULT_THINKING_TRANSPORT)
+            if (
+                raw_profile is not None
+                or "recover_orphan_invokes" in entry
+                or "thinking_transport" in entry
+            ):
                 if raw_profile != "deepseek_v4":
                     msg = f"{config_path}: compatibility for model {target!r} must be 'deepseek_v4'"
                     raise ValueError(msg)
@@ -113,9 +121,17 @@ def _parse_models_section(
                         f"{target!r} must be a boolean"
                     )
                     raise ValueError(msg)
+                if transport not in THINKING_TRANSPORTS:
+                    allowed = ", ".join(sorted(THINKING_TRANSPORTS))
+                    msg = (
+                        f"{config_path}: 'thinking_transport' for model "
+                        f"{target!r} must be one of: {allowed}"
+                    )
+                    raise ValueError(msg)
                 compatibility[target] = {
                     "compatibility": raw_profile,
                     "recover_orphan_invokes": recover_orphans,
+                    "thinking_transport": transport,
                 }
         elif entry is None:
             raw_aliases = []

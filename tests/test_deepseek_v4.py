@@ -100,17 +100,49 @@ def test_yaml_model_entry_loads_deepseek_v4_compatibility(tmp_path: Path) -> Non
     assert settings.parsed_model_aliases == {"dsv4": "deepseek-v4"}
 
 
+def test_yaml_model_entry_selects_the_thinking_transport(tmp_path: Path) -> None:
+    config = tmp_path / "proxy.yaml"
+    config.write_text(
+        "models:\n"
+        "  deepseek-v4-flash:\n"
+        "    compatibility: deepseek_v4\n"
+        "    thinking_transport: chat_template_kwargs\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(config_file=str(config))
+    profile = settings.parsed_model_compatibility["deepseek-v4-flash"]
+
+    assert profile.thinking_transport == "chat_template_kwargs"
+
+
+def test_thinking_transport_defaults_to_the_api_form(tmp_path: Path) -> None:
+    config = tmp_path / "proxy.yaml"
+    config.write_text(
+        "models:\n  deepseek-v4:\n    compatibility: deepseek_v4\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(config_file=str(config))
+
+    assert settings.parsed_model_compatibility["deepseek-v4"].thinking_transport == "api"
+
+
 @pytest.mark.parametrize(
     "config",
     [
         "models:\n  model:\n    compatibility: other\n",
+        (
+            "models:\n  model:\n    compatibility: deepseek_v4\n"
+            "    thinking_transport: enable_thinking\n"
+        ),
         ('models:\n  model:\n    compatibility: deepseek_v4\n    recover_orphan_invokes: "yes"\n'),
     ],
 )
 def test_yaml_rejects_invalid_compatibility(tmp_path: Path, config: str) -> None:
     path = tmp_path / "proxy.yaml"
     path.write_text(config, encoding="utf-8")
-    with pytest.raises(ValueError, match=r"compatibility|boolean"):
+    with pytest.raises(ValueError, match=r"compatibility|boolean|thinking_transport"):
         load_config_file(path)
 
 

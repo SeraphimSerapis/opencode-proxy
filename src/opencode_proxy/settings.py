@@ -14,6 +14,7 @@ from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from opencode_proxy.config_file import load_config_file
+from opencode_proxy.request_compat import DEFAULT_THINKING_TRANSPORT, THINKING_TRANSPORTS
 from opencode_proxy.routing import ModalityRoute, parse_modality_routes
 
 if TYPE_CHECKING:
@@ -28,6 +29,7 @@ CONFIG_FILE_ENV = "PROXY_CONFIG_FILE"
 class ModelCompatibility:
     profile: str
     recover_orphan_invokes: bool
+    thinking_transport: str = DEFAULT_THINKING_TRANSPORT
 
 
 class ConfigFileSettingsSource(PydanticBaseSettingsSource):
@@ -343,6 +345,7 @@ class Settings(BaseSettings):
                 model: {
                     "profile": profile.profile,
                     "recover_orphan_invokes": profile.recover_orphan_invokes,
+                    "thinking_transport": profile.thinking_transport,
                 }
                 for model, profile in sorted(self.parsed_model_compatibility.items())
             },
@@ -444,15 +447,21 @@ def parse_model_compatibility(raw: str | dict[str, object]) -> dict[str, ModelCo
             raise ValueError(msg)
         profile = raw_entry.get("compatibility")
         recover = raw_entry.get("recover_orphan_invokes", False)
+        transport = raw_entry.get("thinking_transport", DEFAULT_THINKING_TRANSPORT)
         if profile != "deepseek_v4":
             msg = f"unsupported compatibility profile for model {model!r}"
             raise ValueError(msg)
         if not isinstance(recover, bool):
             msg = f"recover_orphan_invokes for model {model!r} must be a boolean"
             raise ValueError(msg)
+        if transport not in THINKING_TRANSPORTS:
+            allowed = ", ".join(sorted(THINKING_TRANSPORTS))
+            msg = f"thinking_transport for model {model!r} must be one of: {allowed}"
+            raise ValueError(msg)
         profiles[model] = ModelCompatibility(
             profile=profile,
             recover_orphan_invokes=recover,
+            thinking_transport=transport,
         )
     return profiles
 

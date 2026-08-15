@@ -25,7 +25,7 @@ def test_null_assistant_content_becomes_an_empty_string() -> None:
         ],
     }
 
-    stats = normalize_request(body, deepseek_profile=False)
+    stats = normalize_request(body, thinking_transport=None)
 
     assert body["messages"][0]["content"] == ""
     assert body["messages"][1]["content"] == "kept"
@@ -50,7 +50,7 @@ def test_reasoning_is_replayed_on_tool_call_turns_and_dropped_elsewhere() -> Non
         ],
     }
 
-    stats = normalize_request(body, deepseek_profile=False)
+    stats = normalize_request(body, thinking_transport=None)
 
     assert body["messages"][0]["reasoning_content"] == "kept for the tool round trip"
     assert "reasoning_content" not in body["messages"][1]
@@ -70,7 +70,7 @@ def test_reasoning_moves_into_the_field_the_api_reads() -> None:
         ],
     }
 
-    stats = normalize_request(body, deepseek_profile=False)
+    stats = normalize_request(body, thinking_transport=None)
 
     message = body["messages"][0]
     assert message["reasoning_content"] == "why I called the tool"
@@ -87,7 +87,7 @@ def test_empty_tool_results_get_placeholder_content() -> None:
         ],
     }
 
-    stats = normalize_request(body, deepseek_profile=False)
+    stats = normalize_request(body, thinking_transport=None)
 
     assert body["messages"][0]["content"] == EMPTY_TOOL_RESULT_PLACEHOLDER
     assert body["messages"][1]["content"] == EMPTY_TOOL_RESULT_PLACEHOLDER
@@ -98,7 +98,7 @@ def test_empty_tool_results_get_placeholder_content() -> None:
 def test_disabled_reasoning_effort_becomes_the_thinking_field() -> None:
     body: dict[str, Any] = {"model": "deepseek-v4", "reasoning_effort": "off", "messages": []}
 
-    stats = normalize_request(body, deepseek_profile=True)
+    stats = normalize_request(body, thinking_transport="api")
 
     assert "reasoning_effort" not in body
     assert body["thinking"] == {"type": "disabled"}
@@ -108,17 +108,54 @@ def test_disabled_reasoning_effort_becomes_the_thinking_field() -> None:
 def test_accepted_reasoning_effort_is_forwarded_untouched() -> None:
     body: dict[str, Any] = {"model": "deepseek-v4", "reasoning_effort": "max", "messages": []}
 
-    stats = normalize_request(body, deepseek_profile=True)
+    stats = normalize_request(body, thinking_transport="api")
 
     assert body["reasoning_effort"] == "max"
     assert "thinking" not in body
     assert not stats.changed
 
 
+def test_chat_template_transport_uses_the_vllm_argument() -> None:
+    body: dict[str, Any] = {"model": "deepseek-v4-flash", "reasoning_effort": "off", "messages": []}
+
+    stats = normalize_request(body, thinking_transport="chat_template_kwargs")
+
+    # vLLM ignores the API's top-level field and reads the template argument.
+    assert body["chat_template_kwargs"] == {"thinking": False}
+    assert "thinking" not in body
+    assert "reasoning_effort" not in body
+    assert stats.thinking_disabled == 1
+
+
+def test_chat_template_transport_translates_an_enabled_effort() -> None:
+    body: dict[str, Any] = {"model": "deepseek-v4-flash", "reasoning_effort": "max", "messages": []}
+
+    stats = normalize_request(body, thinking_transport="chat_template_kwargs")
+
+    # The template argument is a boolean, so a level cannot survive; forwarding
+    # the effort field would leave it silently ignored.
+    assert body["chat_template_kwargs"] == {"thinking": True}
+    assert "reasoning_effort" not in body
+    assert stats.thinking_enabled == 1
+
+
+def test_chat_template_transport_keeps_the_callers_other_kwargs() -> None:
+    body: dict[str, Any] = {
+        "model": "deepseek-v4-flash",
+        "reasoning_effort": "off",
+        "chat_template_kwargs": {"add_generation_prompt": True},
+        "messages": [],
+    }
+
+    normalize_request(body, thinking_transport="chat_template_kwargs")
+
+    assert body["chat_template_kwargs"] == {"add_generation_prompt": True, "thinking": False}
+
+
 def test_thinking_mapping_is_deepseek_only() -> None:
     body: dict[str, Any] = {"model": "qwen", "reasoning_effort": "off", "messages": []}
 
-    normalize_request(body, deepseek_profile=False)
+    normalize_request(body, thinking_transport=None)
 
     assert body["reasoning_effort"] == "off"
     assert "thinking" not in body
@@ -134,7 +171,7 @@ def test_normalization_leaves_a_clean_request_alone() -> None:
     }
     original = {"role": "user", "content": "hi"}
 
-    stats = normalize_request(body, deepseek_profile=True)
+    stats = normalize_request(body, thinking_transport="api")
 
     assert not stats.changed
     assert body["messages"][0] == original
@@ -147,7 +184,7 @@ def test_multipart_assistant_content_is_not_flattened() -> None:
         ],
     }
 
-    stats = normalize_request(body, deepseek_profile=False)
+    stats = normalize_request(body, thinking_transport=None)
 
     assert body["messages"][0]["content"] == [{"type": "text", "text": "kept"}]
     assert not stats.changed

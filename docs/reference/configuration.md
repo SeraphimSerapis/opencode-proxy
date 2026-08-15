@@ -100,7 +100,12 @@ reports only whether capture is enabled, not the directory path.
 Every limit degrades to passthrough-as-text. None of them drop content.
 
 The `deepseek_v4` compatibility profile is configured per canonical upstream
-model in YAML. `recover_orphan_invokes: true` repairs the narrow vLLM #49117
+model in YAML. Its optional `thinking_transport` picks how "no thinking" is
+expressed: `api` (default) sends the DeepSeek API's top-level
+`thinking: {"type": "disabled"}`, and `chat_template_kwargs` sends
+`chat_template_kwargs: {"thinking": false}`, which is what vLLM reads -- it
+ignores the API form. Under the vLLM form `reasoning_effort` is translated to a
+boolean and dropped, since a chat-template argument cannot carry a level. `recover_orphan_invokes: true` repairs the narrow vLLM #49117
 failure only when the request declares function tools, `tool_choice` is not
 `none`, the marker is canonical fullwidth-bar V4 DSML in `content`, and the
 completed name exactly matches a declared tool. Rejected blocks remain

@@ -3714,3 +3714,40 @@ async def test_streamed_usage_is_counted_disjointly() -> None:
     assert 'opencode_proxy_usage_tokens_total{kind="cache_read"} 900.0' in metrics
     assert 'opencode_proxy_usage_tokens_total{kind="output"} 40.0' in metrics
     assert 'opencode_proxy_usage_tokens_total{kind="reasoning"} 25.0' in metrics
+
+
+@respx.mock
+async def test_chat_template_transport_forwards_the_vllm_thinking_argument() -> None:
+    route = respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=_buffered_completion("ok")),
+    )
+
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        model_compatibility=json.dumps(
+            {
+                "deepseek-v4-flash": {
+                    "compatibility": "deepseek_v4",
+                    "thinking_transport": "chat_template_kwargs",
+                },
+            },
+        ),
+    )
+    async with await _client(settings) as client:
+        await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "deepseek-v4-flash",
+                "reasoning_effort": "off",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        metrics = (await client.get("/metrics")).text
+
+    forwarded = json.loads(route.calls[0].request.content)
+    # vLLM ignores the DeepSeek API's top-level field, so the profile targets
+    # the chat-template argument instead.
+    assert forwarded["chat_template_kwargs"] == {"thinking": False}
+    assert "thinking" not in forwarded
+    assert "reasoning_effort" not in forwarded
+    assert 'opencode_proxy_request_normalizations_total{kind="thinking_disabled"} 1.0' in metrics

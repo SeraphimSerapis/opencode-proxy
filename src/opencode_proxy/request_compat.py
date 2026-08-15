@@ -29,6 +29,14 @@ REASONING_FIELDS = ("reasoning_content", "reasoning")
 # The only two efforts DeepSeek accepts on the wire. "off" is expressed as
 # ``thinking: {"type": "disabled"}`` instead and never crosses as an effort.
 WIRE_REASONING_EFFORTS = frozenset({"high", "max"})
+
+# How an upstream wants thinking expressed. The DeepSeek API reads a top-level
+# `thinking` object; vLLM ignores that and reads a chat-template argument
+# instead, so the same profile has to be able to target either. These live here
+# rather than in settings.py because settings imports config_file, which needs
+# them too.
+THINKING_TRANSPORTS = frozenset({"api", "chat_template_kwargs"})
+DEFAULT_THINKING_TRANSPORT = "api"
 DISABLED_REASONING_EFFORTS = frozenset({"off", "none", "disabled"})
 
 
@@ -41,6 +49,7 @@ class RequestNormalizationStats:
     moved_reasoning: int = 0
     empty_tool_results: int = 0
     thinking_disabled: int = 0
+    thinking_enabled: int = 0
 
     @property
     def changed(self) -> bool:
@@ -50,6 +59,7 @@ class RequestNormalizationStats:
             or self.moved_reasoning
             or self.empty_tool_results
             or self.thinking_disabled
+            or self.thinking_enabled
         )
 
     def as_labels(self) -> dict[str, int]:
@@ -60,6 +70,7 @@ class RequestNormalizationStats:
             "moved_reasoning": self.moved_reasoning,
             "empty_tool_results": self.empty_tool_results,
             "thinking_disabled": self.thinking_disabled,
+            "thinking_enabled": self.thinking_enabled,
         }
         return {label: count for label, count in counts.items() if count}
 
@@ -124,44 +135,81 @@ def _normalize_tool_message(message: JsonObject, stats: RequestNormalizationStat
         stats.empty_tool_results += 1
 
 
-def normalize_reasoning_effort(body: JsonObject, stats: RequestNormalizationStats) -> None:
-    """Express "no thinking" the way the DeepSeek wire format does.
+def normalize_reasoning_effort(
+    body: JsonObject,
+    stats: RequestNormalizationStats,
+    *,
+    transport: str,
+) -> None:
+    """Express thinking the way *this* upstream reads it.
 
-    ``reasoning_effort`` accepts only ``high`` and ``max``; disabling thinking is
-    ``thinking: {"type": "disabled"}`` with no effort field at all. Enabled is the
-    provider default, so an accepted effort is forwarded on its own.
+    ``reasoning_effort`` accepts only ``high`` and ``max`` on the DeepSeek wire;
+    "off" is a different field entirely. Which field depends on who is serving:
 
-    DeepSeek-profile models only: ``thinking`` is not an OpenAI field.
+    * ``api`` -- the DeepSeek API's top-level ``thinking: {"type": "disabled"}``,
+      with no effort field. Enabled is the provider default, so an accepted
+      effort is forwarded on its own.
+    * ``chat_template_kwargs`` -- vLLM, which ignores the top-level field and
+      reads ``chat_template_kwargs.thinking`` instead. That argument is a
+      boolean, so it cannot carry an effort *level*; the effort field is
+      translated and dropped rather than forwarded to be silently ignored.
+
+    DeepSeek-profile models only: neither field is an OpenAI one.
     """
     effort = body.get("reasoning_effort")
     if not isinstance(effort, str):
         return
 
     normalized = effort.strip().lower()
-    if normalized in DISABLED_REASONING_EFFORTS:
-        body.pop("reasoning_effort", None)
-        body["thinking"] = {"type": "disabled"}
-        stats.thinking_disabled += 1
-        return
-    if normalized not in WIRE_REASONING_EFFORTS:
+    disabled = normalized in DISABLED_REASONING_EFFORTS
+    if not disabled and normalized not in WIRE_REASONING_EFFORTS:
         LOG.warning(
-            "forwarding unsupported reasoning_effort %r; DeepSeek accepts only %s",
+            "unsupported reasoning_effort %r; DeepSeek accepts only %s",
             effort,
             ", ".join(sorted(WIRE_REASONING_EFFORTS)),
         )
+        if transport != "chat_template_kwargs":
+            return
+
+    if transport == "chat_template_kwargs":
+        _set_chat_template_thinking(body, enabled=not disabled)
+        body.pop("reasoning_effort", None)
+        if disabled:
+            stats.thinking_disabled += 1
+        else:
+            stats.thinking_enabled += 1
+        return
+
+    if disabled:
+        body.pop("reasoning_effort", None)
+        body["thinking"] = {"type": "disabled"}
+        stats.thinking_disabled += 1
 
 
-def normalize_request(body: JsonObject, *, deepseek_profile: bool) -> RequestNormalizationStats:
+def _set_chat_template_thinking(body: JsonObject, *, enabled: bool) -> None:
+    """Set the template argument without disturbing the caller's other kwargs."""
+    kwargs = body.get("chat_template_kwargs")
+    if not isinstance(kwargs, dict):
+        kwargs = {}
+    body["chat_template_kwargs"] = {**kwargs, "thinking": enabled}
+
+
+def normalize_request(
+    body: JsonObject,
+    *,
+    thinking_transport: str | None,
+) -> RequestNormalizationStats:
     """Apply every request repair that applies to this body.
 
-    Message hygiene is safe for any OpenAI-compatible upstream; the thinking
-    mapping is DeepSeek-specific and runs only for a model configured with the
+    Message hygiene is safe for any OpenAI-compatible upstream and always runs.
+    The thinking mapping is DeepSeek-specific and needs to know how the upstream
+    reads it, so ``thinking_transport`` is ``None`` for any model without a
     ``deepseek_v4`` compatibility profile.
     """
     stats = RequestNormalizationStats()
     normalize_messages(body, stats)
-    if deepseek_profile:
-        normalize_reasoning_effort(body, stats)
+    if thinking_transport is not None:
+        normalize_reasoning_effort(body, stats, transport=thinking_transport)
     if stats.changed:
         LOG.info("normalized outgoing chat request: %s", stats.as_labels())
     return stats

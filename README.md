@@ -58,8 +58,11 @@ upstream rejects outright (`NORMALIZE_REQUESTS=false` disables all of them):
   `reasoning_content` when that is the only copy present.
 - An empty tool result is sent as `(no output)`.
 - For models configured with the `deepseek_v4` compatibility profile,
-  `reasoning_effort: "off"` becomes `thinking: {"type": "disabled"}`; only
-  `high` and `max` are valid on the wire.
+  `reasoning_effort: "off"` is translated to whichever field the upstream
+  actually reads (`thinking_transport`): the DeepSeek API's
+  `thinking: {"type": "disabled"}` by default, or vLLM's
+  `chat_template_kwargs: {"thinking": false}`. Only `high` and `max` are valid
+  efforts on the wire.
 
 These rules come from [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness),
 DeepSeek's own client for this wire format.

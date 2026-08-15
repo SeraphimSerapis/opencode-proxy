@@ -198,7 +198,7 @@ async def proxy_chat_completions(request: Request, settings: Settings) -> Respon
         if settings.normalize_requests:
             stats = normalize_request(
                 parsed_body,
-                deepseek_profile=_has_deepseek_profile(parsed_body, settings),
+                thinking_transport=_thinking_transport(parsed_body, settings),
             )
             metrics = _request_metrics(request)
             if metrics is not None:
@@ -1728,13 +1728,15 @@ def _safe_text(body: bytes) -> str:
     return body.decode("utf-8", errors="replace")
 
 
-def _has_deepseek_profile(body: JsonObject, settings: Settings) -> bool:
-    """True when this request's model is configured as a DeepSeek V4 model."""
+def _thinking_transport(body: JsonObject, settings: Settings) -> str | None:
+    """How this request's model wants thinking expressed, or ``None`` for no mapping."""
     model = body.get("model")
     if not isinstance(model, str):
-        return False
+        return None
     profile = settings.parsed_model_compatibility.get(model)
-    return profile is not None and profile.profile == "deepseek_v4"
+    if profile is None or profile.profile != "deepseek_v4":
+        return None
+    return profile.thinking_transport
 
 
 def _tool_repair_context(body: JsonObject, settings: Settings) -> ToolRepairContext:

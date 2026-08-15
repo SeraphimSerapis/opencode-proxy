@@ -61,7 +61,8 @@ proxy can enforce on its own:
 | Default per-request output cap | 256,000 tokens |
 | Default stream idle budget | 300s per outstanding read |
 | Accepted `reasoning_effort` values | `high`, `max` (default `high`) |
-| Disabling thinking | `thinking: {"type": "disabled"}`, never `reasoning_effort: "off"` |
+| Disabling thinking (vendor API) | `thinking: {"type": "disabled"}`, never `reasoning_effort: "off"` |
+| Disabling thinking (our vLLM) | `chat_template_kwargs: {"thinking": false}`; thinking is on by default in the generation config, and the vendor field is ignored |
 | Cache accounting | `prompt_tokens` *includes* `prompt_cache_hit_tokens`; no cache-write metric exists |
 
 Two consequences for this deployment. The proxy's

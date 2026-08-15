@@ -7,7 +7,7 @@ tags: [deepseek, requests, wire-format, reasoning, reliability]
 status: active
 generated:
   by: claude-code/opus-5
-  at: 2026-08-15T16:40:00+02:00
+  at: 2026-08-15T17:30:00+02:00
 sources:
   - id: deepseek-harness
     title: DeepSeek Harness — the vendor's own agent client for V4
@@ -72,14 +72,35 @@ The reference client sends the literal `(no output)` for an empty tool result,
 because empty content is another rejected shape. A command that legitimately
 prints nothing is common in an agent loop.
 
-### `off` is `thinking`, not an effort
+### `off` is `thinking`, not an effort -- but which `thinking` depends on the server
 
-`reasoning_effort` accepts only `high` and `max`. Disabling thinking is
-`thinking: {"type": "disabled"}` with no effort field, and enabled is the
-provider default, so an accepted effort is forwarded alone. This mapping is
-DeepSeek-specific -- `thinking` is not an OpenAI field -- so it runs only for a
-model configured with the `deepseek_v4` compatibility profile. Message hygiene
-above is valid for any OpenAI-compatible upstream and is not gated.
+`reasoning_effort` accepts only `high` and `max`. Disabling thinking is a
+different field, and *which* field depends on who is serving the model. Measured
+against the deployed vLLM on 2026-08-15:
+
+| Request shape | Result |
+| --- | --- |
+| `thinking: {"type": "disabled"}` (the API form) | accepted, ignored, model reasons |
+| `chat_template_kwargs: {"thinking": false}` | thinking off |
+| `chat_template_kwargs: {"enable_thinking": false}` (the Qwen spelling) | ignored |
+
+So the profile carries a `thinking_transport`, defaulting to `api`:
+
+* `api` -- the vendor form. `off` becomes `thinking: {"type": "disabled"}` with
+  no effort field; enabled is the provider default, so an accepted effort is
+  forwarded alone.
+* `chat_template_kwargs` -- the vLLM form. The template argument is a boolean,
+  so it cannot carry a *level*: `off` becomes `false`, `high`/`max` become
+  `true`, and `reasoning_effort` is dropped rather than forwarded to be silently
+  ignored. Any other `chat_template_kwargs` the caller sent are preserved.
+
+Both mappings are DeepSeek-specific -- neither field is an OpenAI one -- so they
+run only for a model configured with the `deepseek_v4` compatibility profile.
+Message hygiene above is valid for any OpenAI-compatible upstream and is not
+gated.
+
+Guessing one form would have been wrong half the time, and wrong silently: both
+servers accept the other's field without complaint.
 
 ### An empty completed turn is a failure, not an answer
 
@@ -144,4 +165,7 @@ the failure classifiers directly. In `tests/test_proxy.py`:
 `test_empty_reasoning_delta_opens_no_reasoning_block`,
 `test_retry_after_header_paces_the_retry`,
 `test_upstream_error_status_is_classified`,
-`test_streamed_usage_is_counted_disjointly`.
+`test_streamed_usage_is_counted_disjointly`,
+`test_chat_template_transport_forwards_the_vllm_thinking_argument`. The
+transport itself is covered in `tests/test_request_compat.py` and, for YAML
+loading and rejection, in `tests/test_deepseek_v4.py`.
