@@ -409,6 +409,63 @@ def parse_qwen_xml_tool_calls(text: str) -> list[ToolCall]:
     return results
 
 
+def is_empty_completion(body: JsonObject) -> bool:
+    """True when a completed turn carries nothing the caller can act on.
+
+    A model that closes with ``stop`` but produced no content and no tool call
+    has failed, not answered: agent clients render nothing and execute nothing,
+    which is indistinguishable from a hang. DeepSeek's own client treats exactly
+    this shape as a retryable error rather than a successful empty message.
+
+    A turn cut short by ``length`` is excluded. That one is truthfully reported
+    and retrying it unchanged only burns the same budget again.
+    """
+    choices = body.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+
+    for choice in choices:
+        if not isinstance(choice, dict):
+            return False
+        finish_reason = choice.get("finish_reason")
+        if finish_reason is not None and finish_reason != "stop":
+            return False
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            return False
+        if message.get("tool_calls"):
+            return False
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return False
+        if isinstance(content, list) and content:
+            return False
+    return True
+
+
+def annotate_empty_completion(body: JsonObject, notice: str) -> bool:
+    """Replace empty assistant content with ``notice`` so the turn is visibly dead.
+
+    Mirrors the streamed empty-turn annotation for the buffered transport.
+    """
+    if not notice:
+        return False
+    choices = body.get("choices")
+    if not isinstance(choices, list):
+        return False
+
+    annotated = False
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            continue
+        message["content"] = notice
+        annotated = True
+    return annotated
+
+
 def convert_chat_completion_response(
     body: JsonObject,
     *,

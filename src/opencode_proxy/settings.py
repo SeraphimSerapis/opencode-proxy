@@ -117,6 +117,14 @@ class Settings(BaseSettings):
         ge=0,
         validation_alias="UPSTREAM_MAX_RETRIES",
     )
+    # A completed turn with no content and no tool call is a failed generation,
+    # not an answer, so it is worth one more attempt. Buffered requests only: a
+    # stream is only known to be empty once its bytes have reached the client.
+    empty_response_retries: int = Field(
+        default=1,
+        ge=0,
+        validation_alias="EMPTY_RESPONSE_RETRIES",
+    )
     max_concurrent_upstream: int = Field(
         default=8,
         ge=0,
@@ -142,6 +150,9 @@ class Settings(BaseSettings):
         validation_alias="TOOL_CALL_SCAN_FIELDS",
     )
     sanitize_tools: bool = Field(default=True, validation_alias="SANITIZE_TOOLS")
+    # Repairs message shapes a DeepSeek-compatible upstream rejects outright
+    # (null assistant content, stale reasoning replay, empty tool results).
+    normalize_requests: bool = Field(default=True, validation_alias="NORMALIZE_REQUESTS")
     request_drop_fields: str = Field(default="", validation_alias="REQUEST_DROP_FIELDS")
     custom_headers: str = Field(
         default="",
@@ -299,6 +310,7 @@ class Settings(BaseSettings):
                 },
                 "max_concurrent": self.max_concurrent_upstream or None,
                 "max_retries": self.upstream_max_retries,
+                "empty_response_retries": self.empty_response_retries,
                 "health_path": self.upstream_health_path or None,
             },
             "streaming": {
@@ -320,6 +332,7 @@ class Settings(BaseSettings):
             },
             "request_transforms": {
                 "sanitize_tools": self.sanitize_tools,
+                "normalize_requests": self.normalize_requests,
                 "drop_fields": list(self.parsed_request_drop_fields),
             },
             "model_aliases": {

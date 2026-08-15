@@ -19,6 +19,10 @@ class ProxyMetrics:
     stream_idle_terminations: Counter
     empty_turns: Counter
     upstream_ready_failures: Counter
+    request_normalizations: Counter
+    upstream_errors: Counter
+    finish_reasons: Counter
+    usage_tokens: Counter
 
     @classmethod
     def create(cls) -> ProxyMetrics:
@@ -70,6 +74,30 @@ class ProxyMetrics:
                 "opencode_proxy_upstream_ready_failures",
                 "Readiness probes that judged the upstream unable to serve.",
                 ("reason",),
+                registry=registry,
+            ),
+            request_normalizations=Counter(
+                "opencode_proxy_request_normalizations",
+                "Outgoing request message shapes repaired before forwarding.",
+                ("kind",),
+                registry=registry,
+            ),
+            upstream_errors=Counter(
+                "opencode_proxy_upstream_errors",
+                "Chat completion requests answered with an upstream error status.",
+                ("type",),
+                registry=registry,
+            ),
+            finish_reasons=Counter(
+                "opencode_proxy_finish_reasons",
+                "Turn terminators seen by the proxy, unknown values folded into 'other'.",
+                ("reason", "transport"),
+                registry=registry,
+            ),
+            usage_tokens=Counter(
+                "opencode_proxy_usage_tokens",
+                "Upstream-reported token usage, counted disjointly per kind.",
+                ("kind",),
                 registry=registry,
             ),
         )
