@@ -3356,3 +3356,361 @@ async def test_retries_give_up_and_forward_the_upstream_error() -> None:
     assert route.call_count == 2
     assert response.status_code == 503
     assert response.json()["error"]["message"] == "still overloaded"
+
+
+def _deepseek_settings(**overrides: Any) -> Settings:
+    return Settings(
+        upstream_url="http://upstream.test",
+        model_compatibility=json.dumps({"deepseek-v4": {"compatibility": "deepseek_v4"}}),
+        **overrides,
+    )
+
+
+@respx.mock
+async def test_request_normalization_repairs_messages_before_forwarding() -> None:
+    route = respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-normalize",
+                "model": "deepseek-v4",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    },
+                ],
+            },
+        ),
+    )
+
+    async with await _client(_deepseek_settings()) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "deepseek-v4",
+                "reasoning_effort": "off",
+                "messages": [
+                    {"role": "user", "content": "list the files"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "needed for the passback",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "ls", "arguments": "{}"},
+                            },
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": ""},
+                    {"role": "assistant", "content": "done", "reasoning_content": "stale"},
+                ],
+            },
+        )
+        metrics = (await client.get("/metrics")).text
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    assistant_tool_turn, tool_result, plain_turn = forwarded["messages"][1:]
+    assert assistant_tool_turn["content"] == ""
+    assert assistant_tool_turn["reasoning_content"] == "needed for the passback"
+    assert tool_result["content"] == "(no output)"
+    assert "reasoning_content" not in plain_turn
+    assert "reasoning_effort" not in forwarded
+    assert forwarded["thinking"] == {"type": "disabled"}
+    assert 'opencode_proxy_request_normalizations_total{kind="null_assistant_content"} 1.0' in (
+        metrics
+    )
+
+
+@respx.mock
+async def test_request_normalization_can_be_disabled() -> None:
+    route = respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json={"choices": [], "model": "deepseek-v4"}),
+    )
+
+    settings = _deepseek_settings(normalize_requests=False)
+    async with await _client(settings) as client:
+        await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "deepseek-v4",
+                "reasoning_effort": "off",
+                "messages": [{"role": "assistant", "content": None}],
+            },
+        )
+
+    forwarded = json.loads(route.calls[0].request.content)
+    assert forwarded["messages"][0]["content"] is None
+    assert forwarded["reasoning_effort"] == "off"
+
+
+def _buffered_completion(content: str, finish_reason: str = "stop") -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-empty",
+        "object": "chat.completion",
+        "model": "deepseek-v4",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": finish_reason,
+            },
+        ],
+    }
+
+
+@respx.mock
+async def test_empty_buffered_completion_is_retried() -> None:
+    route = respx.post("http://upstream.test/v1/chat/completions").mock(
+        side_effect=[
+            httpx.Response(200, json=_buffered_completion("")),
+            httpx.Response(200, json=_buffered_completion("second try")),
+        ],
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "messages": []},
+        )
+        metrics = (await client.get("/metrics")).text
+
+    assert route.call_count == 2
+    assert response.json()["choices"][0]["message"]["content"] == "second try"
+    assert 'opencode_proxy_upstream_retries_total{reason="empty_response"} 1.0' in metrics
+
+
+@respx.mock
+async def test_exhausted_empty_completion_retries_annotate_the_turn() -> None:
+    route = respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=_buffered_completion("")),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "messages": []},
+        )
+        metrics = (await client.get("/metrics")).text
+
+    assert route.call_count == 2
+    assert "[proxy:" in response.json()["choices"][0]["message"]["content"]
+    assert "opencode_proxy_empty_turns_total 1.0" in metrics
+
+
+@respx.mock
+async def test_empty_completion_retry_can_be_disabled() -> None:
+    route = respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=_buffered_completion("")),
+    )
+
+    settings = Settings(upstream_url="http://upstream.test", empty_response_retries=0)
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "messages": []},
+        )
+
+    assert route.call_count == 1
+    assert "[proxy:" in response.json()["choices"][0]["message"]["content"]
+
+
+@respx.mock
+async def test_length_truncated_completion_is_not_retried() -> None:
+    route = respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=_buffered_completion("", finish_reason="length")),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "messages": []},
+        )
+
+    assert route.call_count == 1
+    assert response.json()["choices"][0]["message"]["content"] == ""
+
+
+@respx.mock
+async def test_abnormal_finish_reason_replaces_the_budget_notice() -> None:
+    chunk = {
+        "id": "chatcmpl-abnormal",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-v4",
+        "choices": [
+            {"index": 0, "delta": {}, "finish_reason": "insufficient_system_resource"},
+        ],
+    }
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+        metrics = (await client.get("/metrics")).text
+
+    content = collect_content(_stream_payloads(response))
+    assert "finish_reason=insufficient_system_resource" in content
+    assert "token budget" not in content
+    assert 'opencode_proxy_finish_reasons_total{reason="other",transport="streaming"} 1.0' in (
+        metrics
+    )
+
+
+@respx.mock
+async def test_empty_reasoning_delta_opens_no_reasoning_block() -> None:
+    chunks = [
+        {
+            "id": "chatcmpl-think",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [{"index": 0, "delta": {"reasoning_content": ""}, "finish_reason": None}],
+        },
+        {
+            "id": "chatcmpl-think",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [
+                {"index": 0, "delta": {"reasoning_content": "thinking"}, "finish_reason": None},
+            ],
+        },
+        {
+            "id": "chatcmpl-think",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4",
+            "choices": [{"index": 0, "delta": {"content": "answer"}, "finish_reason": "stop"}],
+        },
+    ]
+    body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=body.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+
+    payloads = _stream_payloads(response)
+    reasoning_deltas = [
+        choice["delta"]["reasoning_content"]
+        for payload in payloads
+        for choice in payload.get("choices", [])
+        if isinstance(choice.get("delta"), dict) and "reasoning_content" in choice["delta"]
+    ]
+    # The first thinking chunk of a DeepSeek turn is an empty string; forwarding
+    # it opens an empty reasoning block in the client.
+    assert reasoning_deltas == ["thinking"]
+    assert collect_content(payloads) == "answer"
+
+
+@respx.mock
+async def test_retry_after_header_paces_the_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("opencode_proxy.proxy.asyncio.sleep", record_sleep)
+    route = respx.post("http://upstream.test/v1/chat/completions").mock(
+        side_effect=[
+            httpx.Response(429, json={"error": "slow down"}, headers={"Retry-After": "7"}),
+            httpx.Response(200, json=_buffered_completion("after the wait")),
+        ],
+    )
+
+    settings = Settings(upstream_url="http://upstream.test", upstream_max_retries=1)
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "messages": []},
+        )
+        metrics = (await client.get("/metrics")).text
+
+    assert route.call_count == 2
+    # The header wins over the proxy's own backoff curve.
+    assert delays == [7.0]
+    assert response.json()["choices"][0]["message"]["content"] == "after the wait"
+    assert 'opencode_proxy_upstream_retries_total{reason="http_429"} 1.0' in metrics
+
+
+@respx.mock
+async def test_upstream_error_status_is_classified() -> None:
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            400,
+            json={"error": {"message": "This model's maximum context length is 1000000 tokens"}},
+        ),
+    )
+
+    async with await _client(_no_retry_settings()) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "messages": []},
+        )
+        metrics = (await client.get("/metrics")).text
+
+    assert response.status_code == 400
+    assert 'opencode_proxy_upstream_errors_total{type="context_window_exceeded"} 1.0' in metrics
+
+
+@respx.mock
+async def test_streamed_usage_is_counted_disjointly() -> None:
+    content_chunk = {
+        "id": "chatcmpl-usage",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-v4",
+        "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": "stop"}],
+    }
+    usage_chunk = {
+        "id": "chatcmpl-usage",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-v4",
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 1000,
+            "completion_tokens": 40,
+            "prompt_cache_hit_tokens": 900,
+            "prompt_tokens_details": {"cached_tokens": 900},
+            "completion_tokens_details": {"reasoning_tokens": 25},
+        },
+    }
+    body = (
+        f"data: {json.dumps(content_chunk)}\n\ndata: {json.dumps(usage_chunk)}\n\ndata: [DONE]\n\n"
+    )
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=body.encode(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    async with await _client() as client:
+        await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+        )
+        metrics = (await client.get("/metrics")).text
+
+    # prompt_tokens includes the cache hits, so input is the miss share only.
+    assert 'opencode_proxy_usage_tokens_total{kind="input"} 100.0' in metrics
+    assert 'opencode_proxy_usage_tokens_total{kind="cache_read"} 900.0' in metrics
+    assert 'opencode_proxy_usage_tokens_total{kind="output"} 40.0' in metrics
+    assert 'opencode_proxy_usage_tokens_total{kind="reasoning"} 25.0' in metrics
