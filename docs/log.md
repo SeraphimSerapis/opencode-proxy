@@ -1,5 +1,11 @@
 # Documentation Update Log
 
+## 2026-08-16
+
+* **Feature**: Keepalives can be requested as empty-delta chunks instead of SSE comments, per request, via `X-Opencode-Proxy-Keepalive: chunk`. Comments are discarded by SSE parsers, so a client that extends its own deadline on forward progress saw nothing across a multi-minute prefill and cut the turn off early; the comment path is unchanged for callers that do not opt in, and the header is not forwarded upstream.
+* **Fix**: The streaming contract claimed keepalive comments gave the client evidence of life. They do not -- an SSE parser drops them before application code -- and the document now says what they actually do.
+* **Reliability**: The first-frame stream guard was raised from `480s` to `900s` in the deployed compose unit. Measured cold prefill of a 316,536-token prompt (`cached_tokens=0`) moved from 241.7s to 409.8s after a vLLM prefill retune, and `480` began terminating legitimate prefills.
+
 ## 2026-08-15
 
 * **Feature**: The proxy now repairs outgoing message shapes before forwarding (`NORMALIZE_REQUESTS`, default on): `null` assistant content becomes `""`, `reasoning_content` is replayed only on tool-call turns and dropped elsewhere, empty tool results carry `(no output)`, and for `deepseek_v4` models `reasoning_effort: off` becomes `thinking: {"type": "disabled"}`. Each of these is a shape the DeepSeek API rejects outright, and because a rejected message sits durably in the caller's session log, one bad turn was enough to break every later turn of that session. Rules taken from [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness), the vendor's own client. See [conform to DeepSeek's own client](decisions/deepseek-wire-contract.md).

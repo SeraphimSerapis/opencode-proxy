@@ -3257,6 +3257,101 @@ async def test_quiet_upstream_gets_keepalive_comments() -> None:
 
 
 @respx.mock
+async def test_keepalive_header_promotes_comments_to_chunks() -> None:
+    """Opt-in keepalives must be frames an SSE parser actually surfaces.
+
+    Comments are dropped by SSE parsers, so a client watching for forward
+    progress sees nothing through a long prefill. With the header set the same
+    quiet period must produce real chunks instead, sharing the stream's id and
+    carrying the requested model, and adding no content of their own.
+    """
+    chunk = {
+        "id": "chatcmpl-keepalive",
+        "object": "chat.completion.chunk",
+        "model": "deepseek-v4",
+        "choices": [{"index": 0, "delta": {"content": "thinking done"}, "finish_reason": "stop"}],
+    }
+
+    async def slow_stream() -> AsyncIterator[bytes]:
+        await asyncio.sleep(0.35)
+        yield f"data: {json.dumps(chunk)}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=slow_stream(),
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+
+    settings = Settings(
+        upstream_url="http://upstream.test",
+        sse_keepalive_interval=0.1,
+        upstream_stream_idle_timeout=10,
+    )
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+            headers={"x-opencode-proxy-keepalive": "chunk"},
+        )
+
+    assert ": keepalive" not in response.text
+
+    payloads = _stream_payloads(response)
+    keepalives = [
+        p
+        for p in payloads
+        if p.get("choices")
+        and p["choices"][0].get("delta") == {}
+        and p["choices"][0].get("finish_reason") is None
+    ]
+    assert keepalives, "expected at least one empty-delta keepalive chunk"
+    # These keepalives all precede the first upstream frame, so they carry the
+    # proxy's synthesized id: the upstream id genuinely is not known yet.
+    # `chunk_id` adopts the upstream id as soon as a data frame arrives, so
+    # keepalives emitted mid-stream do match the chunks around them. Either way
+    # the id is stable within the keepalive run, and the model is the one the
+    # caller asked for rather than the "unknown" placeholder.
+    assert len({p["id"] for p in keepalives}) == 1
+    assert {p["model"] for p in keepalives} == {"deepseek-v4"}
+
+    # Keepalives are additive only: content and termination are untouched.
+    assert collect_content(payloads) == "thinking done"
+    assert response.text.count("data: [DONE]") == 1
+
+
+@respx.mock
+async def test_keepalive_control_header_is_not_forwarded_upstream() -> None:
+    """The control header is for this proxy, not part of the upstream contract."""
+    seen: dict[str, str] = {}
+
+    def _capture(request: httpx.Request) -> httpx.Response:
+        seen.update({k.lower(): v for k, v in request.headers.items()})
+        return httpx.Response(
+            200,
+            content=b'data: {"id":"c","object":"chat.completion.chunk","model":"m",'
+            b'"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\n'
+            b"data: [DONE]\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(side_effect=_capture)
+
+    settings = Settings(upstream_url="http://upstream.test")
+    async with await _client(settings) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4", "stream": True, "messages": []},
+            headers={"x-opencode-proxy-keepalive": "chunk"},
+        )
+
+    assert response.status_code == 200
+    assert "x-opencode-proxy-keepalive" not in seen
+
+
+@respx.mock
 async def test_upstream_503_is_retried_before_the_stream_starts() -> None:
     chunk = {
         "id": "chatcmpl-retry",

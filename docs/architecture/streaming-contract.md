@@ -78,8 +78,31 @@ closes. A bounded, visible failure instead of an unbounded invisible one.
 While the upstream is quiet the proxy emits `: keepalive` SSE comments every
 `SSE_KEEPALIVE_INTERVAL` seconds (default 10). Comments are ignored by SSE
 parsers; their purpose is to stop reverse proxies and load balancers from
-dropping an idle connection during a long reasoning pause, and to give the
-client evidence of life.
+dropping an idle connection during a long reasoning pause.
+
+They do **not** give the client evidence of life, which this document
+previously claimed. An SSE parser discards comment lines before application
+code ever sees them -- the OpenAI SDK drops any line beginning with `:` -- so a
+client that watches for forward progress to extend its own deadline observes
+total silence through a prefill that can legitimately run for minutes. Comments
+keep the socket warm and nothing more.
+
+A client that needs visible progress opts in per request with
+`X-Opencode-Proxy-Keepalive: chunk`. Each tick then emits a
+`chat.completion.chunk` with an empty `delta` instead of a comment: a real frame
+the parser surfaces, carrying no content and no `finish_reason`, so it cannot
+alter the turn. The header is stripped before the request is forwarded, since it
+addresses this proxy rather than the upstream.
+
+Opt-in and per request, rather than a deployment-wide setting: injecting
+synthesized frames is a payload mutation, and one proxy serves callers with
+different needs. A caller that does not ask for it gets byte-identical output.
+
+Keepalive chunks reuse `chunk_id`, which starts as the proxy's synthesized id
+and adopts the upstream id once the first data frame arrives. Ticks emitted
+mid-stream therefore match the chunks around them; ticks emitted during prefill
+cannot, because no upstream id exists yet. Clients keying strictly on the id of
+the first frame they see should stay with comments.
 
 Streamed responses also carry `Cache-Control: no-cache` and
 `X-Accel-Buffering: no` so intermediaries relay tokens rather than buffering.

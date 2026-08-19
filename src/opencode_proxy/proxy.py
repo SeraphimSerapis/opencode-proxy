@@ -79,6 +79,17 @@ DECODED_BODY_HEADERS = {
 
 SSE_KEEPALIVE_COMMENT = b": keepalive\n\n"
 
+# Opt-in, per request: a client that sets this to ``chunk`` gets keepalives as
+# empty-delta chat.completion chunks instead of SSE comments. Comments are
+# discarded by SSE parsers (the OpenAI SDK drops any line starting with ``:``),
+# so they keep intermediaries from dropping the connection but are invisible to
+# application code. A client that watches for forward progress to extend its own
+# deadline therefore sees total silence through a multi-minute prefill. Stays
+# opt-in and per request because injecting synthesized frames is a payload
+# mutation: callers that do not ask for it get byte-identical output.
+KEEPALIVE_MODE_HEADER = "x-opencode-proxy-keepalive"
+KEEPALIVE_MODE_CHUNK = "chunk"
+
 # Upstream statuses worth one more attempt: overload and gateway failures, where
 # the model most likely never ran.
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
@@ -480,7 +491,12 @@ async def _proxy_streaming_chat_completion(
             capture.request_body(parsed_body if parsed_body is not None else _safe_text(raw_body))
 
     generator = _rewrite_sse_stream(
-        request, upstream_response, settings, repair_context, capture=capture
+        request,
+        upstream_response,
+        settings,
+        repair_context,
+        capture=capture,
+        requested_model=str(parsed_body.get("model")) if parsed_body is not None else None,
     )
     background = BackgroundTask(_aclose_upstream_and_release_slot, upstream_response, request)
     return StreamingResponse(
@@ -597,6 +613,7 @@ async def _rewrite_sse_stream(
     repair_context: ToolRepairContext = DEFAULT_TOOL_REPAIR_CONTEXT,
     *,
     capture: StreamCapture | None = None,
+    requested_model: str | None = None,
 ) -> AsyncIterator[bytes]:
     """Rewrite an SSE stream, recording both sides when capture is enabled.
 
@@ -606,7 +623,11 @@ async def _rewrite_sse_stream(
     """
     if capture is None:
         async for chunk in _rewrite_sse_stream_inner(
-            request, upstream_response, settings, repair_context
+            request,
+            upstream_response,
+            settings,
+            repair_context,
+            requested_model=requested_model,
         ):
             yield chunk
         return
@@ -614,7 +635,12 @@ async def _rewrite_sse_stream(
     reason = "completed"
     try:
         async for chunk in _rewrite_sse_stream_inner(
-            request, upstream_response, settings, repair_context, capture=capture
+            request,
+            upstream_response,
+            settings,
+            repair_context,
+            capture=capture,
+            requested_model=requested_model,
         ):
             capture.client_bytes(chunk)
             yield chunk
@@ -632,10 +658,14 @@ async def _rewrite_sse_stream_inner(
     repair_context: ToolRepairContext = DEFAULT_TOOL_REPAIR_CONTEXT,
     *,
     capture: StreamCapture | None = None,
+    requested_model: str | None = None,
 ) -> AsyncIterator[bytes]:
     """Rewrite an SSE chat-completion stream into OpenAI ``tool_calls`` deltas."""
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     model = "unknown"
+    keepalive_as_chunk = (
+        request.headers.get(KEEPALIVE_MODE_HEADER, "").strip().lower() == KEEPALIVE_MODE_CHUNK
+    )
     choice_states: dict[int, StreamChoiceState] = {}
     # Usage rides either on the finish chunk or on a trailing usage-only chunk,
     # and some upstreams send both. Keep the last one and count it once.
@@ -659,7 +689,10 @@ async def _rewrite_sse_stream_inner(
                 return
 
             if frame is None:
-                yield SSE_KEEPALIVE_COMMENT
+                if keepalive_as_chunk:
+                    yield _encode_sse_json(_keepalive_chunk(chunk_id, requested_model or model))
+                else:
+                    yield SSE_KEEPALIVE_COMMENT
                 continue
 
             if capture is not None:
@@ -2167,6 +2200,9 @@ def _forward_request_headers(
         lower_key = key.lower()
         if lower_key in HOP_BY_HOP_HEADERS or lower_key == "host":
             continue
+        # Proxy control header, not part of the upstream contract.
+        if lower_key == KEEPALIVE_MODE_HEADER:
+            continue
         if stream and lower_key == "accept-encoding":
             continue
         headers[key] = value
@@ -2329,6 +2365,28 @@ def _parse_sse_data(payload: str) -> JsonObject | str:
 
 def _encode_sse_raw_frame(raw_lines: tuple[str, ...]) -> bytes:
     return ("\n".join(raw_lines) + "\n\n").encode()
+
+
+def _keepalive_chunk(chunk_id: str, model: str) -> JsonObject:
+    """Build an empty-delta chunk used as a visible keepalive.
+
+    Carries the same synthesized ``chunk_id`` as the rest of the rewritten
+    stream, so a client that keys on the id sees one continuous turn. The empty
+    ``delta`` adds no content: its only job is to be a frame the client's SSE
+    parser surfaces, unlike a comment.
+    """
+    return {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {},
+                "finish_reason": None,
+            },
+        ],
+    }
 
 
 def _encode_sse_json(payload: Mapping[str, Any]) -> bytes:

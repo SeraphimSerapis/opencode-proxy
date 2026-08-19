@@ -59,13 +59,19 @@ can legitimately take minutes to produce a first token. Silence is bounded by
 | --- | --- | --- |
 | `UPSTREAM_STREAM_IDLE_TIMEOUT` | `30` | Seconds of silence *between* SSE frames before the client stream is terminated cleanly. `0` disables. |
 | `UPSTREAM_STREAM_FIRST_FRAME_TIMEOUT` | `480` | Seconds of silence before the *first* SSE frame, covering prefill. `0` disables. |
-| `SSE_KEEPALIVE_INTERVAL` | `10` | Seconds of silence between `: keepalive` comments. `0` disables. |
+| `SSE_KEEPALIVE_INTERVAL` | `10` | Seconds of silence between keepalive ticks. `0` disables. |
 | `STREAM_GUARD_CHARS` | `192` | Text held back while watching for a split tool-call marker. |
 | `TOOL_ARGUMENT_CHUNK_SIZE` | `64` | Size of streamed function-argument deltas. |
 | `EMPTY_TURN_NOTICE` | a short explanatory message | Content emitted before the terminal chunk when a turn the upstream closed itself ends with no content and no tool calls. Set empty to disable. See [turn usability](/decisions/turn-usability.md). |
 
 `/healthz/config` reports whether `EMPTY_TURN_NOTICE` is enabled without
 exposing the configured message text.
+
+## Per-request headers
+
+| Header | Values | Effect |
+| --- | --- | --- |
+| `X-Opencode-Proxy-Keepalive` | `chunk` | Emit keepalive ticks as empty-delta `chat.completion.chunk` frames instead of `: keepalive` comments, for clients whose SSE parser discards comments and which need visible forward progress. Any other value, or the header's absence, keeps comments. Stripped before forwarding upstream. |
 
 ## Stream capture
 
