@@ -116,7 +116,9 @@ def build_ollama_router(settings: Settings) -> APIRouter:
             )
 
         openai_payload = ollama_chat_to_openai(payload)
-        _apply_model_alias(openai_payload, settings.parsed_model_aliases)
+        alias_error = await _apply_model_alias(request, openai_payload, settings)
+        if alias_error is not None:
+            return alias_error
         target = resolve_upstream_target(settings, openai_payload)
         apply_target_model(openai_payload, target)
         _normalize_ollama_payload(openai_payload, payload.think, settings, request)
@@ -153,7 +155,9 @@ def build_ollama_router(settings: Settings) -> APIRouter:
             )
 
         openai_payload = ollama_generate_to_openai(payload)
-        _apply_model_alias(openai_payload, settings.parsed_model_aliases)
+        alias_error = await _apply_model_alias(request, openai_payload, settings)
+        if alias_error is not None:
+            return alias_error
         target = resolve_upstream_target(settings, openai_payload)
         apply_target_model(openai_payload, target)
         _normalize_ollama_payload(openai_payload, payload.think, settings, request)
@@ -184,7 +188,9 @@ def build_ollama_router(settings: Settings) -> APIRouter:
     @router.post("/api/embed")
     async def embed(payload: OllamaEmbedRequest, request: Request) -> Response:
         openai_payload = ollama_embed_to_openai(payload)
-        _apply_model_alias(openai_payload, settings.parsed_model_aliases)
+        alias_error = await _apply_model_alias(request, openai_payload, settings)
+        if alias_error is not None:
+            return alias_error
         response = await _request_upstream(request, settings, "/v1/embeddings", openai_payload)
         if isinstance(response, Response):
             return response
@@ -199,7 +205,9 @@ def build_ollama_router(settings: Settings) -> APIRouter:
     async def embeddings(payload: OllamaEmbeddingsRequest, request: Request) -> Response:
         embed_payload = OllamaEmbedRequest(model=payload.model, input=payload.prompt)
         openai_payload = ollama_embed_to_openai(embed_payload)
-        _apply_model_alias(openai_payload, settings.parsed_model_aliases)
+        alias_error = await _apply_model_alias(request, openai_payload, settings)
+        if alias_error is not None:
+            return alias_error
         response = await _request_upstream(request, settings, "/v1/embeddings", openai_payload)
         if isinstance(response, Response):
             return response

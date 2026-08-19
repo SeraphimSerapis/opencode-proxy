@@ -617,7 +617,84 @@ async def test_model_aliases_are_added_to_v1_models() -> None:
         "DeepSeek-V4-Flash",
         "dsv4-flash",
         "deepseek-ai/DeepSeek-V4-Flash-DSpark",
+        "primary",
     }
+
+
+@respx.mock
+async def test_primary_alias_discovers_and_rewrites_current_upstream_model() -> None:
+    respx.get("http://upstream.test/v1/models").mock(
+        return_value=httpx.Response(
+            200,
+            json={"object": "list", "data": [{"id": "qwen3.8-27b"}]},
+        )
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["model"] == "qwen3.8-27b"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(side_effect=handler)
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "primary", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert response.status_code == 200
+
+
+@respx.mock
+async def test_primary_alias_returns_502_when_discovery_fails() -> None:
+    completion = respx.post("http://upstream.test/v1/chat/completions")
+    respx.get("http://upstream.test/v1/models").mock(side_effect=httpx.ConnectError("unreachable"))
+
+    async with await _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "primary", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "primary_model_discovery_failed"
+    assert not completion.called
+
+
+@respx.mock
+async def test_upstream_primary_model_is_not_rewritten_or_duplicated() -> None:
+    respx.get("http://upstream.test/v1/models").mock(
+        return_value=httpx.Response(
+            200,
+            json={"object": "list", "data": [{"id": "primary", "owned_by": "vllm"}]},
+        )
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["model"] == "primary"
+        return httpx.Response(200, json={"choices": []})
+
+    respx.post("http://upstream.test/v1/chat/completions").mock(side_effect=handler)
+
+    async with await _client() as client:
+        models = await client.get("/v1/models")
+        completion = await client.post(
+            "/v1/chat/completions",
+            json={"model": "primary", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert models.json()["data"] == [{"id": "primary", "owned_by": "vllm"}]
+    assert completion.status_code == 200
 
 
 @respx.mock

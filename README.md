@@ -278,6 +278,14 @@ MODEL_ALIASES='{"dsv4-flash":"DeepSeek-V4-Flash","deepseek-ai/DeepSeek-V4-Flash-
 ```
 
 With these aliases, `/v1/chat/completions` requests for `dsv4-flash` are sent upstream as `DeepSeek-V4-Flash`. `/v1/models` and `/models` also include alias entries so clients can discover them.
+
+The proxy also provides `primary` without configuration. If the upstream already
+advertises that model id, requests pass through unchanged. Otherwise the proxy
+adds `primary` to model discovery and resolves it to the first model returned by
+the upstream `/v1/models` endpoint for each request. Discovery errors and empty
+model lists return `502` with `primary_model_discovery_failed` instead of sending
+a request with the wrong model name.
+
 On startup, the proxy logs configured alias names. You can also check
 `/healthz/config` and confirm `model_aliases.aliases` contains `dsv4-flash`.
 

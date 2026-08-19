@@ -1,5 +1,9 @@
 # Documentation Update Log
 
+## 2026-08-19
+
+* **Feature**: Model discovery now advertises a built-in `primary` alias when the upstream does not define one. Requests for `primary` resolve against the first model returned by upstream `/v1/models`; discovery failures return a bounded `502` instead of forwarding an invalid model name.
+
 ## 2026-08-16
 
 * **Feature**: Keepalives can be requested as empty-delta chunks instead of SSE comments, per request, via `X-Opencode-Proxy-Keepalive: chunk`. Comments are discarded by SSE parsers, so a client that extends its own deadline on forward progress saw nothing across a multi-minute prefill and cut the turn off early; the comment path is unchanged for callers that do not opt in, and the header is not forwarded upstream.

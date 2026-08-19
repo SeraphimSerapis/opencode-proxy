@@ -6,8 +6,8 @@ resource: /home/tim/projects/opencode-proxy/src/opencode_proxy/proxy.py
 tags: [proxy, fastapi, streaming, ollama, litellm, vllm, topology]
 status: active
 generated:
-  by: codex/gpt-5
-  at: 2026-08-15T16:21:21+02:00
+  by: openai-codex/gpt-5.6-sol
+  at: 2026-08-19T13:29:49Z
 ---
 
 # Request pipeline
@@ -66,7 +66,7 @@ fixtures:
 | Parse | JSON body to a dict | Body is absent or not a JSON object |
 | Sanitize tools | Drop non-`function` tools; drop `tools` entirely if none remain | `SANITIZE_TOOLS=false` |
 | Drop fields | Remove `REQUEST_DROP_FIELDS` entries | No fields configured |
-| Model alias | Rewrite a client-facing alias to the upstream model name | No alias matches |
+| Model alias | Rewrite a configured alias. For `primary`, query upstream discovery and use its first model when the upstream does not define `primary` itself | No alias matches |
 | Modality routing | Pick an alternate upstream and model for image/audio requests | No matching route |
 | Normalize messages | For `deepseek_v4` profiles only, repair `null` assistant content, replay reasoning on tool turns, empty tool results, unsupported `developer` roles, `max_completion_tokens`, and map `reasoning_effort`/`thinking` to the configured transport | `NORMALIZE_REQUESTS=false` |
 | Concurrency slot | Acquire one of `MAX_CONCURRENT_UPSTREAM`; `429` if full | Limit disabled |
@@ -75,6 +75,11 @@ fixtures:
 A body the proxy cannot parse is forwarded verbatim. None of the rewriting
 stages run in that case, by design: an unparseable body is not something to
 guess at.
+
+The built-in `primary` alias follows the model currently returned first by the
+upstream `/v1/models` endpoint. The proxy leaves a real upstream model named
+`primary` alone. If discovery fails or returns no model ids, it returns `502`
+with `primary_model_discovery_failed` and does not send the completion.
 
 Message normalization follows the rules in DeepSeek's own client; see
 [conform to DeepSeek's own client](../decisions/deepseek-wire-contract.md).

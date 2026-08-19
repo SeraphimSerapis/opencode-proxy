@@ -100,6 +100,7 @@ MAX_RETRY_AFTER_SECONDS = 30.0
 
 CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
 MODELS_PATH = "/v1/models"
+PRIMARY_MODEL_ALIAS = "primary"
 REASONING_SCAN_FIELDS = ("reasoning", "reasoning_content")
 
 # Terminators an OpenAI-compatible client knows how to handle. Anything else
@@ -203,7 +204,9 @@ async def proxy_chat_completions(request: Request, settings: Settings) -> Respon
         if settings.sanitize_tools:
             _sanitize_tools(parsed_body)
         _drop_request_fields(parsed_body, settings.parsed_request_drop_fields)
-        _apply_model_alias(parsed_body, settings.parsed_model_aliases)
+        alias_error = await _apply_model_alias(request, parsed_body, settings)
+        if alias_error is not None:
+            return alias_error
         target = resolve_upstream_target(settings, parsed_body)
         apply_target_model(parsed_body, target)
         repair_context = _tool_repair_context(parsed_body, settings)
@@ -2050,24 +2053,93 @@ def apply_target_model(body: JsonObject, target: UpstreamTarget) -> None:
         body["model"] = target.model
 
 
-def _apply_model_alias(body: JsonObject, aliases: Mapping[str, str]) -> None:
+async def _apply_model_alias(
+    request: Request,
+    body: JsonObject,
+    settings: Settings,
+) -> Response | None:
     model = body.get("model")
-    if isinstance(model, str) and model in aliases:
+    if not isinstance(model, str):
+        return None
+
+    aliases = settings.parsed_model_aliases
+    if model in aliases:
         target = aliases[model]
+    elif model == PRIMARY_MODEL_ALIAS:
+        discovered = await _discover_primary_model(request, settings)
+        if isinstance(discovered, Response):
+            return discovered
+        target = discovered
+    else:
+        return None
+
+    if target != model:
         LOG.info("rewriting model alias %r to upstream model %r", model, target)
         body["model"] = target
+    return None
+
+
+async def _discover_primary_model(request: Request, settings: Settings) -> str | Response:
+    """Resolve ``primary`` to the first model advertised by the upstream."""
+    try:
+        response = await _upstream_client(request).get(
+            _upstream_url(settings, MODELS_PATH, ""),
+            headers=_forward_request_headers(request, settings=settings, stream=False),
+            timeout=httpx.Timeout(settings.upstream_ready_timeout),
+        )
+        response.raise_for_status()
+        body = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        LOG.warning("failed to discover the upstream primary model: %s", exc)
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "message": "could not discover the upstream primary model",
+                    "type": "primary_model_discovery_failed",
+                }
+            },
+        )
+
+    model_ids = _model_ids(body)
+    if not model_ids:
+        LOG.warning("upstream model discovery returned no model ids")
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "message": "upstream model discovery returned no models",
+                    "type": "primary_model_discovery_failed",
+                }
+            },
+        )
+    return PRIMARY_MODEL_ALIAS if PRIMARY_MODEL_ALIAS in model_ids else model_ids[0]
+
+
+def _model_ids(body: object) -> list[str]:
+    if not isinstance(body, dict) or not isinstance(body.get("data"), list):
+        return []
+    return [
+        model_id
+        for entry in body["data"]
+        if isinstance(entry, dict) and isinstance((model_id := entry.get("id")), str)
+    ]
 
 
 def _add_model_aliases(body: JsonObject, settings: Settings) -> bool:
-    aliases = settings.parsed_model_aliases
+    aliases = dict(settings.parsed_model_aliases)
     data = body.get("data")
-    if not isinstance(data, list) or not aliases:
+    if not isinstance(data, list):
         return True
 
     model_entries = [entry for entry in data if isinstance(entry, dict)]
     entries_by_id = {
         entry["id"]: entry for entry in model_entries if isinstance(entry.get("id"), str)
     }
+    if PRIMARY_MODEL_ALIAS not in entries_by_id and PRIMARY_MODEL_ALIAS not in aliases:
+        model_ids = _model_ids(body)
+        if model_ids:
+            aliases[PRIMARY_MODEL_ALIAS] = model_ids[0]
 
     for alias, target in aliases.items():
         if alias in entries_by_id:

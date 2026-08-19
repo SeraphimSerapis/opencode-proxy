@@ -483,7 +483,11 @@ async def test_ollama_tags_applies_model_aliases_and_forwards_client_auth() -> N
         response = await client.get("/api/tags", headers={"Authorization": "Bearer client-key"})
 
     assert response.status_code == 200
-    assert {model["name"] for model in response.json()["models"]} == {"target", "alias"}
+    assert {model["name"] for model in response.json()["models"]} == {
+        "target",
+        "alias",
+        "primary",
+    }
     assert upstream.calls[0].request.headers["authorization"] == "Bearer client-key"
 
 
