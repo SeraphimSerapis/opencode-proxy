@@ -1,5 +1,9 @@
 # Documentation Update Log
 
+## 2026-08-21
+
+* **Feature**: The repair core now runs inside a LiteLLM proxy as a custom callback (`opencode_proxy.litellm_plugin`), so models defined in LiteLLM get tool-call repair without the standalone hop. The streaming state machine was extracted from `proxy.py` into a pure dict-in/dict-out module (`stream_repair.py`) that both frontends share; `ToolRepairContext` moved to `compat.py`. The plugin covers request normalization, buffered and streaming repair, truncated-argument completion, and empty-turn annotation; aliases, modality routing, Ollama-native endpoints, keepalive comments, and empty-response re-sends stay standalone-only. Verified end-to-end against a LiteLLM proxy (buffered and streaming turns repaired through `/v1/chat/completions`). See [tool-call repair](architecture/tool-call-repair.md) and [configuration](reference/configuration.md).
+
 ## 2026-08-19
 
 * **Feature**: Model discovery now advertises a built-in `primary` alias when the upstream does not define one. Requests for `primary` resolve against the first model returned by upstream `/v1/models`; discovery failures return a bounded `502` instead of forwarding an invalid model name.

@@ -86,6 +86,26 @@ By default the proxy forwards to `http://127.0.0.1:4000`, which is LiteLLM's com
 UPSTREAM_URL=http://127.0.0.1:4000 uv run opencode-proxy
 ```
 
+### LiteLLM plugin mode
+
+Instead of running this proxy as a separate service, the repair logic can be loaded into an existing [LiteLLM](https://docs.litellm.ai) proxy as a custom callback. Install `opencode-proxy` into the LiteLLM environment, create a shim file next to your LiteLLM config:
+
+```python
+# litellm_opencode_repair.py
+from opencode_proxy.litellm_plugin import create_repair_handler
+
+repair_handler = create_repair_handler()
+```
+
+and register it:
+
+```yaml
+litellm_settings:
+  callbacks: litellm_opencode_repair.repair_handler
+```
+
+The plugin repairs requests and responses (buffered and streamed) on LiteLLM's `/chat/completions` route using the same engine as the standalone proxy. Model aliases, modality routing, Ollama-native endpoints (`/api/chat`), SSE keepalives, and empty-response re-sends are not covered — use the standalone proxy for those.
+
 ## OpenCode Provider Example
 
 Point OpenCode at the proxy, not directly at the upstream:

@@ -176,6 +176,35 @@ text-only model and look like a model quality problem.
 
 Template: [`/home/tim/projects/opencode-proxy/proxy.example.yaml`](/home/tim/projects/opencode-proxy/proxy.example.yaml).
 
+## LiteLLM plugin mode
+
+The repair core can run inside a LiteLLM proxy instead of (or alongside) this
+standalone service. Install `opencode-proxy` into the LiteLLM environment, add
+a two-line shim next to the LiteLLM config:
+
+```python
+# litellm_opencode_repair.py
+from opencode_proxy.litellm_plugin import create_repair_handler
+
+repair_handler = create_repair_handler()
+```
+
+and register the instance:
+
+```yaml
+litellm_settings:
+  callbacks: litellm_opencode_repair.repair_handler
+```
+
+`create_repair_handler()` accepts a `StreamRepairConfig` (scan fields, guard
+size, chunk size, repair limits, empty-turn notice); `handler_from_env()` builds
+one from this project's environment variables. The plugin covers request
+normalization, buffered and streaming tool-call repair, truncated-argument
+completion, and empty-turn annotation. It does not cover model aliases,
+modality routing, Ollama-native endpoints (`/api/chat`), SSE keepalive comments,
+or empty-response re-sends — deployments needing those keep the standalone
+proxy. See [tool-call repair](../architecture/tool-call-repair.md).
+
 ## Deployed values
 
 The homelab container sets `UPSTREAM_URL`, `UPSTREAM_API_KEY`,

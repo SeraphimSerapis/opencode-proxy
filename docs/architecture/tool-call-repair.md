@@ -120,6 +120,28 @@ unchanged when their IDs are valid. An otherwise valid buffered call without an
 ID receives a distinct synthetic ID. Streaming keeps one ID per choice/tool
 index and reuses it on every fragment; valid upstream IDs always win.
 
+## Running inside LiteLLM as a plugin
+
+The same repair logic runs in two frontends. `stream_repair.py` holds the pure,
+dict-in/dict-out streaming state machine (`rewrite_stream_choice`,
+`iter_finish_payloads`, `StreamRepairConfig`) and imports neither FastAPI nor
+httpx; `proxy.py` wraps it in SSE framing, timeouts, retries, and capture, while
+`litellm_plugin.py` exposes it as a LiteLLM `CustomLogger`.
+
+The plugin maps the repair onto LiteLLM's proxy hooks: request normalization in
+`async_pre_call_hook`, buffered conversion plus empty-turn annotation in
+`async_post_call_success_hook`, and the full chunk stream through
+`async_post_call_streaming_iterator_hook`. Chunks arrive as typed
+`ModelResponseStream` objects, so the adapter dumps them with `exclude_none`
+(LiteLLM fills every unset delta field with `None`, which the state machine
+would read as payload) and rebuilds typed chunks from repaired dicts.
+
+What the plugin deliberately does not cover: model aliases and modality routing
+(LiteLLM's router owns both), Ollama-native API endpoints (LiteLLM serves none),
+SSE keepalive comments (hook output is always `data:` frames), per-frame idle
+timeouts, and empty-response re-sends. Those remain reasons to run the
+standalone proxy. See [configuration](../reference/configuration.md) for wiring.
+
 ## Temporary DeepSeek V4 orphan fallback
 
 vLLM issue/PR

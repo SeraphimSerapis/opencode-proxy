@@ -17,7 +17,10 @@ Build a small, production-ready FastAPI proxy between OpenCode/Ollama clients an
 `request_compat.py` holds outgoing message normalization, `routing.py` holds
 modality detection and upstream selection, and `config_file.py`
 holds YAML loading; all three stay free of FastAPI imports so they can be unit tested
-directly. The Ollama adapter is separated into `ollama_models.py`, `ollama_translate.py`,
+directly. `stream_repair.py` holds the pure streaming repair state machine
+(dict-in/dict-out, no FastAPI/httpx/Settings imports) shared by the FastAPI SSE
+frontend and the LiteLLM callback plugin in `litellm_plugin.py` (optional
+`litellm` dependency, imported only when a handler is created). The Ollama adapter is separated into `ollama_models.py`, `ollama_translate.py`,
 `ollama_streaming.py`, and `ollama.py`; keep translation logic independent from
 FastAPI route wiring. `tools/mock_openai.py` is the dependency-free upstream for
 Docker smoke tests and must not make real model calls.
