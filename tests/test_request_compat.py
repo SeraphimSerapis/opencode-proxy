@@ -8,13 +8,13 @@ from typing import Any
 from opencode_proxy.compat import annotate_empty_completion, is_empty_completion
 from opencode_proxy.proxy import (
     classify_upstream_status,
-    finish_reason_label,
     retry_after_seconds,
 )
 from opencode_proxy.request_compat import (
     EMPTY_TOOL_RESULT_PLACEHOLDER,
     normalize_request,
 )
+from opencode_proxy.stream_repair import finish_reason_label
 
 
 def test_null_assistant_content_becomes_an_empty_string() -> None:

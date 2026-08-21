@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     import httpx
     from fastapi import Request
 
-    from opencode_proxy.proxy import ToolRepairContext
+    from opencode_proxy.compat import ToolRepairContext
     from opencode_proxy.settings import Settings
 
 

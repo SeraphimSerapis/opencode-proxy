@@ -12,7 +12,9 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response, Streami
 from starlette.background import BackgroundTask
 
 from opencode_proxy.compat import (
+    DEFAULT_TOOL_REPAIR_CONTEXT,
     RepairStats,
+    ToolRepairContext,
     annotate_empty_completion,
     convert_chat_completion_response,
     is_empty_completion,
@@ -46,9 +48,7 @@ from opencode_proxy.ollama_translate import (
     openai_models_to_running,
 )
 from opencode_proxy.proxy import (
-    DEFAULT_TOOL_REPAIR_CONTEXT,
     MODELS_PATH,
-    ToolRepairContext,
     _aclose_upstream_and_release_slot,
     _acquire_upstream_slot,
     _add_model_aliases,
@@ -58,7 +58,6 @@ from opencode_proxy.proxy import (
     _note_finish_reasons,
     _note_upstream_error,
     _proxy_error,
-    _record_repair_stats,
     _record_request_normalizations,
     _record_usage,
     _release_upstream_slot,
@@ -78,6 +77,7 @@ from opencode_proxy.request_compat import (
     normalize_request,
 )
 from opencode_proxy.routing import UpstreamTarget, resolve_upstream_target
+from opencode_proxy.stream_repair import record_repair_stats as _record_repair_stats
 
 if TYPE_CHECKING:
     from opencode_proxy.compat import JsonObject

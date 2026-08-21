@@ -109,6 +109,15 @@ class ChatCompletionChunk(TypedDict):
     created: NotRequired[int]
 
 
+@dataclass(frozen=True)
+class ToolRepairContext:
+    recover_orphan_invokes: bool = False
+    declared_tool_names: frozenset[str] = frozenset()
+
+
+DEFAULT_TOOL_REPAIR_CONTEXT = ToolRepairContext()
+
+
 @dataclass
 class RepairStats:
     raw_repairs: list[tuple[str, str]] = field(default_factory=list)
